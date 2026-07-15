@@ -1,0 +1,4 @@
+interface:
+  display_name: "Liteverse Research Memory"
+  short_description: "Maintain traceable project, code, experiment, and task memory"
+  default_prompt: "Use $liteverse-research-memory to preserve the reusable decisions and artifacts from this research task."

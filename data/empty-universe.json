@@ -1,0 +1,38 @@
+{
+  "schemaVersion": "3.0.0",
+  "revision": 1,
+  "title": "Liteverse",
+  "updated": "2026-07-14",
+  "visuals": {
+    "nebulaAssignmentVersion": 1,
+    "nebulaAssetCatalogVersion": 2,
+    "nebulaAssignmentSeed": "liteverse-nebula-v1",
+    "nebulaAssets": [
+      { "id": "nebular-1", "src": "./nebula-regions/nebular1.png", "enabled": true },
+      { "id": "nebular-2", "src": "./nebula-regions/nebular2.png", "enabled": true },
+      { "id": "nebular-3", "src": "./nebula-regions/nebular3.png", "enabled": true },
+      { "id": "nebular-4", "src": "./nebula-regions/nebular4.png", "enabled": true },
+      { "id": "nebular-5", "src": "./nebula-regions/nebular5.png", "enabled": true },
+      { "id": "nebula-6", "src": "./nebula-regions/nebula6.png", "enabled": true },
+      { "id": "nebula-7", "src": "./nebula-regions/nebula7.png", "enabled": true },
+      { "id": "nebula-8", "src": "./nebula-regions/nebula8.png", "enabled": true },
+      { "id": "nebula-9", "src": "./nebula-regions/nebula9.png", "enabled": true },
+      { "id": "nebula-10", "src": "./nebula-regions/nebula10.png", "enabled": true }
+    ]
+  },
+  "usagePolicy": {
+    "schemaVersion": 1,
+    "managedBy": "liteverse-retriever",
+    "manualUpdates": false,
+    "initialValue": 0,
+    "counter": "useCount",
+    "dedupeScope": "codex-task-paper",
+    "ledger": "Usage/events.jsonl",
+    "cache": "Usage/counts.json",
+    "visualNormalization": { "type": "log1p", "referenceCount": 32 },
+    "regionAggregation": "primary-category-mean"
+  },
+  "categories": [],
+  "papers": [],
+  "relations": []
+}

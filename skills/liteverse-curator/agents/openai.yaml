@@ -1,0 +1,4 @@
+interface:
+  display_name: "Liteverse Curator"
+  short_description: "Curate evidence and offer three partition choices"
+  default_prompt: "Use $liteverse-curator to organize literature, propose three evidence-based macro partitions, and wait for my explicit choice before staging."

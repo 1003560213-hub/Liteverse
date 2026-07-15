@@ -1,0 +1,4 @@
+interface:
+  display_name: "Liteverse Retriever"
+  short_description: "Use pinned Liteverse evidence in research and code"
+  default_prompt: "Use $liteverse-retriever to search Liteverse, build a bounded Context Pack, and apply only hash-verified claims and evidence."
