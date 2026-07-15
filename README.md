@@ -47,7 +47,7 @@ Liteverse deliberately uses three Skills with non-overlapping responsibilities:
 
 The same deterministic core is exposed through the provider-neutral `liteverse`
 local CLI. Codex is the first adapter. A stdio MCP adapter is a future extension
-and is **not implemented in version 0.3.1**.
+and is **not implemented in version 0.3.2**.
 
 When working with an AI, natural language is enough. For example:
 
@@ -266,7 +266,7 @@ data, project memory, Context Packs, or usage ledgers.
 - Backups include immutable knowledge, project memory, task records,
   provenance, and optionally PDF bytes. Restore verifies manifest hashes before
   activation; the rebuildable search cache is excluded.
-- Version 0.3.1 has no account, cloud sync, background daemon, automatic online
+- Version 0.3.2 has no account, cloud sync, background daemon, automatic online
   literature search, or default cloud embedding. Explicitly processing an arXiv
   upload may use the network to verify the requested source.
 - The App does not need to remain open for the Skills or CLI to use the local

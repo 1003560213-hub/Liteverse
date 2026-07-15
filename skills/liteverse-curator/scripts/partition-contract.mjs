@@ -9,6 +9,7 @@ import {
 } from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
+import { selectBackgroundAwareCenter } from "./partition-layout-profile.mjs";
 
 const SHA256 = /^[a-f0-9]{64}$/;
 const SAFE_ID = /^[a-z0-9][a-z0-9._-]{0,95}$/;
@@ -224,28 +225,9 @@ export function assignDeterministicPartitionLayout(source, current, categories, 
       0.95 * unitZ,
     ]);
   });
-  for (const [unresolvedOrder, categoryIndex] of unresolved.entries()) {
+  for (const categoryIndex of unresolved) {
     const category = nextCategories[categoryIndex];
-    let selected;
-    if (macroIndexes.length === 1 && usedCenters.length === 0) {
-      selected = [0, 0, 0];
-    } else if (usedCenters.length === 0 && unresolvedOrder === 0) {
-      selected = candidates[0];
-    } else {
-      let bestDistance = -1;
-      for (const candidate of candidates) {
-        const minimumDistance = Math.min(...usedCenters.map((center) => {
-          const x = (candidate[0] - center[0]) / 3.8;
-          const y = (candidate[1] - center[1]) / 2.55;
-          const z = (candidate[2] - center[2]) / 0.95;
-          return x * x + y * y + z * z;
-        }));
-        if (minimumDistance > bestDistance) {
-          bestDistance = minimumDistance;
-          selected = candidate;
-        }
-      }
-    }
+    const selected = selectBackgroundAwareCenter(candidates, usedCenters);
     if (!isFiniteVector3(selected)) fail(`could not generate a finite center for category ${category.id}`);
     category.center = roundedVector(selected);
     usedCenters.push(category.center);

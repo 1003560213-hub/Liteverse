@@ -11,6 +11,13 @@ import {
   assignDeterministicPartitionLayout,
   isFiniteVector3,
 } from "../skills/liteverse-curator/scripts/partition-contract.mjs";
+import {
+  backgroundFootprintCost,
+  DEFAULT_BACKGROUND_LAYOUT_PROFILE,
+  DEFAULT_LAYOUT_CAMERA,
+  projectDefaultLayoutCenter,
+  summarizeProjectedNebulaOverlap,
+} from "../skills/liteverse-curator/scripts/partition-layout-profile.mjs";
 
 const execFileAsync = promisify(execFile);
 const root = path.resolve(import.meta.dirname, "..");
@@ -388,8 +395,8 @@ test("partition choice nebula assignment preserves reused regions and determinis
   );
 });
 
-test("deterministic partition layout supports one, five, and ten regions within the existing universe view", () => {
-  for (const regionCount of [1, 5, 10]) {
+test("deterministic partition layout supports every region count through ten within the existing universe view", () => {
+  for (const regionCount of Array.from({ length: 10 }, (_, index) => index + 1)) {
     const categories = Array.from({ length: regionCount }, (_, index) => ({
       id: `region-${index + 1}`,
       kind: "macro",
@@ -423,6 +430,10 @@ test("deterministic partition layout supports one, five, and ten regions within 
         paper.position[2] - center[2],
       ) <= 1.16;
     }));
+    if (regionCount > 1) {
+      const depth = first.categories.map((category) => category.center[2]);
+      assert.ok(Math.max(...depth) - Math.min(...depth) > 0.2, "layout must retain meaningful 3D depth");
+    }
   }
 
   const reusedCurrent = {
@@ -437,6 +448,100 @@ test("deterministic partition layout supports one, five, and ten regions within 
     "stable-layout",
   );
   assert.deepEqual(reused.categories[0].center, [1.25, -0.75, 0.2]);
+});
+
+test("background-aware region placement prefers blank image footprints and reduces projected overlap", async () => {
+  assert.equal(DEFAULT_BACKGROUND_LAYOUT_PROFILE.cells.length, 24 * 15);
+  assert.equal(DEFAULT_BACKGROUND_LAYOUT_PROFILE.sourceWidth, 1448);
+  assert.equal(DEFAULT_BACKGROUND_LAYOUT_PROFILE.sourceHeight, 1086);
+  assert.equal(DEFAULT_BACKGROUND_LAYOUT_PROFILE.objectFit, "cover");
+  assert.equal(DEFAULT_BACKGROUND_LAYOUT_PROFILE.objectPosition, "center");
+  assert.equal(
+    hash(await readFile(path.join(root, "public", "liteverse-nebula.png"))),
+    DEFAULT_BACKGROUND_LAYOUT_PROFILE.sourceSha256,
+    "the occupancy profile must stay pinned to the packaged default background",
+  );
+
+  const makeLayout = (regionCount) => {
+    const categories = Array.from({ length: regionCount }, (_, index) => ({
+      id: `background-region-${index + 1}`,
+      kind: "macro",
+      name: `Background region ${index + 1}`,
+    }));
+    const papers = categories.flatMap((category) => Array.from({ length: 4 }, (_, index) => ({
+      id: `${category.id}-paper-${index + 1}`,
+      primaryCategory: category.id,
+      categoryIds: [category.id],
+    })));
+    return assignDeterministicPartitionLayout(
+      { categories: [], papers: [] },
+      { categories: [], papers: [] },
+      categories,
+      papers,
+      `layout-${regionCount}`,
+    );
+  };
+
+  const single = makeLayout(1);
+  const blankCost = backgroundFootprintCost(single.categories[0].center);
+  const brightCenterCost = backgroundFootprintCost([0, 0, 0]);
+  assert.ok(blankCost.cost < brightCenterCost.cost - 0.2, "one region should avoid the bright default-background core");
+  assert.equal(blankCost.edgePenalty, 0, "blank-area preference must not hide the nebula under window chrome");
+
+  const five = makeLayout(5);
+  const fiveOverlap = summarizeProjectedNebulaOverlap(five.categories.map((category) => category.center));
+  assert.equal(fiveOverlap.overlapCount, 0, "available blank footprints should be used before projected overlap");
+
+  const ten = makeLayout(10);
+  const tenCenters = ten.categories.map((category) => category.center);
+  const tenOverlap = summarizeProjectedNebulaOverlap(tenCenters);
+  assert.ok(tenOverlap.overlapCount > 0, "crowded layouts may still overlap instead of failing");
+  const legacyTenCenters = [
+    [-1.636213, 1.647537, 0.598698], [1.655728, -1.46554, -0.658073],
+    [-0.456795, -1.977538, 0.588802], [-3.353753, -0.580249, -0.390885],
+    [3.470932, 0.576347, 0.321615], [0.25077, 1.805393, -0.667969],
+    [-3.125559, -0.611995, 0.489844], [0.382466, -0.041066, 0.945052],
+    [1.037921, 2.442624, 0.084115], [-0.638558, -0.134158, -0.935156],
+  ];
+  const legacyOverlap = summarizeProjectedNebulaOverlap(legacyTenCenters);
+  assert.ok(tenOverlap.totalPenetration < legacyOverlap.totalPenetration * 0.5);
+  assert.ok(tenOverlap.maximumPenetration < legacyOverlap.maximumPenetration);
+  const depth = tenCenters.map((center) => center[2]);
+  assert.ok(Math.max(...depth) - Math.min(...depth) > 0.8, "blank-first placement must remain three-dimensional");
+});
+
+test("stable existing centers remain obstacles and camera rotation still changes their 3D projection", () => {
+  const stableCenter = [3.702999, 0.545826, -0.064323];
+  const current = {
+    categories: [{ id: "stable", kind: "macro", center: stableCenter }],
+    papers: Array.from({ length: 4 }, (_, index) => ({ id: `stable-paper-${index}`, primaryCategory: "stable" })),
+  };
+  const papers = [
+    ...current.papers,
+    ...Array.from({ length: 4 }, (_, index) => ({ id: `new-paper-${index}`, primaryCategory: "new-region" })),
+  ];
+  const result = assignDeterministicPartitionLayout(
+    current,
+    current,
+    [
+      { id: "stable", kind: "macro", name: "Stable" },
+      { id: "new-region", kind: "macro", name: "New region" },
+    ],
+    papers,
+    "stable-obstacle-layout",
+  );
+  assert.deepEqual(result.categories[0].center, stableCenter);
+  const overlap = summarizeProjectedNebulaOverlap(result.categories.map((category) => category.center));
+  assert.equal(overlap.overlapCount, 0);
+
+  const defaultProjection = projectDefaultLayoutCenter(result.categories[1].center);
+  const rotatedProjection = projectDefaultLayoutCenter(
+    result.categories[1].center,
+    DEFAULT_BACKGROUND_LAYOUT_PROFILE,
+    { ...DEFAULT_LAYOUT_CAMERA, rotationY: DEFAULT_LAYOUT_CAMERA.rotationY + 0.65 },
+  );
+  assert.notEqual(defaultProjection.x, rotatedProjection.x);
+  assert.notEqual(defaultProjection.depth, rotatedProjection.depth);
 });
 
 test("Curator contract documents explicit delegated partition selection without treating silence as consent", async () => {
