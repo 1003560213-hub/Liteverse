@@ -208,9 +208,10 @@ heat of its primary papers rather than a raw total.
 
 ## Development
 
-Requirements: macOS 13 or later and Node.js 24 or later.
+Requirements: macOS 13 or later, Node.js 24 or later, and Python 3.12 or later.
 
 ```bash
+python3 -m pip install --requirement requirements.txt
 npm install
 npm run dev
 npm run lint
