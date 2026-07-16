@@ -9,6 +9,10 @@ maintainers under the repository's MIT License:
 - `public/nebula-regions/nebular1.png` through `nebular5.png`
 - `public/nebula-regions/nebula6.png` through `nebula10.png`
 - `public/favicon.svg`
+- `docs/assets/liteverse-icon.png` (README-sized derivative of
+  `public/liteverse-brand.png`)
+- `docs/assets/liteverse-universe-demo.jpg` (Liteverse application screenshot
+  supplied by the project maintainer)
 
 `public/file.svg`, `public/globe.svg`, and `public/window.svg` originate from the
 MIT-licensed `create-next-app` starter maintained by Vercel and are redistributed
