@@ -15,10 +15,10 @@ jobs:
       - name: Check out source
         uses: actions/checkout@v4
 
-      - name: Use Node.js 22
+      - name: Use Node.js 24
         uses: actions/setup-node@v4
         with:
-          node-version: 22.13.0
+          node-version: 24.13.1
           cache: npm
 
       - name: Install dependencies

@@ -208,7 +208,7 @@ heat of its primary papers rather than a raw total.
 
 ## Development
 
-Requirements: macOS 13 or later and Node.js 22.13 or later.
+Requirements: macOS 13 or later and Node.js 24 or later.
 
 ```bash
 npm install

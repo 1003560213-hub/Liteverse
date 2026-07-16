@@ -16,7 +16,7 @@ local-first, evidence-aware, and fail-closed design.
 
 ## Local development
 
-Requirements: macOS 13 or later and Node.js 22.13 or later.
+Requirements: macOS 13 or later and Node.js 24 or later.
 
 ```bash
 npm install

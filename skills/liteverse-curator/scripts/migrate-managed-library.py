@@ -18,6 +18,10 @@ import tempfile
 from typing import Any
 
 
+# Keep the installed Skill tree immutable when the sibling materializer is loaded.
+sys.dont_write_bytecode = True
+
+
 DEFAULT_SUPPORT = Path.home() / "Library" / "Application Support" / "Liteverse"
 SCHEMA_VERSION = "3.0.0"
 CARD_SCHEMA_VERSION = "liteverse-card-v1"
