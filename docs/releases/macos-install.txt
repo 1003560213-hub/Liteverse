@@ -1,0 +1,15 @@
+Liteverse 0.4.0 — Developer Preview
+
+Requirements
+- macOS 13 or later
+- Apple Silicon Mac
+
+Installation
+1. Move Liteverse.app to the Applications folder.
+2. Control-click Liteverse.app and choose Open on first launch.
+
+This build is ad-hoc signed and is not notarized by Apple. macOS may therefore
+show a security prompt on first launch.
+
+Liteverse starts with an empty local library. Personal papers, graph data,
+annotations, Usage records, and research memory are not included.

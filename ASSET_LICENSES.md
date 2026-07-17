@@ -13,6 +13,8 @@ maintainers under the repository's MIT License:
   `public/liteverse-brand.png`)
 - `docs/assets/liteverse-universe-demo.jpg` (Liteverse application screenshot
   supplied by the project maintainer)
+- `docs/assets/liteverse-settings-demo.jpg` (Liteverse Settings screenshot
+  supplied by the project maintainer)
 
 `public/file.svg`, `public/globe.svg`, and `public/window.svg` originate from the
 MIT-licensed `create-next-app` starter maintained by Vercel and are redistributed

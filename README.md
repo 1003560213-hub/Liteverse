@@ -32,6 +32,17 @@ service.
   </sub>
 </p>
 
+## One local research workspace
+
+![Liteverse Settings for literature and research memory](docs/assets/liteverse-settings-demo.jpg)
+
+<p align="center">
+  <sub>
+    Add PDFs or arXiv links, review library health, and manage project memory
+    from one local workspace.
+  </sub>
+</p>
+
 ## What Liteverse does
 
 - Organizes papers into a movable 3D literature universe with up to ten broad
