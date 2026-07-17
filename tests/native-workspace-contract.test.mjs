@@ -165,13 +165,74 @@ test("native partition proposal projection is observed, fail-closed, and backup-
 
 test("native JSONL audit append uses one O_APPEND write for payload and newline", async () => {
   const source = await readFile(path.join(root, "macos", "LiteverseApp.m"), "utf8");
-  const appendMethod = source.match(/- \(void\)appendJSONObject:[\s\S]+?\n}\n\n- \(NSArray \*\)readAnnotations/)?.[0] || "";
+  const appendMethod = source.match(/- \(BOOL\)appendJSONObjects:[\s\S]+?\n}\n\n- \(BOOL\)appendJSONObject/)?.[0] || "";
 
   assert.match(appendMethod, /NSMutableData \*eventLine/);
-  assert.match(appendMethod, /O_WRONLY \| O_CREAT \| O_APPEND/);
+  assert.match(appendMethod, /O_RDWR \| O_CREAT \| O_APPEND/);
   assert.match(appendMethod, /appendData:\[@"\\n" dataUsingEncoding:NSUTF8StringEncoding\]/);
   assert.equal((appendMethod.match(/\bwrite\(/g) || []).length, 1);
+  assert.match(appendMethod, /written == \(ssize_t\)eventLine\.length/);
+  assert.match(appendMethod, /fsync\(descriptor\)/);
+  assert.match(appendMethod, /closeResult/);
+  assert.match(appendMethod, /NSError errorWithDomain:NSPOSIXErrorDomain/);
   assert.doesNotMatch(appendMethod, /seekToEndOfFile|writeData:/);
+});
+
+test("native cross-process mutations share token-owned directory locks", async () => {
+  const source = await readFile(path.join(root, "macos", "LiteverseApp.m"), "utf8");
+
+  assert.match(source, /\.locks\/stage-refresh\.lock/);
+  assert.match(source, /\.locks\/research-memory\.lock/);
+  assert.match(source, /\.locks\/mark-annotation\.lock/);
+  assert.match(source, /acquireDirectoryLockAtURL/);
+  assert.match(source, /releaseDirectoryLockAtURL/);
+  assert.match(source, /owner\[@"token"\]/);
+  assert.match(source, /moveItemAtURL:lockURL toURL:quarantineURL/);
+  assert.match(source, /operation:@"Refresh commit"/);
+  assert.match(source, /operation:@"Project switch"/);
+  assert.match(source, /operation:@"Project creation"/);
+  assert.match(source, /operation:@"Annotation update"/);
+});
+
+test("Research Information appends project-memory truth and synchronizes projections", async () => {
+  const source = await readFile(path.join(root, "macos", "LiteverseApp.m"), "utf8");
+
+  assert.match(source, /validatedResearchMemoryStateForProjectID/);
+  assert.match(source, /Project memory has a mismatched revision or ledgerHash/);
+  assert.match(source, /expectedRevision\.integerValue != previousRevision/);
+  assert.match(source, /@"type": @"memory_recorded"/);
+  assert.match(source, /@"kind": @"app_research_information"/);
+  assert.match(source, /@"supersedes": supersededMemoryID/);
+  assert.match(source, /appendJSONObjects:events toURL:state\[@"ledgerURL"\]/);
+  assert.match(source, /writeResearchMemoryProjectionsForProjectID/);
+  assert.match(source, /research\[@"memoryRevision"\]/);
+  assert.match(source, /research\[@"ledgerHash"\]/);
+  assert.match(source, /events\.jsonl is the only truth/);
+});
+
+test("native Context Preview is revision-pinned, cache-only, and never adopts evidence", async () => {
+  const source = await readFile(path.join(root, "macos", "LiteverseApp.m"), "utf8");
+  const method = source.match(/- \(NSDictionary \*\)buildContextPreviewForPayload:[\s\S]+?\n}\n\n- \(NSDictionary \*\)validatedPartitionProposalsAtURL/)?.[0] || "";
+
+  assert.match(method, /liteverse-context-preview-v1/);
+  assert.match(method, /searchLiteratureAtIndexForQuery:query limit:12/);
+  assert.match(method, /projectDataForID:projectID registry:registry/);
+  assert.match(method, /verificationStatus.*evidence_verified/);
+  assert.match(method, /artifactRevision/);
+  assert.match(method, /artifactSha256/);
+  assert.match(method, /Local FTS5\/BM25 match/);
+  assert.match(method, /Verified relationship-graph expansion/);
+  assert.match(method, /Graph or project memory changed while/);
+  assert.match(method, /@"adopted": @NO/);
+  assert.match(method, /@"usageRecorded": @NO/);
+  assert.match(method, /@"cacheOnly": @YES/);
+  assert.match(method, /Cache\/ContextPreviews/);
+  assert.doesNotMatch(method, /appendJSONObject|appendJSONObjects|usageCountsURL|workspaceInboxURL|currentGraphURL[^\n]+writeJSONObject/);
+
+  assert.match(source, /__liteverseReceiveContextPreview/);
+  assert.match(source, /__liteverseReceiveContextPreviewError/);
+  assert.match(source, /action isEqualToString:@"buildContextPreview"/);
+  assert.match(source, /@"contextPreview": contextPreview \?: NSNull\.null/);
 });
 
 test("native backup import is hash checked and cannot overwrite the active workspace", async () => {
@@ -493,4 +554,18 @@ test("public desktop package starts from an empty schema-v3 graph", async () => 
   assert.deepEqual(emptyGraph.relations, []);
   assert.match(buildScript, /data\/empty-universe\.json/);
   assert.doesNotMatch(buildScript, /\/usr\/bin\/ditto "\$ROOT\/data\/papers"/);
+});
+
+test("local packages can isolate a development workspace without changing release defaults", async () => {
+  const [nativeBridge, buildScript] = await Promise.all([
+    readFile(path.join(root, "macos", "LiteverseApp.m"), "utf8"),
+    readFile(path.join(root, "scripts", "build-macos-app.sh"), "utf8"),
+  ]);
+
+  assert.match(nativeBridge, /objectForInfoDictionaryKey:@"LiteverseWorkspaceDirectory"/);
+  assert.match(nativeBridge, /NSString \*directoryName = @"Liteverse"/);
+  assert.match(nativeBridge, /candidate\.length <= 64/);
+  assert.match(nativeBridge, /rangeOfCharacterFromSet:invalidCharacters/);
+  assert.match(buildScript, /LITEVERSE_WORKSPACE_DIRECTORY/);
+  assert.match(buildScript, /Add :LiteverseWorkspaceDirectory string/);
 });

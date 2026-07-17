@@ -31,8 +31,11 @@ Each item includes:
 - `revision`: positive optimistic-lock integer.
 - timestamps such as `createdAt` and `updatedAt`.
 - optional processing and graph fields: `processingToken`, `attentionReason`, `graphPaperId`, `refreshId`, and `disposition`.
+- optional deterministic-preparation field `preparation`, as defined by `local-preparation-contract.md`. Unknown or stale preparation output never changes the queue state by itself.
 
 Always lock by item ID plus revision. `stage-refresh.mjs` accepts only `pending_codex` or `processing`, increments the revision, and writes the updated revision into the staged manifest.
+
+An App preparation commit also uses item ID plus revision. It may install hash-verified draft artifacts, increment the revision, and set `preparation.state: "ready"`, but it leaves `status: "pending_codex"`. Curator must lock the resulting new revision. A failed or unreadable result sets `preparation.state: "needs_attention"` and the existing queue `status: "needs_attention"`; it must retain the source and diagnostic rather than delete the item.
 
 The sole exception is explicit `--replace-pending` recovery. It must receive the complete library-item set from the old pending manifest and verifies the live items are still `ready_to_refresh`, at the recorded revisions, mapped to the same papers, and owned by the old refresh. It transfers them to the replacement refresh without incrementing their revisions; missing, added, changed, stale, or orphaned items abort recovery.
 

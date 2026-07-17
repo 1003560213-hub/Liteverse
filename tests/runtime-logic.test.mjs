@@ -127,6 +127,31 @@ test("research memory rejects blank input without trimming meaningful whitespace
   assert.equal(runtime.researchTextForSave(" \n\t  "), undefined);
 });
 
+test("local context previews are request-scoped, non-adopting, and cache-opaque", async () => {
+  const [component, settings] = await Promise.all([
+    readFile(path.join(root, "app", "universe", "LiteratureUniverse.tsx"), "utf8"),
+    readFile(path.join(root, "app", "universe", "SettingsDrawer.tsx"), "utf8"),
+  ]);
+  const buildStart = component.indexOf("const buildContextPreview =");
+  const buildEnd = component.indexOf("const queueContextRequest =", buildStart);
+  assert.ok(buildStart >= 0 && buildEnd > buildStart);
+  const buildSource = component.slice(buildStart, buildEnd);
+
+  assert.match(buildSource, /action: "buildContextPreview"/);
+  assert.match(buildSource, /requestId/);
+  assert.match(buildSource, /projectId: workspace\.projects\.activeProjectId/);
+  assert.match(buildSource, /budgetChars/);
+  assert.doesNotMatch(buildSource, /recordUsage|saveUsage|paperAdopted/);
+  assert.match(component, /payload\.requestId !== contextPreviewRequestRef\.current/);
+  assert.match(component, /const contextPreview = normalizeContextPreview\(input\?\.contextPreview\)/);
+  assert.match(component, /contextPreview: contextPreview\?\.projectId === activeProjectId \? contextPreview : null/);
+  assert.match(component, /delete hostWindow\.__liteverseReceiveContextPreview/);
+  assert.match(component, /delete hostWindow\.__liteverseReceiveContextPreviewError/);
+  assert.match(settings, /selectedContextIsLocal/);
+  assert.match(settings, /!selectedContextIsLocal && \(selectedContext\.markdownPath \|\| selectedContext\.jsonPath\)/);
+  assert.doesNotMatch(settings, /onOpenWorkspacePath\(selectedContext\.cachePath/);
+});
+
 test("source contains crash-safe annotation and native graph guards", async () => {
   const [component, nativeBridge] = await Promise.all([
     readFile(path.join(root, "app", "universe", "LiteratureUniverse.tsx"), "utf8"),
@@ -157,6 +182,7 @@ test("source contains crash-safe annotation and native graph guards", async () =
   assert.match(nativeBridge, /applicationWillTerminate/);
   assert.match(nativeBridge, /NSString \*trimmedText = \[rawText stringByTrimmingCharactersInSet:/);
   assert.match(nativeBridge, /NSString \*text = rawText;/);
-  assert.match(nativeBridge, /NSString \*markdown = text;/);
+  assert.match(nativeBridge, /\[text writeToURL:markdownURL atomically:YES/);
+  assert.match(nativeBridge, /append-only project memory ledger/);
   assert.doesNotMatch(nativeBridge, /NSString \*text = \[rawText stringByTrimmingCharactersInSet:/);
 });

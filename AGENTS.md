@@ -46,10 +46,18 @@ live under `~/.codex/skills/`:
   metadata, task outcomes, conflicts, and handoffs. It must obtain paper evidence
   through Retriever and never modify `Knowledge/`, `Graph/`, `Usage/`, or PDFs.
 
+The macOS App may run the bundled, short-lived `LiteverseLocalWorker` for
+deterministic preparation. A valid `library.json` item with
+`preparation.state: "ready"` already has hash-pinned page extraction and a card
+skeleton; Curator verifies and reuses those bytes instead of repeating the
+materializer. Local preparation, review packets, and candidate scores are never
+scientific evidence and never promote a card, relationship, classification, or
+Usage count.
+
 Do not split these responsibilities into per-feature Skills. The CLI is the
 provider-neutral interface; Codex is the first adapter. Liteverse has no
-background daemon, automatic online literature search, cloud sync, or shipped
-stdio MCP adapter.
+background daemon, bundled Node/Python runtime, local model, automatic online
+literature search, cloud sync, or shipped stdio MCP adapter.
 
 ## Macro-region decisions
 

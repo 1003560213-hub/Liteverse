@@ -11,7 +11,7 @@ Preserve project knowledge as append-only events. Treat projections as rebuildab
 
 1. Resolve the support directory from `--support-dir`, `LITEVERSE_SUPPORT_DIR`, or `~/Library/Application Support/Liteverse`.
 2. Run `scripts/status.mjs --json`. Select the project explicitly when more than one exists.
-3. Initialize a project with `scripts/project.mjs create-or-init --project <id> --name <name> --activate`. For the first migration, add `--import-existing-research` to preserve the complete existing Research Information as one user-declared memory before later structuring it.
+3. Initialize a project with `scripts/project.mjs create-or-init --project <id> --name <name> --activate`. For the first migration, add `--import-existing-research` to preserve the complete existing Research Information as one user-declared memory before later structuring it. Research Information saved by Liteverse 0.4 or later may already be an append-only `project_context` event; verify the project revision and ledger hash and do not import or duplicate it again.
 4. Begin each reusable task with `scripts/begin-task.mjs --project <id> --summary <text>`. Let `LITEVERSE_TASK_ID` identify a generic AI task; Codex falls back to `CODEX_THREAD_ID`. Never invent a persistent raw task identifier.
 5. Search active project memory with `scripts/search-memory.mjs --project <id> --query <text>`. Do not search across projects unless the user explicitly requests `--all-projects`.
 6. If the task needs literature, invoke `liteverse-retriever` first. Accept only its paper, claim, evidence, artifact revision, and artifact hash receipt; never read paper cards, Graph, or Usage through this Skill.
@@ -36,4 +36,3 @@ Pass `--expected-revision <n>` on coordinated writes. On a conflict, reload stat
 - Read `references/memory-contract.md` before changing schemas, projections, or concurrency behavior.
 - Read `references/evidence-and-merge-policy.md` before recording supported, contradicted, superseding, code, or experiment memory.
 - Run `scripts/research-memory.mjs --help` for the complete umbrella interface. The small command scripts are stable wrappers around it.
-

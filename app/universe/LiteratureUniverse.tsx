@@ -12,6 +12,7 @@ import {
 import emptyUniverseData from "../../data/empty-universe.json";
 import {
   SettingsDrawer,
+  type ContextPack,
   type LibraryHealth,
   type LibraryItem,
   type LiteratureSearchPayload,
@@ -118,7 +119,18 @@ type CommitReveal = {
 const DEFAULT_ROTATION = { x: -0.08, y: -0.22 } as const;
 const DEFAULT_ZOOM = 1.08;
 const REGION_FOCUS_ZOOM = 1.78;
-const CAMERA_TRANSITION_MS = 720;
+const CAMERA_TRANSITION_MS = 620;
+const INTERACTION_FPS = 30;
+const IDLE_FPS = 12;
+const BACKGROUND_FPS = 4;
+
+function sameHitTarget(left: HitTarget, right: HitTarget) {
+  if (left === right) return true;
+  if (!left || !right || left.kind !== right.kind) return false;
+  if (left.kind === "paper" && right.kind === "paper") return left.id === right.id;
+  if (left.kind === "category" && right.kind === "category") return left.id === right.id;
+  return left.kind === "relation" && right.kind === "relation" && left.key === right.key;
+}
 
 function paperIntegrityIssue(
   paperId: string,
@@ -195,6 +207,8 @@ type LiteverseHostWindow = typeof window & {
   __liteverseReceiveKnowledgeCard?: (payload: KnowledgeCardPayload) => void;
   __liteverseReceiveLiteratureSearch?: (payload: LiteratureSearchPayload) => void;
   __liteverseReceiveLiteratureSearchError?: (payload: { requestId: string; message: string }) => void;
+  __liteverseReceiveContextPreview?: (payload: ContextPack) => void;
+  __liteverseReceiveContextPreviewError?: (payload: { requestId: string; message: string }) => void;
   __liteverseReceiveUniverse?: (
     graph: UniverseGraph | { graph: UniverseGraph; usageCounts?: UsageCounts },
     usage?: UsageCounts,
@@ -226,6 +240,7 @@ const EMPTY_WORKSPACE: WorkspaceState = {
   projectMemory: { revision: 0, items: [] },
   tasks: [],
   contextPacks: [],
+  contextPreview: null,
   artifacts: [],
   searchProjection: [],
   projectUseCounts: {},
@@ -338,9 +353,41 @@ function normalizePartitionProposals(input: unknown): PartitionProposalSet | nul
   return validOptions ? proposal as PartitionProposalSet : null;
 }
 
+function normalizeContextPreview(input: unknown): ContextPack | null {
+  if (!input || typeof input !== "object") return null;
+  const preview = input as Partial<ContextPack>;
+  if (
+    preview.schemaVersion !== "liteverse-context-preview-v1"
+    || preview.contextKind !== "local_preview"
+    || preview.adopted !== false
+    || preview.usageRecorded !== false
+    || preview.cacheOnly !== true
+    || typeof preview.contextId !== "string"
+    || !preview.contextId
+    || typeof preview.requestId !== "string"
+    || !preview.requestId
+    || typeof preview.projectId !== "string"
+    || !preview.projectId
+    || typeof preview.query !== "string"
+    || !preview.query
+    || typeof preview.cachePath !== "string"
+    || !preview.cachePath
+    || !Array.isArray(preview.selectedClaims)
+    || !Array.isArray(preview.projectMemory)
+    || !Array.isArray(preview.conflicts)
+    || !Array.isArray(preview.limitations)
+  ) return null;
+  return {
+    ...preview,
+    source: "local_preview",
+    adoptionState: "not_adopted",
+  } as ContextPack;
+}
+
 function normalizeWorkspaceState(input: Partial<WorkspaceState> | null | undefined): WorkspaceState {
   const projects = input?.projects;
   const activeProjectId = projects?.activeProjectId || "project-default";
+  const contextPreview = normalizeContextPreview(input?.contextPreview);
   const projectItems = Array.isArray(projects?.items) && projects.items.length > 0
     ? projects.items
     : [{ id: activeProjectId, name: activeProjectId === "project-default" ? "Default project" : activeProjectId }];
@@ -375,6 +422,7 @@ function normalizeWorkspaceState(input: Partial<WorkspaceState> | null | undefin
     },
     tasks: Array.isArray(input?.tasks) ? input.tasks : [],
     contextPacks: Array.isArray(input?.contextPacks) ? input.contextPacks : [],
+    contextPreview: contextPreview?.projectId === activeProjectId ? contextPreview : null,
     artifacts: Array.isArray(input?.artifacts) ? input.artifacts : [],
     searchProjection: Array.isArray(input?.searchProjection) ? input.searchProjection : [],
     projectUseCounts: input?.projectUseCounts && typeof input.projectUseCounts === "object"
@@ -433,13 +481,23 @@ export function LiteratureUniverse() {
   const selectedPaperRef = useRef<string | null>(null);
   const selectedRelationRef = useRef<string | null>(null);
   const hoveredRef = useRef<HitTarget>(null);
+  const universeRef = useRef<UniverseGraph>(FALLBACK_UNIVERSE);
   const visibleRef = useRef<Set<string>>(new Set());
   const heatRef = useRef<Record<string, number>>({});
+  const categoryFilterRef = useRef("all");
+  const relationBundlesRef = useRef<RelationBundle[]>([]);
   const rotationRef = useRef<{ x: number; y: number }>({ ...DEFAULT_ROTATION });
   const zoomRef = useRef(DEFAULT_ZOOM);
   const cameraCenterRef = useRef<Vector3>([0, 0, 0]);
   const cameraTransitionRef = useRef<CameraTransition | null>(null);
   const pointerRef = useRef({ down: false, x: 0, y: 0, moved: false });
+  const pendingPointerHitRef = useRef<{
+    clientX: number;
+    clientY: number;
+    canvas: HTMLCanvasElement;
+  } | null>(null);
+  const pointerHitFrameRef = useRef(0);
+  const requestRefreshCommitRef = useRef<(() => void) | null>(null);
   const settingsButtonRef = useRef<HTMLButtonElement>(null);
   const researchDraftDirtyRef = useRef(false);
   const pendingWorkspaceActionRef = useRef<"pdf" | "arxiv" | "research" | null>(null);
@@ -502,6 +560,12 @@ export function LiteratureUniverse() {
   const [literatureSearchError, setLiteratureSearchError] = useState("");
   const literatureSearchRequestRef = useRef<string | null>(null);
   const literatureSearchTimeoutRef = useRef<number | null>(null);
+  const [localContextPreview, setLocalContextPreview] = useState<ContextPack | null>(null);
+  const [contextPreviewBusy, setContextPreviewBusy] = useState(false);
+  const [contextPreviewError, setContextPreviewError] = useState("");
+  const contextPreviewRequestRef = useRef<string | null>(null);
+  const contextPreviewProjectRef = useRef<string | null>(null);
+  const contextPreviewTimeoutRef = useRef<number | null>(null);
 
   useEffect(() => {
     const hostWindow = window as LiteverseHostWindow;
@@ -608,6 +672,16 @@ export function LiteratureUniverse() {
       const nextWorkspace = normalizeWorkspaceState(rawWorkspace);
       const pendingAction = pendingWorkspaceActionRef.current;
       setWorkspace(nextWorkspace);
+      if (nextWorkspace.contextPreview) {
+        setLocalContextPreview((current) => {
+          if (
+            current
+            && current.projectId === nextWorkspace.contextPreview?.projectId
+            && (current.createdAt || "") > (nextWorkspace.contextPreview?.createdAt || "")
+          ) return current;
+          return nextWorkspace.contextPreview || null;
+        });
+      }
       setWorkspaceBusyAction(null);
       pendingWorkspaceActionRef.current = null;
       setWorkspaceError("");
@@ -644,6 +718,37 @@ export function LiteratureUniverse() {
       setLiteratureSearchBusy(false);
       setLiteratureSearchError(payload.message || "The local literature index is unavailable. Run `liteverse index rebuild` and try again.");
     };
+    hostWindow.__liteverseReceiveContextPreview = (payload) => {
+      if (payload.requestId !== contextPreviewRequestRef.current) return;
+      const expectedProjectId = contextPreviewProjectRef.current;
+      if (contextPreviewTimeoutRef.current !== null) {
+        window.clearTimeout(contextPreviewTimeoutRef.current);
+        contextPreviewTimeoutRef.current = null;
+      }
+      contextPreviewRequestRef.current = null;
+      contextPreviewProjectRef.current = null;
+      const preview = normalizeContextPreview(payload);
+      if (!preview || preview.projectId !== expectedProjectId) {
+        setContextPreviewBusy(false);
+        setContextPreviewError("The local preview response was incomplete and was not displayed.");
+        return;
+      }
+      setLocalContextPreview(preview);
+      setWorkspace((current) => ({ ...current, contextPreview: preview }));
+      setContextPreviewBusy(false);
+      setContextPreviewError("");
+    };
+    hostWindow.__liteverseReceiveContextPreviewError = (payload) => {
+      if (payload.requestId !== contextPreviewRequestRef.current) return;
+      if (contextPreviewTimeoutRef.current !== null) {
+        window.clearTimeout(contextPreviewTimeoutRef.current);
+        contextPreviewTimeoutRef.current = null;
+      }
+      contextPreviewRequestRef.current = null;
+      contextPreviewProjectRef.current = null;
+      setContextPreviewBusy(false);
+      setContextPreviewError(payload.message || "The local context preview could not be built.");
+    };
     hostWindow.__liteverseReceiveWorkspaceHealth = (health) => {
       setWorkspace((current) => ({ ...current, health }));
     };
@@ -656,6 +761,17 @@ export function LiteratureUniverse() {
       setWorkspaceNotice(`Backup verified and imported into the recovery area: ${payload.recoveryPath || payload.path || "Recovered"}`);
     };
     hostWindow.__liteverseWorkspaceError = (nativeError) => {
+      if (nativeError.action === "buildContextPreview") {
+        if (contextPreviewTimeoutRef.current !== null) {
+          window.clearTimeout(contextPreviewTimeoutRef.current);
+          contextPreviewTimeoutRef.current = null;
+        }
+        contextPreviewRequestRef.current = null;
+        contextPreviewProjectRef.current = null;
+        setContextPreviewBusy(false);
+        setContextPreviewError(nativeError.message || "The local context preview could not be built.");
+        return;
+      }
       pendingWorkspaceActionRef.current = null;
       setWorkspaceBusyAction(null);
       setWorkspaceError(nativeError.message || "The local data operation failed. Try again shortly.");
@@ -742,6 +858,7 @@ export function LiteratureUniverse() {
           const restoredWorkspace = normalizeWorkspaceState(JSON.parse(cachedWorkspace));
           fallbackFrames.push(window.requestAnimationFrame(() => {
             setWorkspace(restoredWorkspace);
+            setLocalContextPreview(restoredWorkspace.contextPreview || null);
             setResearchDraft(
               editableResearchText(restoredWorkspace.researchInformation),
             );
@@ -765,6 +882,8 @@ export function LiteratureUniverse() {
       delete hostWindow.__liteverseReceiveKnowledgeCard;
       delete hostWindow.__liteverseReceiveLiteratureSearch;
       delete hostWindow.__liteverseReceiveLiteratureSearchError;
+      delete hostWindow.__liteverseReceiveContextPreview;
+      delete hostWindow.__liteverseReceiveContextPreviewError;
       delete hostWindow.__liteverseReceiveUniverse;
       delete hostWindow.__liteverseReceivePendingRefresh;
       delete hostWindow.__liteverseRefreshCommitted;
@@ -772,6 +891,12 @@ export function LiteratureUniverse() {
         window.clearTimeout(literatureSearchTimeoutRef.current);
         literatureSearchTimeoutRef.current = null;
       }
+      if (contextPreviewTimeoutRef.current !== null) {
+        window.clearTimeout(contextPreviewTimeoutRef.current);
+        contextPreviewTimeoutRef.current = null;
+      }
+      contextPreviewRequestRef.current = null;
+      contextPreviewProjectRef.current = null;
     };
   }, []);
 
@@ -805,6 +930,26 @@ export function LiteratureUniverse() {
   const getPaper = useCallback(
     (id: string) => paperById.get(id) || universe.papers[0]!,
     [paperById, universe.papers],
+  );
+  const renderResourceFingerprint = useMemo(
+    () => JSON.stringify({
+      categories: universe.categories.map((category) => ({
+        id: category.id,
+        name: category.name,
+        color: category.color,
+        center: category.center,
+        nebulaAssetId: category.nebulaAssetId,
+      })),
+      papers: universe.papers.map((paper) => ({
+        id: paper.id,
+        shortTitle: paper.shortTitle,
+        primaryCategory: paper.primaryCategory,
+        categoryIds: paper.categoryIds,
+        position: paper.position,
+      })),
+      visuals: universe.visuals,
+    }),
+    [universe.categories, universe.papers, universe.visuals],
   );
 
   const heatByPaper = useMemo(
@@ -1091,6 +1236,9 @@ export function LiteratureUniverse() {
     selectedPaperRef.current = selectedPaperId;
   }, [selectedPaperId]);
   useEffect(() => {
+    universeRef.current = universe;
+  }, [universe]);
+  useEffect(() => {
     selectedRelationRef.current = selectedRelationKey;
   }, [selectedRelationKey]);
   useEffect(() => {
@@ -1102,6 +1250,20 @@ export function LiteratureUniverse() {
   useEffect(() => {
     heatRef.current = heatByPaper;
   }, [heatByPaper]);
+  useEffect(() => {
+    categoryFilterRef.current = categoryFilter;
+  }, [categoryFilter]);
+  useEffect(() => {
+    relationBundlesRef.current = relationBundles;
+  }, [relationBundles]);
+  useEffect(
+    () => () => {
+      if (pointerHitFrameRef.current) {
+        window.cancelAnimationFrame(pointerHitFrameRef.current);
+      }
+    },
+    [],
+  );
 
   const startCameraTransition = useCallback(
     (toCenter: Vector3, toZoom: number) => {
@@ -1179,6 +1341,10 @@ export function LiteratureUniverse() {
     }, 950);
   }, []);
 
+  useEffect(() => {
+    requestRefreshCommitRef.current = requestRefreshCommit;
+  }, [requestRefreshCommit]);
+
   const startPendingRefresh = useCallback(() => {
     if (!pendingRefresh || refreshAnimationRef.current || refreshPhase !== "idle") {
       return;
@@ -1231,6 +1397,17 @@ export function LiteratureUniverse() {
     if (!canvas) return;
     const context = canvas.getContext("2d");
     if (!context) return;
+    const renderUniverse = universeRef.current;
+    const renderCategoriesById = new Map(
+      renderUniverse.categories.map((category) => [category.id, category]),
+    );
+    const renderPapersById = new Map(
+      renderUniverse.papers.map((paper) => [paper.id, paper]),
+    );
+    const getRenderCategory = (id: string) =>
+      renderCategoriesById.get(id) || renderUniverse.categories[0]!;
+    const getRenderPaper = (id: string) =>
+      renderPapersById.get(id) || renderUniverse.papers[0]!;
 
     let frame = 0;
     let width = 0;
@@ -1263,13 +1440,21 @@ export function LiteratureUniverse() {
       phase: seeded(index, 16) * Math.PI * 2,
     }));
     const categoryMembers = new Map(
-      universe.categories.map((category) => [
+      renderUniverse.categories.map((category) => [
         category.id,
-        universe.papers.filter((paper) => paper.categoryIds.includes(category.id)),
+        renderUniverse.papers.filter((paper) => paper.categoryIds.includes(category.id)),
+      ]),
+    );
+    const primaryCategoryMembers = new Map(
+      renderUniverse.categories.map((category) => [
+        category.id,
+        renderUniverse.papers.filter(
+          (paper) => paper.primaryCategory === category.id,
+        ),
       ]),
     );
     const categoryParticles = new Map(
-      universe.categories.map((category) => [
+      renderUniverse.categories.map((category) => [
         category.id,
         Array.from({ length: 84 }, (_, index) => {
           const seedIndex = (stableHash(category.id) % 10_000) * 211 + index;
@@ -1315,7 +1500,7 @@ export function LiteratureUniverse() {
     };
 
     const starSprites = new Map(
-      universe.categories.map((category) => [
+      renderUniverse.categories.map((category) => [
         category.id,
         createStarSprite(category.color),
       ]),
@@ -1390,16 +1575,16 @@ export function LiteratureUniverse() {
     };
 
     const nebulaTextures = new Map(
-      universe.categories.map((category) => [
+      renderUniverse.categories.map((category) => [
         category.id,
         createNebulaTexture(category),
       ]),
     );
 
     const categoryNebulaAssignments = resolveRegionNebulaAssignments(
-      universe.categories,
-      universe.visuals.nebulaAssets,
-      universe.visuals.nebulaAssignmentSeed,
+      renderUniverse.categories,
+      renderUniverse.visuals.nebulaAssets,
+      renderUniverse.visuals.nebulaAssignmentSeed,
     );
     const regionNebulaSprites = new Map<string, HTMLCanvasElement>();
     const regionNebulaSources: HTMLImageElement[] = [];
@@ -1444,7 +1629,7 @@ export function LiteratureUniverse() {
     };
 
     const assignedNebulaAssetIds = new Set(categoryNebulaAssignments.values());
-    for (const asset of universe.visuals.nebulaAssets) {
+    for (const asset of renderUniverse.visuals.nebulaAssets) {
       // Ten artwork choices remain available to future regions, but only the
       // assets visible in the current graph need to be decoded into memory.
       if (!assignedNebulaAssetIds.has(asset.id)) continue;
@@ -1585,17 +1770,18 @@ export function LiteratureUniverse() {
         refreshAnimationRef.current ||
         commitRevealRef.current,
       );
-      // The visual language is cinematic, so 24 fps is sufficient while idle.
-      // Interactions rise to 30 fps, and an unfocused window falls to 8 fps.
-      // This avoids continuously redrawing a multi-megapixel composited canvas
-      // at the display's full refresh rate.
-      const targetFps = reducedMotion
-        ? 2
-        : windowFocused
-          ? activelyMoving
-            ? 30
-            : 24
-          : 8;
+      // The universe is intentionally calm while idle. Interaction gets a
+      // responsive 30 fps budget, while a background window drops to 4 fps.
+      // Hidden windows are stopped entirely by the visibility handler below.
+      const targetFps = windowFocused
+        ? activelyMoving
+          ? reducedMotion
+            ? IDLE_FPS
+            : INTERACTION_FPS
+          : reducedMotion
+            ? BACKGROUND_FPS
+            : IDLE_FPS
+        : BACKGROUND_FPS;
       if (time - lastRenderedAt < 1000 / targetFps) {
         frame = window.requestAnimationFrame(render);
         return;
@@ -1681,17 +1867,16 @@ export function LiteratureUniverse() {
       context.restore();
 
       const worldScale = Math.min(width, height) * 0.115 * zoomRef.current;
-      const categoryFrames = universe.categories
+      const categoryFrames = renderUniverse.categories
         .filter(
           (category) =>
-            categoryFilter === "all" || category.id === categoryFilter,
+            categoryFilterRef.current === "all" ||
+            category.id === categoryFilterRef.current,
         )
         .map((category) => {
           const center = project(category.center);
           const members = categoryMembers.get(category.id)!;
-          const primaryMembers = universe.papers.filter(
-            (paper) => paper.primaryCategory === category.id,
-          );
+          const primaryMembers = primaryCategoryMembers.get(category.id)!;
           const extentMembers = primaryMembers.length > 0 ? primaryMembers : members;
           const worldExtent = Math.max(
             1.55,
@@ -1861,9 +2046,10 @@ export function LiteratureUniverse() {
         }
 
         context.save();
-        const categoryLabel = category.name.toUpperCase();
-        context.font = "650 14px -apple-system, BlinkMacSystemFont, 'PingFang SC', sans-serif";
-        const categoryLabelWidth = context.measureText(categoryLabel).width;
+        const categoryLabel = category.name;
+        context.font = "600 15px -apple-system, BlinkMacSystemFont, 'SF Pro Display', sans-serif";
+        const categoryLabelAccentWidth = 18;
+        const categoryLabelWidth = context.measureText(categoryLabel).width + categoryLabelAccentWidth;
         // Keep region names below the header/search controls and inside the
         // viewport. Large nebula sprites can otherwise place the label behind
         // the chrome even while the region itself remains visible.
@@ -1875,22 +2061,28 @@ export function LiteratureUniverse() {
           176,
           Math.min(height - 36, center.y - radius * 0.43),
         );
-        context.lineJoin = "round";
-        context.lineWidth = 3.5;
-        context.strokeStyle = "rgba(2, 7, 20, 0.82)";
-        context.shadowColor = "rgba(2, 7, 20, 0.92)";
-        context.shadowBlur = 8;
-        context.strokeText(categoryLabel, categoryLabelX, categoryLabelY);
-        context.fillStyle = hexToRgba(category.color, 0.96);
-        context.shadowColor = hexToRgba(category.color, 0.84);
-        context.shadowBlur = 12;
-        context.fillText(categoryLabel, categoryLabelX, categoryLabelY);
+        context.globalCompositeOperation = "source-over";
+        context.fillStyle = "rgba(245, 245, 247, 0.92)";
+        context.shadowColor = "rgba(0, 0, 0, 0.68)";
+        context.shadowBlur = 4;
+        context.shadowOffsetY = 1;
+        context.fillText(
+          categoryLabel,
+          categoryLabelX + categoryLabelAccentWidth,
+          categoryLabelY,
+        );
+        context.shadowBlur = 0;
+        context.shadowOffsetY = 0;
+        context.fillStyle = hexToRgba(category.color, 0.78);
+        context.beginPath();
+        context.arc(categoryLabelX + 4, categoryLabelY - 5, 2.8, 0, Math.PI * 2);
+        context.fill();
         context.restore();
       }
       projectedRegionsRef.current = projectedRegions;
 
       const positions = new Map<string, ReturnType<typeof project>>();
-      for (const paper of universe.papers) {
+      for (const paper of renderUniverse.papers) {
         positions.set(paper.id, project(paper.position));
       }
 
@@ -1985,12 +2177,12 @@ export function LiteratureUniverse() {
           lastBurstAt +
           (newPaperIds.length > 0 ? activeRefresh.waveDurationMs : 520);
         if (time - activeRefresh.startedAt >= totalDuration) {
-          requestRefreshCommit();
+          requestRefreshCommitRef.current?.();
         }
       }
 
       const projectedRelations: ProjectedRelation[] = [];
-      for (const [bundleIndex, bundle] of relationBundles.entries()) {
+      for (const [bundleIndex, bundle] of relationBundlesRef.current.entries()) {
         if (
           !visibleRef.current.has(bundle.source) ||
           !visibleRef.current.has(bundle.target)
@@ -2033,11 +2225,11 @@ export function LiteratureUniverse() {
             sum + (relation.evidenceIds?.length || relation.evidenceCount || 0),
           0,
         );
-        const sourceColor = getCategory(
-          getPaper(bundle.source).primaryCategory,
+        const sourceColor = getRenderCategory(
+          getRenderPaper(bundle.source).primaryCategory,
         ).color;
-        const targetColor = getCategory(
-          getPaper(bundle.target).primaryCategory,
+        const targetColor = getRenderCategory(
+          getRenderPaper(bundle.target).primaryCategory,
         ).color;
         const gradient = context.createLinearGradient(
           source.x,
@@ -2047,17 +2239,20 @@ export function LiteratureUniverse() {
         );
         gradient.addColorStop(
           0,
-          hexToRgba(sourceColor, allUnscored ? (focused ? 0.38 : 0.055) : (focused ? 0.95 : 0.28)),
+          hexToRgba(sourceColor, allUnscored ? (focused ? 0.34 : 0.075) : (focused ? 0.92 : 0.62)),
         );
         gradient.addColorStop(
           1,
-          hexToRgba(targetColor, allUnscored ? (focused ? 0.38 : 0.055) : (focused ? 0.95 : 0.28)),
+          hexToRgba(targetColor, allUnscored ? (focused ? 0.34 : 0.075) : (focused ? 0.92 : 0.62)),
         );
-        const lineWidth =
-          (allUnscored ? (focused ? 1.35 : 0.42) : (focused ? 2.1 : 0.78)) +
-          Math.sqrt(Math.max(1, evidenceCount)) *
-            (allUnscored ? 0.24 : focused ? 1.5 : 0.84) *
-            (0.46 + relationStrength * 0.74);
+        const evidenceWeight = Math.min(
+          1.25,
+          Math.sqrt(Math.max(1, evidenceCount)) * 0.24,
+        );
+        const lineWidth = allUnscored
+          ? (focused ? 1.15 : 0.52) + evidenceWeight * 0.18
+          : (focused ? 1.75 : 0.9) +
+            evidenceWeight * (0.4 + relationStrength * 0.35);
         const control = {
           x: (source.x + target.x) / 2,
           y: (source.y + target.y) / 2 - 11 * bundle.relations.length,
@@ -2071,21 +2266,21 @@ export function LiteratureUniverse() {
         context.lineCap = "round";
         context.strokeStyle = gradient;
         context.setLineDash(lineDash);
-        context.globalAlpha = (
-          allUnscored ? (focused ? 0.16 : 0.026) : (focused ? 0.32 : 0.13)
-        ) * revealAlpha;
-        context.lineWidth = lineWidth * 4.2;
-        context.shadowColor = hexToRgba(sourceColor, focused ? 0.82 : 0.35);
-        context.shadowBlur = focused ? 20 : 10;
-        context.beginPath();
-        context.moveTo(source.x, source.y);
-        context.quadraticCurveTo(control.x, control.y, target.x, target.y);
-        context.stroke();
+        if (focused) {
+          context.globalAlpha = (allUnscored ? 0.1 : 0.14) * revealAlpha;
+          context.lineWidth = lineWidth + 1.25;
+          context.shadowBlur = 0;
+          context.beginPath();
+          context.moveTo(source.x, source.y);
+          context.quadraticCurveTo(control.x, control.y, target.x, target.y);
+          context.stroke();
+        }
 
-        context.globalAlpha = (allUnscored ? (focused ? 0.48 : 0.07) : 1) * revealAlpha;
+        context.globalAlpha = (
+          allUnscored ? (focused ? 0.6 : 0.22) : (focused ? 0.98 : 0.78)
+        ) * revealAlpha;
         context.lineWidth = lineWidth;
-        context.shadowColor = focused ? hexToRgba(sourceColor, 0.82) : "transparent";
-        context.shadowBlur = focused ? 12 : 0;
+        context.shadowBlur = 0;
         context.beginPath();
         context.moveTo(source.x, source.y);
         context.quadraticCurveTo(control.x, control.y, target.x, target.y);
@@ -2093,22 +2288,19 @@ export function LiteratureUniverse() {
 
         context.setLineDash(lineDash);
         context.strokeStyle = `rgba(238,248,255,${
-          allUnscored ? (focused ? 0.22 : 0.035) : focused ? 0.52 : 0.12
+          allUnscored ? (focused ? 0.12 : 0.025) : focused ? 0.32 : 0.13
         })`;
-        context.lineWidth = Math.max(0.55, lineWidth * 0.22);
+        context.lineWidth = Math.max(0.35, lineWidth * 0.18);
         context.shadowBlur = 0;
         context.beginPath();
         context.moveTo(source.x, source.y);
         context.quadraticCurveTo(control.x, control.y, target.x, target.y);
         context.stroke();
 
-        context.globalCompositeOperation = "lighter";
-        context.fillStyle = focused
-          ? "rgba(235,250,255,.96)"
-          : "rgba(173,222,255,.58)";
-        context.shadowColor = hexToRgba(targetColor, 0.9);
-        context.shadowBlur = focused ? 13 : 7;
-        const photonCount = allUnscored && !focused ? 0 : focused ? 3 : 1;
+        context.globalCompositeOperation = "source-over";
+        context.fillStyle = "rgba(238, 248, 255, 0.72)";
+        context.shadowBlur = 0;
+        const photonCount = focused ? 1 : 0;
         for (let photonIndex = 0; photonIndex < photonCount; photonIndex += 1) {
           const photonT =
             ((motionTime * 0.00007 +
@@ -2127,7 +2319,7 @@ export function LiteratureUniverse() {
             2 * inverse * photonT * control.y +
             photonT * photonT * target.y;
           context.beginPath();
-          context.arc(photonX, photonY, focused ? 1.9 : 1.15, 0, Math.PI * 2);
+          context.arc(photonX, photonY, 1, 0, Math.PI * 2);
           context.fill();
         }
         context.restore();
@@ -2162,7 +2354,7 @@ export function LiteratureUniverse() {
         radius: number;
         emphasized: boolean;
       }> = [];
-      const depthSorted = [...universe.papers].sort(
+      const depthSorted = [...renderUniverse.papers].sort(
         (left, right) => positions.get(right.id)!.depth - positions.get(left.id)!.depth,
       );
       for (const paper of depthSorted) {
@@ -2176,9 +2368,10 @@ export function LiteratureUniverse() {
         const selected = selectedPaperRef.current === paper.id;
         const hoveredPaper =
           hoveredRef.current?.kind === "paper" && hoveredRef.current.id === paper.id;
-        const category = getCategory(paper.primaryCategory);
+        const category = getRenderCategory(paper.primaryCategory);
         const showRegionLabel =
-          categoryFilter !== "all" && paper.primaryCategory === categoryFilter;
+          categoryFilterRef.current !== "all" &&
+          paper.primaryCategory === categoryFilterRef.current;
         const radius =
           (4.5 + heat * 4.2 + (selected || hoveredPaper ? 2.2 : 0)) *
           point.perspective;
@@ -2266,7 +2459,7 @@ export function LiteratureUniverse() {
         const category =
           activeRefresh?.pending.stagedSnapshot.categories.find(
             (item) => item.id === ghost.paper.primaryCategory,
-          ) || getCategory(ghost.paper.primaryCategory);
+          ) || getRenderCategory(ghost.paper.primaryCategory);
         if (!category) continue;
         const shake = refreshShakeOffsets.get(ghost.paper.id);
         const point = shake
@@ -2605,14 +2798,7 @@ export function LiteratureUniverse() {
       }
       regionNebulaSprites.clear();
     };
-  }, [
-    categoryFilter,
-    getCategory,
-    getPaper,
-    relationBundles,
-    requestRefreshCommit,
-    universe,
-  ]);
+  }, [renderResourceFingerprint]);
 
   const findTarget = useCallback((clientX: number, clientY: number): HitTarget => {
     const canvas = canvasRef.current;
@@ -2670,6 +2856,11 @@ export function LiteratureUniverse() {
   }, []);
 
   const handlePointerDown = (event: ReactPointerEvent<HTMLCanvasElement>) => {
+    pendingPointerHitRef.current = null;
+    if (pointerHitFrameRef.current) {
+      window.cancelAnimationFrame(pointerHitFrameRef.current);
+      pointerHitFrameRef.current = 0;
+    }
     const cameraTransition = cameraTransitionRef.current;
     if (cameraTransition) {
       cameraCenterRef.current = [...cameraTransition.toCenter];
@@ -2699,9 +2890,24 @@ export function LiteratureUniverse() {
       pointerRef.current.y = event.clientY;
       return;
     }
-    const target = findTarget(event.clientX, event.clientY);
-    setHovered(target);
-    event.currentTarget.dataset.interactive = target ? "true" : "false";
+    pendingPointerHitRef.current = {
+      clientX: event.clientX,
+      clientY: event.clientY,
+      canvas: event.currentTarget,
+    };
+    if (pointerHitFrameRef.current) return;
+    pointerHitFrameRef.current = window.requestAnimationFrame(() => {
+      pointerHitFrameRef.current = 0;
+      const pending = pendingPointerHitRef.current;
+      pendingPointerHitRef.current = null;
+      if (!pending) return;
+      const target = findTarget(pending.clientX, pending.clientY);
+      if (!sameHitTarget(hoveredRef.current, target)) {
+        hoveredRef.current = target;
+        setHovered(target);
+      }
+      pending.canvas.dataset.interactive = target ? "true" : "false";
+    });
   };
 
   const handlePointerUp = (event: ReactPointerEvent<HTMLCanvasElement>) => {
@@ -2942,6 +3148,7 @@ export function LiteratureUniverse() {
         action: "saveResearchInformation",
         text,
         projectId: workspace.projects.activeProjectId,
+        expectedRevision: workspace.researchInformation.draft.revision,
       });
       return;
     }
@@ -2986,6 +3193,15 @@ export function LiteratureUniverse() {
 
   const selectProject = (projectId: string) => {
     if (!projectId || projectId === workspace.projects.activeProjectId) return;
+    contextPreviewRequestRef.current = null;
+    contextPreviewProjectRef.current = null;
+    if (contextPreviewTimeoutRef.current !== null) {
+      window.clearTimeout(contextPreviewTimeoutRef.current);
+      contextPreviewTimeoutRef.current = null;
+    }
+    setLocalContextPreview(null);
+    setContextPreviewBusy(false);
+    setContextPreviewError("");
     researchDraftDirtyRef.current = false;
     setResearchDraft("");
     setWorkspaceError("");
@@ -3012,6 +3228,15 @@ export function LiteratureUniverse() {
   const createProject = (name: string) => {
     const normalizedName = name.trim();
     if (!normalizedName) return;
+    contextPreviewRequestRef.current = null;
+    contextPreviewProjectRef.current = null;
+    if (contextPreviewTimeoutRef.current !== null) {
+      window.clearTimeout(contextPreviewTimeoutRef.current);
+      contextPreviewTimeoutRef.current = null;
+    }
+    setLocalContextPreview(null);
+    setContextPreviewBusy(false);
+    setContextPreviewError("");
     researchDraftDirtyRef.current = false;
     setResearchDraft("");
     setWorkspaceError("");
@@ -3037,6 +3262,42 @@ export function LiteratureUniverse() {
       projectUseCounts: {},
     }));
     setResearchDraft("");
+  };
+
+  const buildContextPreview = (contextQuery: string, budgetChars: number) => {
+    const queryText = contextQuery.trim();
+    if (!queryText) return;
+    const bridge = getNativeBridge();
+    if (!bridge) {
+      contextPreviewRequestRef.current = null;
+      contextPreviewProjectRef.current = null;
+      setContextPreviewBusy(false);
+      setContextPreviewError("Local Context Preview is available in the Liteverse macOS app.");
+      return;
+    }
+    const requestId = crypto.randomUUID();
+    if (contextPreviewTimeoutRef.current !== null) {
+      window.clearTimeout(contextPreviewTimeoutRef.current);
+    }
+    contextPreviewRequestRef.current = requestId;
+    contextPreviewProjectRef.current = workspace.projects.activeProjectId;
+    setContextPreviewError("");
+    setContextPreviewBusy(true);
+    contextPreviewTimeoutRef.current = window.setTimeout(() => {
+      if (contextPreviewRequestRef.current !== requestId) return;
+      contextPreviewTimeoutRef.current = null;
+      contextPreviewRequestRef.current = null;
+      contextPreviewProjectRef.current = null;
+      setContextPreviewBusy(false);
+      setContextPreviewError("Local Context Preview timed out after 10 seconds. No evidence was adopted and Usage was not changed.");
+    }, 10_000);
+    bridge.postMessage({
+      action: "buildContextPreview",
+      requestId,
+      projectId: workspace.projects.activeProjectId,
+      query: queryText,
+      budgetChars,
+    });
   };
 
   const queueContextRequest = (contextQuery: string, budgetChars: number) => {
@@ -3119,6 +3380,22 @@ export function LiteratureUniverse() {
     }
   };
 
+  const retryLocalPreparation = (item: LibraryItem) => {
+    setWorkspaceError("");
+    setWorkspaceNotice("");
+    const bridge = getNativeBridge();
+    if (!bridge) {
+      setWorkspaceError("Local preparation retry is available in the Liteverse macOS app.");
+      return;
+    }
+    bridge.postMessage({
+      action: "retryLocalPreparation",
+      itemId: item.id,
+      expectedRevision: item.revision,
+    });
+    setWorkspaceNotice(`Retrying deterministic local preparation for ${item.displayTitle}…`);
+  };
+
   const exportWorkspace = (includePDFs: boolean) => {
     setWorkspaceError("");
     setWorkspaceNotice("");
@@ -3168,6 +3445,12 @@ export function LiteratureUniverse() {
           pointerRef.current.down = false;
         }}
         onPointerLeave={(event) => {
+          pendingPointerHitRef.current = null;
+          if (pointerHitFrameRef.current) {
+            window.cancelAnimationFrame(pointerHitFrameRef.current);
+            pointerHitFrameRef.current = 0;
+          }
+          hoveredRef.current = null;
           setHovered(null);
           event.currentTarget.dataset.interactive = "false";
         }}
@@ -3391,6 +3674,10 @@ export function LiteratureUniverse() {
         onSaveArxiv={saveArxivEntry}
         onResearchDraftChange={updateResearchDraft}
         onSaveResearch={saveResearchInformation}
+        localContextPreview={localContextPreview}
+        contextPreviewBusy={contextPreviewBusy}
+        contextPreviewError={contextPreviewError}
+        onBuildContextPreview={buildContextPreview}
         onQueueContext={queueContextRequest}
         literatureSearch={visibleLiteratureSearch}
         literatureSearchBusy={literatureSearchBusy}
@@ -3399,6 +3686,7 @@ export function LiteratureUniverse() {
         onOpenSearchPaper={selectSearchResult}
         onOpenWorkspacePath={openLocalFile}
         onOpenLibraryItem={openLibraryItem}
+        onRetryLocalPreparation={retryLocalPreparation}
         onExportWorkspace={exportWorkspace}
         onImportWorkspace={importWorkspace}
       />
@@ -3429,7 +3717,7 @@ export function LiteratureUniverse() {
               <p className="drawer-authors">{selectedPaper.authors}</p>
 
               <nav className="drawer-tabs" role="tablist" aria-label="Paper detail sections">
-                <button type="button" id="paper-tab-summary" role="tab" aria-selected={drawerTab === "summary"} aria-controls="paper-panel-summary" className={drawerTab === "summary" ? "is-active" : ""} onClick={() => setDrawerTab("summary")}>Summary</button>
+                <button type="button" id="paper-tab-summary" role="tab" aria-selected={drawerTab === "summary"} aria-controls="paper-panel-summary" className={drawerTab === "summary" ? "is-active" : ""} onClick={() => setDrawerTab("summary")}><span>Summary</span></button>
                 <button
                   type="button"
                   id="paper-tab-knowledge"
@@ -3441,18 +3729,18 @@ export function LiteratureUniverse() {
                     setDrawerTab("knowledge");
                     if (!knowledgeCard || knowledgeCard.paperId !== selectedPaper.id) loadKnowledgeCard(selectedPaper);
                   }}
-                >Knowledge card</button>
-                <button type="button" id="paper-tab-notes" role="tab" aria-selected={drawerTab === "notes"} aria-controls="paper-panel-notes" className={drawerTab === "notes" ? "is-active" : ""} onClick={() => setDrawerTab("notes")}>Notes{selectedPaperAnnotations.filter((item) => item.status === "pending").length > 0 && <i>{selectedPaperAnnotations.filter((item) => item.status === "pending").length}</i>}</button>
-                <button type="button" id="paper-tab-relations" role="tab" aria-selected={drawerTab === "relations"} aria-controls="paper-panel-relations" className={drawerTab === "relations" ? "is-active" : ""} onClick={() => setDrawerTab("relations")}>Relationships <i>{selectedPaperRelationBundles.length}</i></button>
+                ><span>Knowledge card</span></button>
+                <button type="button" id="paper-tab-notes" role="tab" aria-selected={drawerTab === "notes"} aria-controls="paper-panel-notes" className={drawerTab === "notes" ? "is-active" : ""} onClick={() => setDrawerTab("notes")}><span>Notes</span>{selectedPaperAnnotations.filter((item) => item.status === "pending").length > 0 && <i>{selectedPaperAnnotations.filter((item) => item.status === "pending").length}</i>}</button>
+                <button type="button" id="paper-tab-relations" role="tab" aria-selected={drawerTab === "relations"} aria-controls="paper-panel-relations" className={drawerTab === "relations" ? "is-active" : ""} onClick={() => setDrawerTab("relations")}><span>Relationships</span><i>{selectedPaperRelationBundles.length}</i></button>
               </nav>
 
               {drawerTab === "summary" && (
                 <div id="paper-panel-summary" className="drawer-tab-content" role="tabpanel" aria-labelledby="paper-tab-summary">
                   <div className="paper-temperature">
-                    <div style={{ "--paper-color": selectedPaperCategory.color } as React.CSSProperties}>
+                    <div className="paper-temperature-value" aria-label={`${selectedPaperUseCount} evidence uses`} style={{ "--paper-color": selectedPaperCategory.color } as React.CSSProperties}>
                       {selectedPaperUseCount}
                     </div>
-                    <span><b>{heatScope === "project" ? "Project heat" : "Global heat"} · Evidence uses</b><small>Halo brightness {Math.round((heatByPaper[selectedPaper.id] ?? 0) * 100)}% · Managed by a Codex Skill · Read-only here</small></span>
+                    <span><b>{heatScope === "project" ? "Project heat" : "Global heat"} · Evidence uses</b><small>Halo brightness {Math.round((heatByPaper[selectedPaper.id] ?? 0) * 100)}% · Skill-managed · Read-only</small></span>
                   </div>
 
                   <section>

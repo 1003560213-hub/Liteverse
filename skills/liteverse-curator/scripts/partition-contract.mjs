@@ -174,7 +174,7 @@ function sameMembers(left, right) {
   return left.length === right.length && left.every((value, index) => value === right[index]);
 }
 
-export function assignDeterministicPartitionLayout(source, current, categories, papers, seed) {
+export function assignDeterministicPartitionLayout(source, current, categories, papers, seed, options = {}) {
   const nextCategories = categories.map((category) => ({ ...category }));
   const currentPrimaryMembers = new Map();
   for (const paper of current?.papers ?? []) {
@@ -201,7 +201,12 @@ export function assignDeterministicPartitionLayout(source, current, categories, 
     const currentCategory = currentById.get(category.id);
     const oldMembers = currentPrimaryMembers.get(category.id) ?? [];
     const newMembers = nextPrimaryMembers.get(category.id) ?? [];
-    if (currentCategory && sameMembers(oldMembers, newMembers) && isFiniteVector3(currentCategory.center)) {
+    if (
+      options.preserveUnchangedCenters !== false
+      && currentCategory
+      && sameMembers(oldMembers, newMembers)
+      && isFiniteVector3(currentCategory.center)
+    ) {
       category.center = roundedVector(currentCategory.center);
       usedCenters.push(category.center);
     } else {

@@ -88,7 +88,7 @@ test("focuses clickable nebula regions and labels their primary papers", async (
   assert.match(component, /REGION_FOCUS_ZOOM/);
   assert.match(
     component,
-    /categoryFilter !== "all" && paper\.primaryCategory === categoryFilter/,
+    /categoryFilterRef\.current !== "all" &&[\s\S]*paper\.primaryCategory === categoryFilterRef\.current/,
   );
   assert.match(component, /regionLabelCandidates/);
   assert.match(component, /verticalOffsets/);
@@ -130,11 +130,12 @@ test("uses cinematic particle rendering without visible corner instructions", as
   assert.match(component, /camera remains fixed unless the user explicitly drags/i);
   assert.doesNotMatch(component, /className="universe-instruction"/);
   assert.doesNotMatch(component, /className="liteverse-footer"/);
-  assert.match(styles, /Cinematic 4K interface pass/);
-  assert.match(styles, /font-size: 14px/);
+  assert.match(styles, /--lv-surface: rgba\(18, 20, 26, 0\.82\)/);
+  assert.match(styles, /--lv-hairline: rgba\(255, 255, 255, 0\.12\)/);
+  assert.match(styles, /font-size: 15px/);
   assert.match(
     styles,
-    /\.nebula-backdrop\s*\{[^}]*filter: brightness\(0\.47\)[^}]*\}/s,
+    /\.nebula-backdrop\s*\{[^}]*filter: saturate\(0\.88\) brightness\(0\.58\) contrast\(1\.04\)[^}]*\}/s,
   );
   assert.doesNotMatch(
     styles,
@@ -201,12 +202,25 @@ test("provides a persistent settings workspace and synchronized zoom control", a
   assert.match(component, /action: "setActiveProject"/);
   assert.match(component, /action: "createProject"/);
   assert.match(component, /action: "saveContextRequest"/);
+  assert.match(component, /action: "buildContextPreview"/);
+  assert.match(component, /__liteverseReceiveContextPreview/);
+  assert.match(component, /__liteverseReceiveContextPreviewError/);
+  assert.match(component, /preview\.schemaVersion !== "liteverse-context-preview-v1"/);
+  assert.match(component, /preview\.adopted !== false/);
+  assert.match(component, /preview\.usageRecorded !== false/);
   assert.match(component, /action: "loadKnowledgeCard"/);
   assert.match(component, /heatScope === "project"/);
   assert.match(component, /setZoomLevel/);
   assert.match(settings, /LITERATURE UPLOAD/);
   assert.match(settings, /RESEARCH INFORMATION/);
   assert.match(settings, /AI CONTEXT CENTER/);
+  assert.match(settings, /Build local preview/);
+  assert.match(settings, /Search local literature/);
+  assert.match(settings, /Queue formal CLI build/);
+  assert.match(settings, /Local preview · not adopted/);
+  assert.match(settings, /No paper was adopted and Usage was not changed/);
+  assert.match(settings, /!selectedContextIsLocal && \(selectedContext\.markdownPath \|\| selectedContext\.jsonPath\)/);
+  assert.doesNotMatch(settings, /onOpenWorkspacePath\(selectedContext\.cachePath/);
   assert.match(settings, /STRUCTURED MEMORY/);
   assert.match(settings, /CODE &amp; EXPERIMENT ARTIFACTS/);
   assert.match(settings, /artifact\.contentHash/);
@@ -228,6 +242,7 @@ test("provides a persistent settings workspace and synchronized zoom control", a
   assert.match(styles, /\.settings-drawer/);
   assert.match(styles, /\.zoom-control/);
   assert.match(styles, /\.nebula-backdrop/);
+  assert.match(styles, /\.context-pack-kind\.is-local/);
   assert.match(nativeBridge, /NSOpenPanel/);
   assert.match(nativeBridge, /allowedContentTypes = @\[ UTTypePDF \]/);
   assert.match(nativeBridge, /library\.json/);
@@ -240,7 +255,8 @@ test("provides a persistent settings workspace and synchronized zoom control", a
   assert.match(nativeBridge, /Knowledge\/claims/);
   assert.match(nativeBridge, /projectUseCounts/);
   assert.match(nativeBridge, /NSString \*text = rawText;/);
-  assert.match(nativeBridge, /NSString \*markdown = text;/);
+  assert.match(nativeBridge, /NSString \*historyMarkdown = \[NSString stringWithFormat:/);
+  assert.match(nativeBridge, /@"content": text/);
   assert.match(nativeBridge, /configureApplicationMenus/);
   assert.match(nativeBridge, /@selector\(cut:\)/);
   assert.match(nativeBridge, /@selector\(copy:\)/);
@@ -334,7 +350,7 @@ test("keeps paper usage Retriever-managed with a zero integer default", async ()
   );
   assert.match(component, /paper\.useCount/);
   assert.match(component, /Math\.log1p/);
-  assert.match(component, /Managed by a Codex Skill · Read-only here/);
+  assert.match(component, /Skill-managed · Read-only/);
   assert.doesNotMatch(component, /recordUse/);
   assert.doesNotMatch(component, /liteverse-usage-events/);
   assert.doesNotMatch(component, /record use|quick read|formula verification|simulation decision/i);

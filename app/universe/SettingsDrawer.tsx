@@ -19,6 +19,22 @@ export type LibraryItem = {
     | "organized"
     | "needs_attention";
   revision: number;
+  preparation?: {
+    schemaVersion: 1;
+    state: "queued" | "ready" | "needs_attention";
+    jobId: string;
+    sourceRevision: number;
+    resultSha256?: string | null;
+    manifestPath?: string | null;
+    reviewPacketPath?: string;
+    resultState?: "ready" | "duplicate" | "needs_attention";
+    extractionStatus?: "extracted" | "needs_ocr";
+    screeningMethod?: "fts5_bm25_title_v1";
+    screeningCandidates?: Array<{ paperId: string; rank: number }>;
+    reason?: string;
+    queuedAt?: string;
+    completedAt?: string;
+  };
   createdAt: string;
   updatedAt: string;
   organizedAt?: string;
@@ -129,24 +145,40 @@ export type ContextClaim = {
   whySelected?: string;
   evidenceLocators?: Array<Record<string, unknown>>;
   verificationStatus?: string;
+  artifactRevision?: number;
+  artifactSha256?: string;
+  contentHash?: string;
+  trust?: string;
 };
 
 export type ContextPack = {
   schemaVersion?: string | number;
   contextId: string;
+  packId?: string;
+  requestId?: string;
+  contextKind?: "formal" | "local_preview";
+  adopted?: boolean;
+  cacheOnly?: boolean;
+  cachePath?: string;
   projectId: string;
   taskHash?: string;
   createdAt?: string;
   graphRevision?: number;
   memoryRevision?: number;
+  memoryLedgerHash?: string | null;
+  indexFingerprint?: string;
   query?: string;
   budgetChars?: number;
+  usedChars?: number;
   selectedClaims?: ContextClaim[];
   projectMemory?: MemoryItem[];
   conflicts?: Array<string | Record<string, unknown>>;
   limitations?: Array<string | Record<string, unknown>>;
   markdownPath?: string;
   jsonPath?: string;
+  source?: "liteverse_cli" | "local_preview";
+  adoptionState?: "adopted" | "not_adopted";
+  usageRecorded?: boolean;
 };
 
 export type ResearchArtifact = {
@@ -259,6 +291,7 @@ export type WorkspaceState = {
   };
   tasks: ProjectTask[];
   contextPacks: ContextPack[];
+  contextPreview?: ContextPack | null;
   artifacts: ResearchArtifact[];
   searchProjection: SearchProjectionItem[];
   projectUseCounts: Record<string, number>;
@@ -284,6 +317,10 @@ type SettingsDrawerProps = {
   onSaveArxiv: (value: string) => void;
   onResearchDraftChange: (value: string) => void;
   onSaveResearch: () => void;
+  localContextPreview: ContextPack | null;
+  contextPreviewBusy: boolean;
+  contextPreviewError: string;
+  onBuildContextPreview: (query: string, budgetChars: number) => void;
   onQueueContext: (query: string, budgetChars: number) => void;
   literatureSearch: LiteratureSearchPayload | null;
   literatureSearchBusy: boolean;
@@ -292,6 +329,7 @@ type SettingsDrawerProps = {
   onOpenSearchPaper: (paperId: string) => void;
   onOpenWorkspacePath: (path: string) => void;
   onOpenLibraryItem: (item: LibraryItem) => void;
+  onRetryLocalPreparation: (item: LibraryItem) => void;
   onExportWorkspace: (includePDFs: boolean) => void;
   onImportWorkspace: () => void;
 };
@@ -302,6 +340,12 @@ const statusLabels: Record<LibraryItem["status"], string> = {
   ready_to_refresh: "Ready to refresh",
   organized: "Organized",
   needs_attention: "Review required",
+};
+
+const preparationLabels: Record<NonNullable<LibraryItem["preparation"]>["state"], string> = {
+  queued: "Preparing locally",
+  ready: "Locally prepared",
+  needs_attention: "Preparation needs attention",
 };
 
 const ARXIV_PATTERN = /^(?:https:\/\/(?:www\.)?arxiv\.org\/(?:abs|pdf)\/)?(?:\d{4}\.\d{4,5}|[a-z.-]+\/\d{7})(?:v\d+)?(?:\.pdf)?$/i;
@@ -377,6 +421,10 @@ export function SettingsDrawer({
   onSaveArxiv,
   onResearchDraftChange,
   onSaveResearch,
+  localContextPreview,
+  contextPreviewBusy,
+  contextPreviewError,
+  onBuildContextPreview,
   onQueueContext,
   literatureSearch,
   literatureSearchBusy,
@@ -385,6 +433,7 @@ export function SettingsDrawer({
   onOpenSearchPaper,
   onOpenWorkspacePath,
   onOpenLibraryItem,
+  onRetryLocalPreparation,
   onExportWorkspace,
   onImportWorkspace,
 }: SettingsDrawerProps) {
@@ -446,11 +495,21 @@ export function SettingsDrawer({
   const activeProject = workspace.projects.items.find(
     (project) => project.id === workspace.projects.activeProjectId,
   );
-  const contextPacks = [...workspace.contextPacks].sort((left, right) =>
-    (right.createdAt || "").localeCompare(left.createdAt || ""),
-  );
+  const visibleLocalContextPreview = localContextPreview?.projectId === workspace.projects.activeProjectId
+    ? localContextPreview
+    : null;
+  const contextPacks = [
+    ...(visibleLocalContextPreview ? [visibleLocalContextPreview] : []),
+    ...workspace.contextPacks.filter(
+      (pack) => pack.contextId !== visibleLocalContextPreview?.contextId,
+    ),
+  ].sort((left, right) => (right.createdAt || "").localeCompare(left.createdAt || ""));
   const selectedContext = contextPacks.find((pack) => pack.contextId === selectedContextId)
     || contextPacks[0];
+  const selectedContextIsLocal = selectedContext?.contextKind === "local_preview"
+    || selectedContext?.source === "local_preview"
+    || selectedContext?.adopted === false
+    || selectedContext?.adoptionState === "not_adopted";
   const partitionProposal = workspace.partitionProposals;
   const partitionProposalStale = Boolean(
     partitionProposal
@@ -587,7 +646,7 @@ export function SettingsDrawer({
           className={activeTab === "context" ? "is-active" : ""}
           onClick={() => onTabChange("context")}
         >
-          Context <i>{workspace.contextPacks.length}</i>
+          Context <i>{workspace.contextPacks.length + (visibleLocalContextPreview ? 1 : 0)}</i>
         </button>
         <button
           type="button"
@@ -660,7 +719,7 @@ export function SettingsDrawer({
                 <div id="upload-panel-pdf" className="upload-method upload-source-panel" role="tabpanel" aria-labelledby="upload-tab-pdf">
                   <div>
                     <span className="upload-icon">PDF</span>
-                    <span><b>PDF file</b><small>The source is copied into your local library immediately.</small></span>
+                    <span><b>PDF file</b><small>The source is copied and prepared locally before scientific review.</small></span>
                   </div>
                   <button type="button" disabled={busyAction !== null} onClick={onPickPDF}>
                     {busyAction === "pdf" ? "Importing…" : "Choose PDF"}
@@ -690,7 +749,7 @@ export function SettingsDrawer({
                       {busyAction === "arxiv" ? "Saving…" : "Save link"}
                     </button>
                   </div>
-                  <small>The link is saved immediately. On the next Codex run, its title and stellar connections can be verified.</small>
+                  <small>The explicit paper is downloaded and prepared locally. Codex later verifies its scientific content and stellar connections.</small>
                 </label>
               )}
             </section>
@@ -756,12 +815,32 @@ export function SettingsDrawer({
                       <footer>
                         <small>{item.catalogSource === "universe" ? "Universe paper" : item.sourceType === "pdf" ? "PDF" : "arXiv"}</small>
                         <small className={`library-status ${item.status}`}>{statusLabels[item.status]}</small>
+                        {item.preparation && (
+                          <small
+                            className={`library-status ${item.preparation.state === "queued" ? "processing" : item.preparation.state === "ready" ? "ready_to_refresh" : "needs_attention"}`}
+                            title={item.preparation.reason || `Local job ${item.preparation.jobId}`}
+                          >
+                            {preparationLabels[item.preparation.state]}
+                            {item.preparation.resultState === "duplicate" ? " · duplicate" : ""}
+                            {item.preparation.extractionStatus === "needs_ocr" ? " · OCR needed" : ""}
+                          </small>
+                        )}
                         {item.verificationLabel && (
                           <small className={`verification-chip ${item.verificationTone || "draft"}`} title={item.verificationDetail}>
                             {item.verificationLabel}
                           </small>
                         )}
                         <small>v{item.revision}</small>
+                        {item.preparation?.state === "needs_attention" && item.catalogSource !== "universe" && (
+                          <button
+                            type="button"
+                            className="library-preparation-retry"
+                            onClick={() => onRetryLocalPreparation(item)}
+                            title={item.preparation.reason || "Retry deterministic local preparation"}
+                          >
+                            Retry local preparation
+                          </button>
+                        )}
                       </footer>
                     </div>
                     <button
@@ -941,7 +1020,7 @@ export function SettingsDrawer({
             <section className="settings-card context-composer">
               <div className="settings-section-heading">
                 <span className="section-label">AI CONTEXT CENTER</span>
-                <p>Describe the task and set a character budget. The app only saves the request and previews local projections; it does not call a model.</p>
+                <p>Describe the task and set a character budget. The app builds a deterministic local preview without calling a model.</p>
               </div>
               <label>
                 <span>Task</span>
@@ -967,17 +1046,25 @@ export function SettingsDrawer({
               <div className="workspace-backup-actions context-composer-actions">
                 <button
                   type="button"
-                  disabled={!contextQuery.trim()}
-                  onClick={() => onQueueContext(contextQuery.trim(), contextBudget)}
-                >Save context request</button>
+                  aria-busy={contextPreviewBusy}
+                  disabled={!contextQuery.trim() || contextPreviewBusy}
+                  onClick={() => onBuildContextPreview(contextQuery.trim(), contextBudget)}
+                >{contextPreviewBusy ? "Building local preview…" : "Build local preview"}</button>
                 <button
                   type="button"
                   className="is-secondary"
                   disabled={!contextQuery.trim() || literatureSearchBusy}
                   onClick={() => onSearchLiterature(contextQuery.trim())}
                 >{literatureSearchBusy ? "Searching with BM25…" : "Search local literature"}</button>
+                <button
+                  type="button"
+                  className="is-secondary"
+                  disabled={!contextQuery.trim() || contextPreviewBusy}
+                  onClick={() => onQueueContext(contextQuery.trim(), contextBudget)}
+                >Queue formal CLI build</button>
               </div>
-              <p className="settings-boundary">Then run `liteverse context build`; generated packs will appear here automatically.</p>
+              {contextPreviewError && <div className="workspace-error" role="alert">{contextPreviewError}</div>}
+              <p className="settings-boundary">Local previews are deterministic and do not adopt evidence or update Usage. A queued formal build remains available to the Retriever and CLI.</p>
             </section>
 
             <section className="settings-card search-projection-card">
@@ -1021,21 +1108,33 @@ export function SettingsDrawer({
             <section className="settings-card context-pack-browser">
               <div className="settings-section-heading">
                 <span className="section-label">CONTEXT PACKS</span>
-                <p>Each pack pins exact graph and memory revisions and can be reused by any AI client.</p>
+                <p>Formal packs pin exact graph and memory revisions. The latest local preview appears beside them without becoming adopted evidence.</p>
               </div>
               {contextPacks.length > 0 && (
                 <select value={selectedContext?.contextId || ""} onChange={(event) => setSelectedContextId(event.target.value)}>
                   {contextPacks.map((pack) => (
-                    <option key={pack.contextId} value={pack.contextId}>{pack.query || pack.contextId}</option>
+                    <option key={pack.contextId} value={pack.contextId}>
+                      {pack.contextKind === "local_preview" || pack.source === "local_preview" || pack.adopted === false || pack.adoptionState === "not_adopted"
+                        ? `Local preview · not adopted — ${pack.query || pack.contextId}`
+                        : `Formal CLI pack — ${pack.query || pack.contextId}`}
+                    </option>
                   ))}
                 </select>
               )}
               {selectedContext ? (
                 <article className="context-pack-detail">
                   <header>
-                    <b>{selectedContext.query || selectedContext.contextId}</b>
+                    <div>
+                      <span className={`context-pack-kind ${selectedContextIsLocal ? "is-local" : "is-formal"}`}>
+                        {selectedContextIsLocal ? "Local preview · not adopted" : "Formal CLI pack"}
+                      </span>
+                      <b>{selectedContext.query || selectedContext.contextId}</b>
+                    </div>
                     <small>Graph r{selectedContext.graphRevision ?? "?"} · Memory r{selectedContext.memoryRevision ?? "?"} · {selectedContext.budgetChars?.toLocaleString("en-US") || "?"} chars</small>
                   </header>
+                  {selectedContextIsLocal && (
+                    <p className="settings-boundary">Preview only. No paper was adopted and Usage was not changed.</p>
+                  )}
                   <div className="context-pack-metrics">
                     <span><b>{selectedContext.selectedClaims?.length || 0}</b> claims</span>
                     <span><b>{selectedContext.projectMemory?.length || 0}</b> memories</span>
@@ -1047,18 +1146,26 @@ export function SettingsDrawer({
                       <article key={claim.claimId || `${claim.paperId}-${index}`}>
                         <header><b>{claim.paperId || "paper"}</b><span>{claim.claimId || claim.evidenceId || "claim"}</span></header>
                         <p>{claim.statement || claim.text || claim.title}</p>
+                        {(claim.artifactRevision || claim.artifactSha256) && (
+                          <small>
+                            Artifact {claim.artifactRevision ? `r${claim.artifactRevision}` : "revision unknown"}
+                            {claim.artifactSha256 ? ` · ${claim.artifactSha256.slice(0, 12)}…` : ""}
+                          </small>
+                        )}
                         {(claim.whySelected || claim.reason) && <small>Selected because: {claim.whySelected || claim.reason}</small>}
                       </article>
                     ))}
                   </div>
                   <details><summary>Limitations and conflicts</summary><pre>{JSON.stringify({ limitations: selectedContext.limitations || [], conflicts: selectedContext.conflicts || [] }, null, 2)}</pre></details>
-                  <div className="workspace-backup-actions">
-                    {selectedContext.markdownPath && <button type="button" onClick={() => onOpenWorkspacePath(selectedContext.markdownPath!)}>Open Markdown</button>}
-                    {selectedContext.jsonPath && <button type="button" className="is-secondary" onClick={() => onOpenWorkspacePath(selectedContext.jsonPath!)}>Open JSON</button>}
-                  </div>
+                  {!selectedContextIsLocal && (selectedContext.markdownPath || selectedContext.jsonPath) && (
+                    <div className="workspace-backup-actions">
+                      {selectedContext.markdownPath && <button type="button" onClick={() => onOpenWorkspacePath(selectedContext.markdownPath!)}>Open Markdown</button>}
+                      {selectedContext.jsonPath && <button type="button" className="is-secondary" onClick={() => onOpenWorkspacePath(selectedContext.jsonPath!)}>Open JSON</button>}
+                    </div>
+                  )}
                 </article>
               ) : (
-                <div className="settings-empty is-compact"><span>✦</span><b>No context packs yet</b><p>Once generated by the Liteverse CLI, evidence, limitations, and conflicts appear here.</p></div>
+                <div className="settings-empty is-compact"><span>✦</span><b>No context packs yet</b><p>Build a local preview now, or queue a formal Liteverse CLI pack for adopted evidence.</p></div>
               )}
             </section>
           </div>
@@ -1187,7 +1294,7 @@ export function SettingsDrawer({
 
       <footer className="settings-footer">
         <span>LOCAL-FIRST</span>
-        <p>Existing papers and research memory load directly; new imports remain pending until verified.</p>
+        <p>New papers are prepared locally, then remain pending until their scientific content is verified.</p>
       </footer>
     </aside>
   );

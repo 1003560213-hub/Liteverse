@@ -22,6 +22,8 @@ Projects/
 
 All mutations use `.locks/research-memory.lock`, reject a mismatched `--expected-revision`, append and `fsync` the ledger, then atomically replace projections. A malformed JSONL line fails closed. Never interpret a corrupt or missing projection as an empty project.
 
+The App's existing Research Information editor is a first-class user input path. A save appends one `memory_recorded` event with `type: project_context`, `provenance: user`, and `evidenceState: user_declared`; it may supersede the previous active App/legacy Research Information item but never rewrites that event. The App must hold the same lock, reject a stale editor revision or ledger/projection mismatch, preserve the complete text in revision history, `fsync` the ledger, and update every project projection to the resulting revision and ledger hash. A UI success message is forbidden unless this closure succeeds.
+
 ## Project and task identity
 
 - Use lowercase slug project IDs.
@@ -53,4 +55,3 @@ Supported types are `project_context`, `goal`, `convention`, `decision`, `assump
 `tasks.json` and each `Tasks/<taskHash>/task.json` contain only the hash, status, summaries, timestamps, linked memory IDs, and metadata-only outputs. Context Packs remain owned by Retriever. Research Memory writes handoffs only under `Tasks/<taskHash>/handoffs/` and records both artifact paths and hashes in the ledger.
 
 A handoff contains the project and task summaries, active memory, explicit conflicts, open questions, and next steps as matching JSON and Markdown. It never expands paper evidence into paper content.
-

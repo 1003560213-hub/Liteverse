@@ -51,8 +51,8 @@ service.
 2. Unzip the macOS arm64 archive and move **Liteverse.app** to Applications.
 3. On first launch, Control-click the app and choose **Open**.
 4. Open **Settings → Literature** and add either a PDF or an arXiv link.
-5. Ask Codex to organize the queued papers, then choose **Refresh** in Liteverse
-   when the updated universe is ready.
+5. Liteverse prepares the source locally. Ask Codex to review its scientific
+   meaning, then choose **Refresh** when the updated universe is ready.
 
 The current preview requires **macOS 13 or later** on an **Apple Silicon Mac**.
 It is ad-hoc signed and has not yet been notarized by Apple.
@@ -92,13 +92,16 @@ Liteverse stores its mutable workspace under:
 ```
 
 The public app starts empty and contains no personal papers, annotations, graph
-data, or research memory. Version 0.3.2 has no account, cloud sync, background
-daemon, or default cloud embedding. Processing an arXiv link may use the network
-to retrieve the source explicitly requested by the user.
+data, or research memory. Version 0.4.0 has no account, cloud sync, background
+daemon, bundled language model, or default cloud embedding. Its short-lived
+native Worker handles hashing, explicit arXiv retrieval, PDF extraction,
+deduplication, and routing-only review packets, then exits. Processing an arXiv
+link may use the network only to retrieve the source explicitly requested by
+the user.
 
-Liteverse can be used as a visual library without AI. Automated paper
-organization, evidence-aware relationships, Context Packs, and research-memory
-updates currently use the optional Codex integration.
+Liteverse can be used as a visual library without AI. Codex remains responsible
+for scientific interpretation, evidence-aware relationships, verified
+classification, and semantic research-memory updates.
 
 ## Development
 

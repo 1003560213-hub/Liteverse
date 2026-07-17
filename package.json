@@ -1,6 +1,6 @@
 {
   "name": "liteverse",
-  "version": "0.3.2",
+  "version": "0.4.0",
   "description": "A local-first literature universe and research-memory workspace for people and AI assistants.",
   "license": "MIT",
   "keywords": [
@@ -19,6 +19,7 @@
     "build": "npm run typecheck:app && npm run validate:data && WRANGLER_LOG_PATH=.wrangler/wrangler.log vinext build",
     "desktop:build": "vite build --config vite.desktop.config.ts && node scripts/inline-desktop-assets.mjs",
     "desktop:package": "zsh scripts/build-macos-app.sh",
+    "worker:build": "zsh scripts/build-local-worker.sh",
     "codex:notes": "node scripts/codex-note-queue.mjs list",
     "codex:workspace": "node scripts/codex-workspace-queue.mjs list",
     "liteverse": "node --no-warnings scripts/liteverse-cli.mjs",
@@ -26,12 +27,14 @@
     "liteverse:index": "node --no-warnings scripts/liteverse-cli.mjs index rebuild",
     "nebula:assign": "node scripts/assign-region-nebula.mjs",
     "nebula:sync-runtime": "node scripts/sync-runtime-nebula-assets.mjs",
+    "sync:private:check": "node scripts/sync-private-shared.mjs --check",
+    "sync:private:write": "node scripts/sync-private-shared.mjs --write",
     "start": "WRANGLER_LOG_PATH=.wrangler/wrangler.log vinext start",
     "test": "npm run build && node --test tests/*.test.mjs",
     "typecheck:app": "tsc -p tsconfig.app.json",
     "validate:data": "node scripts/validate-universe.mjs",
     "verify:public": "node scripts/verify-public-release.mjs",
-    "lint": "eslint . --ignore-pattern dist --ignore-pattern .next",
+    "lint": "eslint . --ignore-pattern dist --ignore-pattern .next --ignore-pattern .vinext --ignore-pattern dist-desktop --ignore-pattern Liteverse.app --ignore-pattern release",
     "db:generate": "drizzle-kit generate"
   },
   "dependencies": {

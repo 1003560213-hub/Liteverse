@@ -2,12 +2,15 @@
 #import <CommonCrypto/CommonDigest.h>
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 #import <WebKit/WebKit.h>
+#import <errno.h>
 #import <fcntl.h>
+#import <signal.h>
 #import <sqlite3.h>
 #import <unistd.h>
 
 @interface LiteverseAppDelegate : NSObject <NSApplicationDelegate, WKScriptMessageHandler, WKNavigationDelegate> {
   dispatch_queue_t _persistenceQueue;
+  dispatch_queue_t _localPreparationQueue;
   dispatch_source_t _pendingRefreshSource;
   dispatch_source_t _workspaceSource;
   NSUInteger _workspaceObservationGeneration;
@@ -84,7 +87,20 @@
   NSURL *baseURL = [[[NSFileManager defaultManager]
       URLsForDirectory:NSApplicationSupportDirectory
              inDomains:NSUserDomainMask] firstObject];
-  NSURL *directory = [baseURL URLByAppendingPathComponent:@"Liteverse" isDirectory:YES];
+  NSString *directoryName = @"Liteverse";
+  id configuredName = [NSBundle.mainBundle objectForInfoDictionaryKey:@"LiteverseWorkspaceDirectory"];
+  if ([configuredName isKindOfClass:NSString.class]) {
+    NSString *candidate = configuredName;
+    NSCharacterSet *invalidCharacters = [[NSCharacterSet
+        characterSetWithCharactersInString:@"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._-"]
+        invertedSet];
+    if (candidate.length > 0 && candidate.length <= 64 &&
+        ![candidate isEqualToString:@"."] && ![candidate isEqualToString:@".."] &&
+        [candidate rangeOfCharacterFromSet:invalidCharacters].location == NSNotFound) {
+      directoryName = candidate;
+    }
+  }
+  NSURL *directory = [baseURL URLByAppendingPathComponent:directoryName isDirectory:YES];
   if (![[NSFileManager defaultManager] fileExistsAtPath:directory.path]) {
     [[NSFileManager defaultManager] createDirectoryAtURL:directory
                              withIntermediateDirectories:YES
@@ -156,6 +172,101 @@
 - (NSURL *)stageRefreshLockURL {
   return [[self applicationSupportURL]
       URLByAppendingPathComponent:@".locks/stage-refresh.lock" isDirectory:YES];
+}
+
+- (NSURL *)researchMemoryLockURL {
+  return [[self applicationSupportURL]
+      URLByAppendingPathComponent:@".locks/research-memory.lock" isDirectory:YES];
+}
+
+- (NSURL *)annotationMutationLockURL {
+  return [[self applicationSupportURL]
+      URLByAppendingPathComponent:@".locks/mark-annotation.lock" isDirectory:YES];
+}
+
+- (BOOL)processWithPIDIsAlive:(pid_t)pid {
+  if (pid <= 0) return NO;
+  if (kill(pid, 0) == 0) return YES;
+  return errno == EPERM;
+}
+
+// Directory locks are shared with the Node-based Curator and Research Memory
+// tools.  The owner token prevents a delayed native cleanup from deleting a
+// lock that another process acquired after ours disappeared.  Stale recovery
+// first atomically renames the old directory, so it can never remove a newly
+// created replacement at the original path.
+- (NSString *)acquireDirectoryLockAtURL:(NSURL *)lockURL
+                              operation:(NSString *)operation
+                                timeout:(NSTimeInterval)timeout
+                                  error:(NSError **)error {
+  NSFileManager *manager = NSFileManager.defaultManager;
+  if (![manager createDirectoryAtURL:lockURL.URLByDeletingLastPathComponent
+          withIntermediateDirectories:YES attributes:nil error:error]) return nil;
+  NSTimeInterval deadline = NSDate.date.timeIntervalSinceReferenceDate + MAX(0, timeout);
+  while (YES) {
+    NSError *lockError = nil;
+    if ([manager createDirectoryAtURL:lockURL
+          withIntermediateDirectories:NO attributes:nil error:&lockError]) {
+      NSString *token = NSUUID.UUID.UUIDString.lowercaseString;
+      NSDictionary *owner = @{
+        @"schemaVersion": @1,
+        @"pid": @(NSProcessInfo.processInfo.processIdentifier),
+        @"createdAt": [self isoTimestamp],
+        @"token": token,
+        @"operation": operation ?: @"storage-mutation"
+      };
+      NSError *ownerError = nil;
+      if (![self writeJSONObject:owner
+                           toURL:[lockURL URLByAppendingPathComponent:@"owner.json"]
+                           error:&ownerError]) {
+        [manager removeItemAtURL:lockURL error:nil];
+        if (error) *error = ownerError;
+        return nil;
+      }
+      return token;
+    }
+    if (![manager fileExistsAtPath:lockURL.path]) {
+      if (error) *error = lockError;
+      return nil;
+    }
+
+    NSDictionary *attributes = [manager attributesOfItemAtPath:lockURL.path error:nil];
+    NSDate *modifiedAt = attributes[NSFileModificationDate];
+    NSTimeInterval age = modifiedAt ? -modifiedAt.timeIntervalSinceNow : 0;
+    NSDictionary *owner = [self readDictionaryAtURL:
+        [lockURL URLByAppendingPathComponent:@"owner.json"] defaultValue:nil error:nil];
+    NSNumber *ownerPID = [owner[@"pid"] isKindOfClass:NSNumber.class] ? owner[@"pid"] : nil;
+    BOOL ownerAlive = ownerPID && [self processWithPIDIsAlive:(pid_t)ownerPID.intValue];
+    // Ownerless locks are created by older Curator tools; never guess that a
+    // long-running scientific operation is stale. Token/PID locks can be
+    // recovered only after their recorded owner is no longer alive.
+    if (age > 60.0 && ownerPID && !ownerAlive) {
+      NSURL *quarantineURL = [lockURL.URLByDeletingLastPathComponent
+          URLByAppendingPathComponent:[NSString stringWithFormat:@"%@.stale.%@",
+              lockURL.lastPathComponent, NSUUID.UUID.UUIDString.lowercaseString]
+                       isDirectory:YES];
+      if ([manager moveItemAtURL:lockURL toURL:quarantineURL error:nil]) {
+        [manager removeItemAtURL:quarantineURL error:nil];
+        continue;
+      }
+    }
+
+    if (NSDate.date.timeIntervalSinceReferenceDate >= deadline) {
+      if (error) *error = [self storageError:
+          [NSString stringWithFormat:@"%@ is already updating Liteverse data. Try again after that operation finishes.",
+              operation ?: @"Another process"] code:591];
+      return nil;
+    }
+    usleep(50 * 1000);
+  }
+}
+
+- (void)releaseDirectoryLockAtURL:(NSURL *)lockURL token:(NSString *)token {
+  if (token.length == 0) return;
+  NSDictionary *owner = [self readDictionaryAtURL:
+      [lockURL URLByAppendingPathComponent:@"owner.json"] defaultValue:nil error:nil];
+  if (![owner[@"token"] isEqualToString:token]) return;
+  [NSFileManager.defaultManager removeItemAtURL:lockURL error:nil];
 }
 
 - (NSURL *)usageDirectoryURL {
@@ -592,14 +703,14 @@
   migrated[@"papers"] = papers;
   migrated[@"updated"] = [self isoTimestamp];
   if (![self writeJSONObject:migrated toURL:currentURL error:error]) return NO;
-  [self appendJSONObject:@{
+  if (![self appendJSONObject:@{
     @"eventId": NSUUID.UUID.UUIDString,
     @"action": @"managed_pdf_sources_migrated",
     @"timestamp": [self isoTimestamp],
     @"paperCount": @(papers.count),
     @"unmanagedPaperIds": unmanagedPaperIDs,
     @"historyPath": [@"Graph/history" stringByAppendingPathComponent:historyURL.lastPathComponent]
-  } toURL:[self workspaceInboxURL]];
+  } toURL:[self workspaceInboxURL] error:error]) return NO;
   return YES;
 }
 
@@ -672,17 +783,10 @@
   // vnode observer and must never be part of a health-read loop.
   if (!missingPackagedAsset && !catalogVersionChanged) return YES;
 
-  if (![manager createDirectoryAtURL:[lockURL URLByDeletingLastPathComponent]
-          withIntermediateDirectories:YES
-                           attributes:nil
-                                error:error]) {
-    return NO;
-  }
   NSError *lockError = nil;
-  if (![manager createDirectoryAtURL:lockURL
-          withIntermediateDirectories:NO
-                           attributes:nil
-                                error:&lockError]) {
+  NSString *lockToken = [self acquireDirectoryLockAtURL:lockURL
+      operation:@"Nebula catalog synchronization" timeout:0 error:&lockError];
+  if (!lockToken) {
     // Curator owns the same atomic directory lock.  Deferring is preferable to
     // blocking the UI or touching current.json during snapshot construction.
     if ([manager fileExistsAtPath:lockURL.path]) return YES;
@@ -759,17 +863,17 @@
   // Refresh while the two catalogs were being read.
   if ([manager fileExistsAtPath:[self pendingRefreshURL].path]) return YES;
   if (![self writeJSONObject:mergedGraph toURL:currentURL error:error]) return NO;
-  [self appendJSONObject:@{
+  if (![self appendJSONObject:@{
     @"eventId": NSUUID.UUID.UUIDString,
     @"action": @"nebula_asset_catalog_migrated",
     @"timestamp": [self isoTimestamp],
     @"revision": current[@"revision"] ?: @0,
     @"catalogVersion": packagedCatalogVersion,
     @"addedAssetIds": addedAssetIDs
-  } toURL:[self workspaceInboxURL]];
+  } toURL:[self workspaceInboxURL] error:error]) return NO;
   return YES;
   } @finally {
-    [manager removeItemAtURL:lockURL error:nil];
+    [self releaseDirectoryLockAtURL:lockURL token:lockToken];
   }
 }
 
@@ -1254,18 +1358,67 @@
   return [data writeToURL:url options:NSDataWritingAtomic error:error];
 }
 
-- (void)appendJSONObject:(NSDictionary *)object toURL:(NSURL *)url {
-  NSError *error = nil;
-  NSData *eventData = [NSJSONSerialization dataWithJSONObject:object options:0 error:&error];
-  if (!eventData || error) return;
-  NSMutableData *eventLine = [eventData mutableCopy];
-  [eventLine appendData:[@"\n" dataUsingEncoding:NSUTF8StringEncoding]];
-  int descriptor = open(url.path.fileSystemRepresentation, O_WRONLY | O_CREAT | O_APPEND, 0600);
-  if (descriptor < 0) return;
-  // O_APPEND plus one write keeps concurrently appended JSONL events from
-  // interleaving between the JSON payload and its terminating newline.
-  (void)write(descriptor, eventLine.bytes, eventLine.length);
-  close(descriptor);
+- (BOOL)appendJSONObjects:(NSArray<NSDictionary *> *)objects
+                    toURL:(NSURL *)url
+                    error:(NSError **)error {
+  if (objects.count == 0) return YES;
+  if (![NSFileManager.defaultManager createDirectoryAtURL:url.URLByDeletingLastPathComponent
+                              withIntermediateDirectories:YES
+                                               attributes:nil
+                                                    error:error]) return NO;
+  NSMutableData *eventLine = [NSMutableData data];
+  for (NSDictionary *object in objects) {
+    NSData *eventData = [NSJSONSerialization dataWithJSONObject:object
+                                                        options:NSJSONWritingSortedKeys
+                                                          error:error];
+    if (!eventData) return NO;
+    [eventLine appendData:eventData];
+    [eventLine appendData:[@"\n" dataUsingEncoding:NSUTF8StringEncoding]];
+  }
+  int descriptor = open(url.path.fileSystemRepresentation, O_RDWR | O_CREAT | O_APPEND, 0600);
+  if (descriptor < 0) {
+    if (error) *error = [NSError errorWithDomain:NSPOSIXErrorDomain code:errno userInfo:nil];
+    return NO;
+  }
+  off_t existingSize = lseek(descriptor, 0, SEEK_END);
+  if (existingSize < 0) {
+    int seekError = errno;
+    close(descriptor);
+    if (error) *error = [NSError errorWithDomain:NSPOSIXErrorDomain code:seekError userInfo:nil];
+    return NO;
+  }
+  if (existingSize > 0) {
+    unsigned char finalByte = 0;
+    if (pread(descriptor, &finalByte, 1, existingSize - 1) != 1) {
+      int readError = errno ?: EIO;
+      close(descriptor);
+      if (error) *error = [NSError errorWithDomain:NSPOSIXErrorDomain code:readError userInfo:nil];
+      return NO;
+    }
+    if (finalByte != '\n') {
+      [eventLine replaceBytesInRange:NSMakeRange(0, 0)
+                           withBytes:"\n" length:1];
+    }
+  }
+  // O_APPEND plus one write keeps each logical batch, including its final
+  // newline, together.  A short write is treated as corruption-risk and is
+  // never reported as success.
+  ssize_t written = write(descriptor, eventLine.bytes, eventLine.length);
+  int writeError = written < 0 ? errno : (written == (ssize_t)eventLine.length ? 0 : EIO);
+  int syncResult = writeError == 0 ? fsync(descriptor) : -1;
+  int syncError = syncResult == 0 ? 0 : errno;
+  int closeResult = close(descriptor);
+  int closeError = closeResult == 0 ? 0 : errno;
+  int failure = writeError ?: (syncError ?: closeError);
+  if (failure != 0) {
+    if (error) *error = [NSError errorWithDomain:NSPOSIXErrorDomain code:failure userInfo:nil];
+    return NO;
+  }
+  return YES;
+}
+
+- (BOOL)appendJSONObject:(NSDictionary *)object toURL:(NSURL *)url error:(NSError **)error {
+  return [self appendJSONObjects:@[object] toURL:url error:error];
 }
 
 - (NSArray *)readAnnotationsWithError:(NSError **)error {
@@ -1329,6 +1482,33 @@
   dispatch_async(dispatch_get_main_queue(), ^{
     [self.webView callAsyncJavaScript:
         @"window.__liteverseReceiveLiteratureSearchError && window.__liteverseReceiveLiteratureSearchError(errorPayload);"
+                              arguments:@{ @"errorPayload": payload }
+                                inFrame:nil
+                         inContentWorld:WKContentWorld.pageWorld
+                      completionHandler:nil];
+  });
+}
+
+- (void)sendContextPreview:(NSDictionary *)preview {
+  if (!preview) return;
+  dispatch_async(dispatch_get_main_queue(), ^{
+    [self.webView callAsyncJavaScript:
+        @"window.__liteverseReceiveContextPreview && window.__liteverseReceiveContextPreview(previewPayload);"
+                              arguments:@{ @"previewPayload": preview }
+                                inFrame:nil
+                         inContentWorld:WKContentWorld.pageWorld
+                      completionHandler:nil];
+  });
+}
+
+- (void)sendContextPreviewError:(NSError *)error requestID:(NSString *)requestID {
+  NSDictionary *payload = @{
+    @"requestId": requestID ?: @"",
+    @"message": error.localizedDescription ?: @"The local Context Preview could not be built."
+  };
+  dispatch_async(dispatch_get_main_queue(), ^{
+    [self.webView callAsyncJavaScript:
+        @"window.__liteverseReceiveContextPreviewError && window.__liteverseReceiveContextPreviewError(errorPayload);"
                               arguments:@{ @"errorPayload": payload }
                                 inFrame:nil
                          inContentWorld:WKContentWorld.pageWorld
@@ -1694,6 +1874,15 @@
     return;
   }
 
+  NSURL *refreshLockURL = [self stageRefreshLockURL];
+  NSString *refreshLockToken = [self acquireDirectoryLockAtURL:refreshLockURL
+      operation:@"Refresh commit" timeout:15.0 error:&error];
+  if (!refreshLockToken) {
+    [self sendWorkspaceErrorForAction:@"commitRefresh" error:error];
+    return;
+  }
+
+  @try {
   NSURL *pendingURL = [self pendingRefreshURL];
   if (![NSFileManager.defaultManager fileExistsAtPath:pendingURL.path]) {
     [self sendWorkspaceErrorForAction:@"commitRefresh"
@@ -1813,7 +2002,8 @@
     return;
   }
 
-  [self appendJSONObject:@{
+  NSError *auditError = nil;
+  BOOL auditSaved = [self appendJSONObject:@{
     @"eventId": NSUUID.UUID.UUIDString,
     @"action": @"graph_refresh_committed",
     @"timestamp": [self isoTimestamp],
@@ -1821,7 +2011,7 @@
     @"baseRevision": requestedBaseRevision,
     @"targetRevision": targetRevision,
     @"snapshotSha256": requestedHash
-  } toURL:[self workspaceInboxURL]];
+  } toURL:[self workspaceInboxURL] error:&auditError];
   // The pending marker has now been removed, so an app-owned visual-catalog
   // migration can safely run without breaking Refresh recovery/idempotency.
   NSError *catalogError = nil;
@@ -1830,7 +2020,13 @@
                                                defaultValue:snapshot
                                                       error:nil];
   [self sendRefreshCommittedGraph:committedGraph ?: snapshot];
-  [self sendWorkspaceWithNotice:@"The literature universe was refreshed atomically."];
+  [self sendWorkspaceWithNotice:auditSaved
+      ? @"The literature universe was refreshed atomically."
+      : [NSString stringWithFormat:@"The literature universe was refreshed, but its audit event could not be persisted: %@",
+          auditError.localizedDescription ?: @"unknown storage error"]];
+  } @finally {
+    [self releaseDirectoryLockAtURL:refreshLockURL token:refreshLockToken];
+  }
 }
 
 - (NSDictionary *)projectDataForID:(NSString *)projectID
@@ -2513,6 +2709,249 @@
   };
 }
 
+- (NSString *)contextPreviewText:(NSString *)text limitedTo:(NSInteger)limit {
+  if (![text isKindOfClass:NSString.class] || limit <= 0) return @"";
+  if ((NSInteger)text.length <= limit) return text;
+  __block NSUInteger end = 0;
+  [text enumerateSubstringsInRange:NSMakeRange(0, text.length)
+                           options:NSStringEnumerationByComposedCharacterSequences
+                        usingBlock:^(NSString *substring, NSRange substringRange,
+                                     NSRange enclosingRange, BOOL *stop) {
+    if (NSMaxRange(substringRange) > (NSUInteger)limit) {
+      *stop = YES;
+      return;
+    }
+    end = NSMaxRange(substringRange);
+  }];
+  return [text substringToIndex:end];
+}
+
+- (NSDictionary *)latestContextPreviewForProjectID:(NSString *)projectID {
+  if (![self isSafeProjectID:projectID]) return nil;
+  NSURL *previewURL = [[[self applicationSupportURL]
+      URLByAppendingPathComponent:@"Cache/ContextPreviews" isDirectory:YES]
+      URLByAppendingPathComponent:[projectID stringByAppendingPathComponent:@"latest.json"]];
+  if (![NSFileManager.defaultManager fileExistsAtPath:previewURL.path]) return nil;
+  NSDictionary *preview = [self readDictionaryAtURL:previewURL defaultValue:nil error:nil];
+  if (![preview[@"schemaVersion"] isEqualToString:@"liteverse-context-preview-v1"] ||
+      ![preview[@"projectId"] isEqualToString:projectID] ||
+      ![preview[@"cacheOnly"] boolValue] || [preview[@"adopted"] boolValue] ||
+      ![preview[@"selectedClaims"] isKindOfClass:NSArray.class] ||
+      ![preview[@"projectMemory"] isKindOfClass:NSArray.class]) return nil;
+  return preview;
+}
+
+- (NSDictionary *)buildContextPreviewForPayload:(NSDictionary *)payload error:(NSError **)error {
+  NSString *query = [payload[@"query"] isKindOfClass:NSString.class]
+      ? [payload[@"query"] stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet]
+      : @"";
+  NSString *projectID = [payload[@"projectId"] isKindOfClass:NSString.class]
+      ? payload[@"projectId"] : nil;
+  NSString *requestID = [payload[@"requestId"] isKindOfClass:NSString.class]
+      ? payload[@"requestId"] : NSUUID.UUID.UUIDString.lowercaseString;
+  NSInteger budget = [payload[@"budgetChars"] integerValue];
+  if (query.length == 0 || query.length > 20000 || ![self isSafeProjectID:projectID] ||
+      requestID.length == 0 || requestID.length > 160 || budget < 2000 || budget > 200000) {
+    if (error) *error = [self storageError:
+        @"The local Context Preview query, project, request ID, or character budget is invalid." code:606];
+    return nil;
+  }
+  if (![self ensureRuntimeGraphStorage:error]) return nil;
+
+  NSDictionary *registry = [self readDictionaryAtURL:[self projectsRegistryURL]
+                                        defaultValue:nil error:error];
+  NSString *activeProjectID = registry ? [self activeProjectIDFromRegistry:registry] : nil;
+  if (!registry || ![activeProjectID isEqualToString:projectID]) {
+    if (error) *error = [self storageError:
+        @"The active project changed before the local Context Preview was built." code:607];
+    return nil;
+  }
+  NSDictionary *projectData = [self projectDataForID:projectID registry:registry error:error];
+  if (!projectData) return nil;
+  NSDictionary *graph = [self readDictionaryAtURL:[self currentGraphURL]
+                                      defaultValue:nil error:error];
+  if (!graph) return nil;
+  id graphRevision = graph[@"revision"] ?: @0;
+
+  NSURL *memoryURL = [[[self projectDirectoryURLForID:projectID error:error]
+      URLByAppendingPathComponent:@"memory" isDirectory:YES]
+      URLByAppendingPathComponent:@"current.json"];
+  NSDictionary *memoryProjection = [NSFileManager.defaultManager fileExistsAtPath:memoryURL.path]
+      ? [self readDictionaryAtURL:memoryURL defaultValue:nil error:error]
+      : @{ @"schemaVersion": @1, @"projectId": projectID, @"revision": @0,
+           @"ledgerHash": @"", @"items": @[] };
+  if (!memoryProjection) return nil;
+  NSNumber *memoryRevision = [memoryProjection[@"revision"] isKindOfClass:NSNumber.class]
+      ? memoryProjection[@"revision"] : @0;
+  NSString *memoryLedgerHash = [memoryProjection[@"ledgerHash"] isKindOfClass:NSString.class]
+      ? memoryProjection[@"ledgerHash"] : @"";
+
+  NSDictionary *search = [self searchLiteratureAtIndexForQuery:query limit:12 error:error];
+  if (!search) return nil;
+  NSInteger literatureBudget = (NSInteger)floor((double)budget * 0.72);
+  NSInteger literatureUsed = 0;
+  NSMutableArray *selectedClaims = [NSMutableArray array];
+  NSMutableOrderedSet<NSString *> *limitationTexts = [NSMutableOrderedSet orderedSet];
+  for (NSDictionary *paper in [search[@"results"] isKindOfClass:NSArray.class] ? search[@"results"] : @[]) {
+    NSArray *relationExpansion = [paper[@"relationExpansion"] isKindOfClass:NSArray.class]
+        ? paper[@"relationExpansion"] : @[];
+    for (NSDictionary *claim in [paper[@"matchingClaims"] isKindOfClass:NSArray.class]
+        ? paper[@"matchingClaims"] : @[]) {
+      if (![claim[@"verificationStatus"] isEqualToString:@"evidence_verified"] ||
+          [claim[@"type"] isEqualToString:@"project_role"]) continue;
+      NSString *claimText = [claim[@"text"] isKindOfClass:NSString.class] ? claim[@"text"] : @"";
+      NSInteger remaining = literatureBudget - literatureUsed;
+      if (claimText.length == 0 || remaining < 120) break;
+      NSString *bounded = [self contextPreviewText:claimText limitedTo:remaining];
+      NSString *section = [claim[@"section"] isKindOfClass:NSString.class]
+          ? claim[@"section"] : (claim[@"type"] ?: @"claim");
+      NSString *routingReason = relationExpansion.count > 0
+          ? [NSString stringWithFormat:@"Verified relationship-graph expansion via %@",
+              [relationExpansion componentsJoinedByString:@", "]]
+          : [NSString stringWithFormat:@"Local FTS5/BM25 match in %@", section];
+      NSArray *evidence = [claim[@"evidence"] isKindOfClass:NSArray.class] ? claim[@"evidence"] : @[];
+      [selectedClaims addObject:@{
+        @"paperId": paper[@"paperId"] ?: @"",
+        @"paperTitle": paper[@"title"] ?: @"",
+        @"title": paper[@"title"] ?: @"",
+        @"claimId": claim[@"claimId"] ?: @"",
+        @"type": claim[@"type"] ?: @"claim",
+        @"text": bounded,
+        @"verificationStatus": @"evidence_verified",
+        @"artifactRevision": claim[@"artifactRevision"] ?: paper[@"artifactRevision"] ?: @0,
+        @"artifactSha256": claim[@"artifactSha256"] ?: paper[@"artifactSha256"] ?: @"",
+        @"evidenceLocators": evidence,
+        @"whySelected": routingReason,
+        @"reason": routingReason,
+        @"trust": @"verified_original_source"
+      }];
+      literatureUsed += bounded.length;
+      if ([claim[@"type"] isEqualToString:@"limitation"]) {
+        [limitationTexts addObject:[NSString stringWithFormat:@"%@: %@", paper[@"paperId"] ?: @"paper", bounded]];
+      }
+    }
+    if (literatureUsed >= literatureBudget - 120) break;
+  }
+
+  NSMutableOrderedSet<NSString *> *queryTokens = [NSMutableOrderedSet orderedSet];
+  for (NSString *token in [[self normalizedSearchText:query] componentsSeparatedByString:@" "]) {
+    if (token.length > 1) [queryTokens addObject:token];
+  }
+  NSMutableArray *rankedMemory = [NSMutableArray array];
+  NSMutableArray *conflicts = [NSMutableArray array];
+  NSSet *alwaysRelevantTypes = [NSSet setWithArray:@[@"goal", @"convention", @"decision", @"assumption"]];
+  NSArray *memoryItems = [projectData[@"projectMemory"][@"items"] isKindOfClass:NSArray.class]
+      ? projectData[@"projectMemory"][@"items"] : @[];
+  for (NSDictionary *item in memoryItems) {
+    if (![item[@"state"] isEqualToString:@"active"]) continue;
+    NSString *content = [item[@"content"] isKindOfClass:NSString.class]
+        ? item[@"content"] : ([item[@"statement"] isKindOfClass:NSString.class] ? item[@"statement"] : @"");
+    NSString *title = [item[@"title"] isKindOfClass:NSString.class] ? item[@"title"] : @"";
+    NSString *searchable = [self normalizedSearchText:
+        [NSString stringWithFormat:@"%@ %@", title, content]];
+    NSInteger score = [alwaysRelevantTypes containsObject:item[@"type"]] ? 1 : 0;
+    for (NSString *token in queryTokens) {
+      if ([searchable containsString:token]) score += 2;
+    }
+    if (score > 0 && content.length > 0) {
+      [rankedMemory addObject:@{ @"item": item, @"score": @(score) }];
+    }
+    NSArray *contradicts = [item[@"contradicts"] isKindOfClass:NSArray.class] ? item[@"contradicts"] : @[];
+    NSArray *contradictedBy = [item[@"contradictedBy"] isKindOfClass:NSArray.class] ? item[@"contradictedBy"] : @[];
+    if (contradicts.count > 0 || contradictedBy.count > 0 ||
+        [item[@"evidenceState"] isEqualToString:@"contradicted"]) {
+      [conflicts addObject:@{
+        @"memoryId": item[@"memoryId"] ?: item[@"id"] ?: @"memory",
+        @"title": title,
+        @"evidenceState": item[@"evidenceState"] ?: @"unknown",
+        @"contradicts": contradicts,
+        @"contradictedBy": contradictedBy
+      }];
+    }
+  }
+  [rankedMemory sortUsingComparator:^NSComparisonResult(NSDictionary *left, NSDictionary *right) {
+    NSInteger leftScore = [left[@"score"] integerValue];
+    NSInteger rightScore = [right[@"score"] integerValue];
+    if (leftScore != rightScore) return leftScore > rightScore ? NSOrderedAscending : NSOrderedDescending;
+    NSString *leftID = left[@"item"][@"memoryId"] ?: left[@"item"][@"id"] ?: @"";
+    NSString *rightID = right[@"item"][@"memoryId"] ?: right[@"item"][@"id"] ?: @"";
+    return [leftID compare:rightID];
+  }];
+  NSInteger memoryBudget = budget - literatureUsed;
+  NSInteger memoryUsed = 0;
+  NSMutableArray *selectedMemory = [NSMutableArray array];
+  for (NSDictionary *candidate in rankedMemory) {
+    if (memoryBudget - memoryUsed < 100) break;
+    NSDictionary *item = candidate[@"item"];
+    NSString *content = [item[@"content"] isKindOfClass:NSString.class]
+        ? item[@"content"] : item[@"statement"];
+    NSString *bounded = [self contextPreviewText:content limitedTo:memoryBudget - memoryUsed];
+    NSMutableDictionary *selected = [item mutableCopy];
+    selected[@"content"] = bounded;
+    selected[@"selectionReason"] = [candidate[@"score"] integerValue] > 1
+        ? @"Task-query term overlap" : @"Active project goal or convention";
+    [selectedMemory addObject:selected];
+    memoryUsed += bounded.length;
+  }
+  if (selectedClaims.count == 0) {
+    [limitationTexts addObject:@"No evidence-verified claim matched this query in the current local index."];
+  }
+  [limitationTexts addObject:
+      @"This local preview has not been adopted by an AI task and does not affect literature heat or usage history."];
+
+  // Pin the preview only if both mutable projections remained unchanged while
+  // search and budget selection were running.
+  NSDictionary *finalGraph = [self readDictionaryAtURL:[self currentGraphURL]
+                                           defaultValue:nil error:error];
+  NSDictionary *finalRegistry = [self readDictionaryAtURL:[self projectsRegistryURL]
+                                              defaultValue:nil error:error];
+  NSDictionary *finalMemory = [NSFileManager.defaultManager fileExistsAtPath:memoryURL.path]
+      ? [self readDictionaryAtURL:memoryURL defaultValue:nil error:error] : memoryProjection;
+  if (!finalGraph || !finalRegistry || !finalMemory) return nil;
+  if (![self revision:finalGraph[@"revision"] matches:graphRevision] ||
+      ![[self activeProjectIDFromRegistry:finalRegistry] isEqualToString:projectID] ||
+      ![finalMemory[@"revision"] isEqual:memoryRevision] ||
+      ![(finalMemory[@"ledgerHash"] ?: @"") isEqualToString:memoryLedgerHash]) {
+    if (error) *error = [self storageError:
+        @"Graph or project memory changed while the local Context Preview was being built. Retry to pin the new revisions."
+                                    code:608];
+    return nil;
+  }
+
+  NSString *contextID = [NSString stringWithFormat:@"preview-%@", NSUUID.UUID.UUIDString.lowercaseString];
+  NSString *createdAt = [self isoTimestamp];
+  NSString *cachePath = [[@"Cache/ContextPreviews" stringByAppendingPathComponent:projectID]
+      stringByAppendingPathComponent:@"latest.json"];
+  NSMutableDictionary *preview = [@{
+    @"schemaVersion": @"liteverse-context-preview-v1",
+    @"requestId": requestID,
+    @"contextId": contextID,
+    @"contextKind": @"local_preview",
+    @"adopted": @NO,
+    @"usageRecorded": @NO,
+    @"cacheOnly": @YES,
+    @"createdAt": createdAt,
+    @"projectId": projectID,
+    @"query": query,
+    @"budgetChars": @(budget),
+    @"usedChars": @(literatureUsed + memoryUsed),
+    @"graphRevision": graphRevision,
+    @"memoryRevision": memoryRevision,
+    @"memoryLedgerHash": memoryLedgerHash,
+    @"indexFingerprint": search[@"indexFingerprint"] ?: @"",
+    @"selectedClaims": selectedClaims,
+    @"projectMemory": selectedMemory,
+    @"conflicts": conflicts,
+    @"limitations": limitationTexts.array,
+    @"cachePath": cachePath
+  } mutableCopy];
+  NSURL *cacheURL = [self URLForWorkspaceRelativePath:cachePath error:error];
+  if (!cacheURL || ![NSFileManager.defaultManager createDirectoryAtURL:cacheURL.URLByDeletingLastPathComponent
+                                      withIntermediateDirectories:YES attributes:nil error:error] ||
+      ![self writeJSONObject:preview toURL:cacheURL error:error]) return nil;
+  return preview;
+}
+
 - (NSDictionary *)validatedPartitionProposalsAtURL:(NSURL *)url error:(NSError **)error {
   NSDictionary *proposal = [self readDictionaryAtURL:url defaultValue:nil error:error];
   if (!proposal) return nil;
@@ -2877,6 +3316,7 @@
     [self sendWorkspaceErrorForAction:@"loadWorkspaceHealth" error:error];
     return;
   }
+  NSDictionary *contextPreview = [self latestContextPreviewForProjectID:activeProjectID];
   NSMutableDictionary *payload = [@{
     @"library": library,
     @"researchInformation": research,
@@ -2884,6 +3324,7 @@
     @"projectMemory": projectData[@"projectMemory"],
     @"tasks": projectData[@"tasks"],
     @"contextPacks": projectData[@"contextPacks"],
+    @"contextPreview": contextPreview ?: NSNull.null,
     @"artifacts": projectData[@"artifacts"],
     // Search is demand-driven through the shared SQLite FTS5 index. Do not
     // deserialize thousands of claims into every workspace payload.
@@ -2968,6 +3409,15 @@
   NSString *text = rawAnnotation[@"text"];
   if (annotationID.length == 0 || paperID.length == 0 || text.length == 0) return;
 
+  NSError *lockError = nil;
+  NSURL *lockURL = [self annotationMutationLockURL];
+  NSString *lockToken = [self acquireDirectoryLockAtURL:lockURL
+      operation:@"Annotation update" timeout:15.0 error:&lockError];
+  if (!lockToken) {
+    [self sendWorkspaceErrorForAction:@"saveAnnotation" error:lockError];
+    return;
+  }
+  @try {
   NSError *readError = nil;
   NSArray *storedAnnotations = [self readAnnotationsWithError:&readError];
   if (!storedAnnotations) {
@@ -3007,10 +3457,15 @@
   }
 
   NSError *error = nil;
-  NSData *data = [NSJSONSerialization dataWithJSONObject:annotations
-                                                  options:NSJSONWritingPrettyPrinted | NSJSONWritingSortedKeys
-                                                    error:&error];
-  if (error || ![data writeToURL:[self annotationsURL] options:NSDataWritingAtomic error:&error]) {
+  NSURL *annotationsURL = [self annotationsURL];
+  BOOL annotationsExisted = [NSFileManager.defaultManager fileExistsAtPath:annotationsURL.path];
+  NSData *previousData = annotationsExisted
+      ? [NSData dataWithContentsOfURL:annotationsURL options:0 error:&error] : nil;
+  if (annotationsExisted && !previousData) {
+    [self sendWorkspaceErrorForAction:@"saveAnnotation" error:error];
+    return;
+  }
+  if (![self writeJSONObject:annotations toURL:annotationsURL error:&error]) {
     [self sendWorkspaceErrorForAction:@"saveAnnotation" error:error];
     return;
   }
@@ -3021,10 +3476,22 @@
     @"timestamp": annotation[@"updatedAt"] ?: @"",
     @"annotation": annotation
   };
-  [self appendJSONObject:event
-                    toURL:[[self applicationSupportURL] URLByAppendingPathComponent:@"codex-inbox.jsonl"]];
+  if (![self appendJSONObject:event
+                    toURL:[[self applicationSupportURL] URLByAppendingPathComponent:@"codex-inbox.jsonl"]
+                    error:&error]) {
+    if (annotationsExisted && previousData) {
+      [previousData writeToURL:annotationsURL options:NSDataWritingAtomic error:nil];
+    } else {
+      [NSFileManager.defaultManager removeItemAtURL:annotationsURL error:nil];
+    }
+    [self sendWorkspaceErrorForAction:@"saveAnnotation" error:error];
+    return;
+  }
   [self writeMarkdownMirrorForPaper:paperID annotations:annotations];
   [self sendAnnotations:annotations savedID:annotationID];
+  } @finally {
+    [self releaseDirectoryLockAtURL:lockURL token:lockToken];
+  }
 }
 
 - (NSString *)normalizedArxivIDFromValue:(NSString *)rawValue {
@@ -3047,6 +3514,627 @@
   NSRegularExpression *expression = [NSRegularExpression regularExpressionWithPattern:pattern options:0 error:nil];
   NSRange fullRange = NSMakeRange(0, candidate.length);
   return [expression firstMatchInString:candidate options:0 range:fullRange] ? candidate : nil;
+}
+
+- (NSURL *)localPreparationPipelineURL {
+  return [[self applicationSupportURL] URLByAppendingPathComponent:@"Work/LocalPipeline" isDirectory:YES];
+}
+
+- (NSURL *)localPreparationWorkerURL {
+  NSURL *executableDirectory = NSBundle.mainBundle.executableURL.URLByDeletingLastPathComponent;
+  return [executableDirectory URLByAppendingPathComponent:@"LiteverseLocalWorker" isDirectory:NO];
+}
+
+- (BOOL)isSafeLocalPreparationJobID:(NSString *)jobID {
+  if (![jobID isKindOfClass:NSString.class] || jobID.length == 0 || jobID.length > 64) return NO;
+  NSRegularExpression *expression = [NSRegularExpression
+      regularExpressionWithPattern:@"^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$"
+                           options:0
+                             error:nil];
+  return [expression firstMatchInString:jobID options:0 range:NSMakeRange(0, jobID.length)] != nil;
+}
+
+- (BOOL)isValidLocalPreparationSHA256:(id)value {
+  if (![value isKindOfClass:NSString.class] || [value length] != 64) return NO;
+  NSCharacterSet *hex = [NSCharacterSet characterSetWithCharactersInString:@"0123456789abcdef"];
+  return [(NSString *)value rangeOfCharacterFromSet:hex.invertedSet].location == NSNotFound;
+}
+
+- (NSString *)localPreparationJobID {
+  return [NSString stringWithFormat:@"local-%@", NSUUID.UUID.UUIDString.lowercaseString];
+}
+
+- (NSString *)localPreparationCatalogFingerprint:(NSError **)error {
+  NSURL *catalogURL = [self papersIndexURL];
+  NSFileManager *manager = NSFileManager.defaultManager;
+  if (![manager fileExistsAtPath:catalogURL.path]) return @"absent";
+  NSNumber *isRegular = nil;
+  NSNumber *isSymbolicLink = nil;
+  if (![catalogURL getResourceValue:&isRegular forKey:NSURLIsRegularFileKey error:error] ||
+      ![catalogURL getResourceValue:&isSymbolicLink forKey:NSURLIsSymbolicLinkKey error:error] ||
+      !isRegular.boolValue || isSymbolicLink.boolValue) {
+    if (error && !*error) *error = [self storageError:
+        @"Knowledge/papers.json must be a regular, non-symbolic-link file before local preparation can run."
+                                                   code:601];
+    return nil;
+  }
+  return [self sha256ForFileAtURL:catalogURL error:error];
+}
+
+- (NSString *)arxivBaseIdentifier:(NSString *)identifier {
+  if (![identifier isKindOfClass:NSString.class]) return nil;
+  return [[identifier lowercaseString]
+      stringByReplacingOccurrencesOfString:@"v[0-9]+$"
+                                withString:@""
+                                   options:NSRegularExpressionSearch
+                                     range:NSMakeRange(0, identifier.length)];
+}
+
+- (NSString *)boundedLocalPreparationReason:(NSString *)reason {
+  NSString *value = [reason isKindOfClass:NSString.class]
+      ? [reason stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet]
+      : @"Local preparation failed closed.";
+  if (value.length == 0) value = @"Local preparation failed closed.";
+  return value.length > 480 ? [[value substringToIndex:480] stringByAppendingString:@"…"] : value;
+}
+
+- (NSDictionary *)queuedPreparationWithJobID:(NSString *)jobID sourceRevision:(NSInteger)sourceRevision {
+  return @{
+    @"schemaVersion": @1,
+    @"state": @"queued",
+    @"jobId": jobID,
+    @"sourceRevision": @(sourceRevision),
+    @"resultSha256": NSNull.null,
+    @"manifestPath": NSNull.null,
+    @"queuedAt": [self isoTimestamp]
+  };
+}
+
+- (BOOL)localPreparationFileAtURL:(NSURL *)fileURL
+                isConfinedToRoot:(NSURL *)rootURL
+                           error:(NSError **)error {
+  NSURL *root = rootURL.URLByStandardizingPath.URLByResolvingSymlinksInPath;
+  NSURL *originalFile = fileURL.URLByStandardizingPath;
+  NSURL *file = originalFile.URLByResolvingSymlinksInPath;
+  NSString *rootPrefix = [root.path stringByAppendingString:@"/"];
+  NSNumber *isRegular = nil;
+  NSNumber *isSymbolicLink = nil;
+  BOOL valid = [file.path hasPrefix:rootPrefix] &&
+      [originalFile getResourceValue:&isRegular forKey:NSURLIsRegularFileKey error:error] &&
+      [originalFile getResourceValue:&isSymbolicLink forKey:NSURLIsSymbolicLinkKey error:error] &&
+      isRegular.boolValue && !isSymbolicLink.boolValue;
+  if (!valid && error && !*error) {
+    *error = [self storageError:
+        @"The local preparation result contains an out-of-bounds, missing, or symbolic-link output."
+                            code:602];
+  }
+  return valid;
+}
+
+- (NSDictionary *)validatedLocalPreparationOutput:(NSData *)stdoutData
+                                               item:(NSDictionary *)item
+                                              jobID:(NSString *)jobID
+                                   expectedRevision:(NSInteger)expectedRevision
+                                 catalogFingerprint:(NSString *)catalogFingerprint
+                                     manifestSHA256:(NSString **)manifestSHA256
+                                       manifestPath:(NSString **)manifestPath
+                                              error:(NSError **)error {
+  static const unsigned long long kManifestLimit = 2ULL * 1024ULL * 1024ULL;
+  static const unsigned long long kPDFLimit = 1536ULL * 1024ULL * 1024ULL;
+  static const unsigned long long kFulltextLimit = 256ULL * 1024ULL * 1024ULL;
+  static const unsigned long long kCardLimit = 8ULL * 1024ULL * 1024ULL;
+  static const unsigned long long kReviewPacketLimit = 16ULL * 1024ULL * 1024ULL;
+  if (stdoutData.length == 0 || stdoutData.length > kManifestLimit) {
+    if (error) *error = [self storageError:@"The local worker returned an empty or oversized manifest." code:603];
+    return nil;
+  }
+  id rawStdout = [NSJSONSerialization JSONObjectWithData:stdoutData options:0 error:error];
+  if (![rawStdout isKindOfClass:NSDictionary.class]) {
+    if (error && !*error) *error = [self storageError:@"The local worker returned malformed JSON." code:604];
+    return nil;
+  }
+  NSDictionary *manifest = rawStdout;
+  NSString *itemID = [item[@"id"] isKindOfClass:NSString.class] ? item[@"id"] : nil;
+  NSSet *allowedStates = [NSSet setWithArray:@[ @"ready", @"duplicate", @"needs_attention" ]];
+  if (![manifest[@"schemaVersion"] isEqualToString:@"liteverse-local-result-v1"] ||
+      ![manifest[@"jobSchemaVersion"] isEqualToString:@"liteverse-local-job-v1"] ||
+      ![manifest[@"operation"] isEqualToString:@"materialize"] ||
+      ![manifest[@"jobId"] isEqualToString:jobID] ||
+      ![manifest[@"itemId"] isEqualToString:itemID] ||
+      ![self revision:manifest[@"itemRevision"] matches:@(expectedRevision)] ||
+      ![manifest[@"catalogFingerprint"] isEqualToString:catalogFingerprint] ||
+      ![allowedStates containsObject:manifest[@"state"]] ||
+      ![self isValidLocalPreparationSHA256:manifest[@"sourceSha256"]]) {
+    if (error) *error = [self storageError:
+        @"The local worker manifest does not match the queued item, revision, catalog, or result schema."
+                                             code:605];
+    return nil;
+  }
+
+  NSDictionary *preparation = [manifest[@"preparation"] isKindOfClass:NSDictionary.class]
+      ? manifest[@"preparation"] : nil;
+  NSString *expectedPreparationState = [manifest[@"state"] isEqualToString:@"needs_attention"]
+      ? @"needs_attention" : @"ready";
+  if (!preparation || ![preparation[@"state"] isEqualToString:expectedPreparationState]) {
+    if (error) *error = [self storageError:@"The local worker result has an inconsistent preparation state." code:606];
+    return nil;
+  }
+  NSDictionary *guardrails = [manifest[@"guardrails"] isKindOfClass:NSDictionary.class]
+      ? manifest[@"guardrails"] : nil;
+  for (NSString *key in @[ @"writesGraphCurrent", @"writesUsage", @"writesResearchMemory",
+                            @"promotesKnowledgeArtifacts", @"downloadsSuggestedLiterature" ]) {
+    if (!guardrails || ![guardrails[key] isKindOfClass:NSNumber.class] || [guardrails[key] boolValue]) {
+      if (error) *error = [self storageError:@"The local worker result did not preserve its write-boundary guardrails." code:607];
+      return nil;
+    }
+  }
+
+  NSDictionary *canonical = [manifest[@"canonicalMetadata"] isKindOfClass:NSDictionary.class]
+      ? manifest[@"canonicalMetadata"] : nil;
+  NSString *sourceType = [item[@"sourceType"] isKindOfClass:NSString.class] ? item[@"sourceType"] : nil;
+  if (!canonical || ![canonical[@"kind"] isEqualToString:sourceType]) {
+    if (error) *error = [self storageError:@"The local worker changed the queued source type." code:608];
+    return nil;
+  }
+  if ([sourceType isEqualToString:@"pdf"]) {
+    NSDictionary *source = [item[@"source"] isKindOfClass:NSDictionary.class] ? item[@"source"] : @{};
+    NSString *expectedSourceHash = [source[@"sha256"] isKindOfClass:NSString.class]
+        ? source[@"sha256"] : item[@"sha256"];
+    if (![manifest[@"sourceSha256"] isEqualToString:expectedSourceHash]) {
+      if (error) *error = [self storageError:@"The prepared PDF does not match the managed source SHA-256." code:609];
+      return nil;
+    }
+  } else if ([sourceType isEqualToString:@"arxiv"]) {
+    NSString *queuedArxiv = [self arxivBaseIdentifier:item[@"arxivId"]];
+    NSString *resultArxiv = [self arxivBaseIdentifier:canonical[@"arxivId"]];
+    if (queuedArxiv.length == 0 || ![queuedArxiv isEqualToString:resultArxiv]) {
+      if (error) *error = [self storageError:@"Official arXiv metadata did not match the explicitly submitted identifier." code:610];
+      return nil;
+    }
+  } else {
+    if (error) *error = [self storageError:@"The queued literature source type is unsupported." code:611];
+    return nil;
+  }
+
+  NSURL *pipelineRoot = [self localPreparationPipelineURL].URLByStandardizingPath.URLByResolvingSymlinksInPath;
+  NSURL *jobDirectory = [[self localPreparationPipelineURL]
+      URLByAppendingPathComponent:jobID isDirectory:YES].URLByStandardizingPath;
+  NSURL *resolvedJobDirectory = jobDirectory.URLByResolvingSymlinksInPath;
+  NSNumber *jobIsDirectory = nil;
+  NSNumber *jobIsSymbolicLink = nil;
+  NSString *pipelinePrefix = [pipelineRoot.path stringByAppendingString:@"/"];
+  if (![resolvedJobDirectory.path hasPrefix:pipelinePrefix] ||
+      ![jobDirectory getResourceValue:&jobIsDirectory forKey:NSURLIsDirectoryKey error:error] ||
+      ![jobDirectory getResourceValue:&jobIsSymbolicLink forKey:NSURLIsSymbolicLinkKey error:error] ||
+      !jobIsDirectory.boolValue || jobIsSymbolicLink.boolValue) {
+    if (error && !*error) *error = [self storageError:
+        @"The local preparation job directory escaped Work/LocalPipeline or is a symbolic link."
+                                                   code:634];
+    return nil;
+  }
+  NSURL *manifestURL = [jobDirectory URLByAppendingPathComponent:@"manifest.json" isDirectory:NO];
+  if (![self localPreparationFileAtURL:manifestURL isConfinedToRoot:jobDirectory error:error]) return nil;
+  NSDictionary *manifestAttributes = [NSFileManager.defaultManager
+      attributesOfItemAtPath:manifestURL.path error:error];
+  if (!manifestAttributes || [manifestAttributes[NSFileSize] unsignedLongLongValue] > kManifestLimit) {
+    if (error && !*error) *error = [self storageError:@"The stored local manifest is oversized." code:612];
+    return nil;
+  }
+  NSData *storedManifest = [NSData dataWithContentsOfURL:manifestURL options:NSDataReadingMappedIfSafe error:error];
+  if (!storedManifest || ![storedManifest isEqualToData:stdoutData]) {
+    if (error && !*error) *error = [self storageError:@"Worker stdout and the immutable stored manifest differ." code:613];
+    return nil;
+  }
+
+  NSArray *outputs = [manifest[@"outputs"] isKindOfClass:NSArray.class] ? manifest[@"outputs"] : nil;
+  if (!outputs || outputs.count > 4) {
+    if (error) *error = [self storageError:@"The local worker declared an invalid output set." code:614];
+    return nil;
+  }
+  NSMutableSet<NSString *> *roles = [NSMutableSet set];
+  NSMutableSet<NSString *> *paths = [NSMutableSet set];
+  unsigned long long totalOutputSize = 0;
+  for (id rawOutput in outputs) {
+    if (![rawOutput isKindOfClass:NSDictionary.class]) {
+      if (error) *error = [self storageError:@"The local worker declared a malformed output." code:615];
+      return nil;
+    }
+    NSDictionary *output = rawOutput;
+    NSString *role = [output[@"role"] isKindOfClass:NSString.class] ? output[@"role"] : nil;
+    NSString *path = [output[@"path"] isKindOfClass:NSString.class] ? output[@"path"] : nil;
+    NSNumber *declaredSize = [output[@"size"] isKindOfClass:NSNumber.class] ? output[@"size"] : nil;
+    NSString *declaredHash = output[@"sha256"];
+    NSDictionary *limits = @{
+      @"pdf": @(kPDFLimit),
+      @"fulltext": @(kFulltextLimit),
+      @"card": @(kCardLimit),
+      @"review_packet": @(kReviewPacketLimit)
+    };
+    unsigned long long sizeLimit = [limits[role] unsignedLongLongValue];
+    if (!role || !limits[role] || [roles containsObject:role] ||
+        !path || ![self isSafeWorkspaceRelativePath:path] || [paths containsObject:path] ||
+        !declaredSize || declaredSize.longLongValue < 0 || declaredSize.unsignedLongLongValue > sizeLimit ||
+        ![self isValidLocalPreparationSHA256:declaredHash]) {
+      if (error) *error = [self storageError:@"The local worker output declaration is unsafe or exceeds its size limit." code:616];
+      return nil;
+    }
+    [roles addObject:role];
+    [paths addObject:path];
+    NSURL *outputURL = [jobDirectory URLByAppendingPathComponent:path isDirectory:NO];
+    if (![self localPreparationFileAtURL:outputURL isConfinedToRoot:jobDirectory error:error]) return nil;
+    NSDictionary *attributes = [NSFileManager.defaultManager attributesOfItemAtPath:outputURL.path error:error];
+    unsigned long long actualSize = [attributes[NSFileSize] unsignedLongLongValue];
+    if (actualSize != declaredSize.unsignedLongLongValue ||
+        ![[self sha256ForFileAtURL:outputURL error:error] isEqualToString:declaredHash]) {
+      if (error && !*error) *error = [self storageError:@"A local preparation output failed its size or SHA-256 check." code:617];
+      return nil;
+    }
+    if ([role isEqualToString:@"review_packet"]) {
+      NSData *packetData = [NSData dataWithContentsOfURL:outputURL options:NSDataReadingMappedIfSafe error:error];
+      id rawPacket = packetData ? [NSJSONSerialization JSONObjectWithData:packetData options:0 error:error] : nil;
+      NSDictionary *packet = [rawPacket isKindOfClass:NSDictionary.class] ? rawPacket : nil;
+      NSDictionary *packetGuardrails = [packet[@"guardrails"] isKindOfClass:NSDictionary.class]
+          ? packet[@"guardrails"] : nil;
+      BOOL routingOnly = packet &&
+          [packet[@"schemaVersion"] isEqualToString:@"liteverse-review-packet-v1"] &&
+          [packet[@"itemId"] isEqualToString:itemID] &&
+          [self revision:packet[@"itemRevision"] matches:@(expectedRevision)] &&
+          [packet[@"sourceSha256"] isEqualToString:manifest[@"sourceSha256"]] &&
+          [packet[@"status"] isEqualToString:@"provisional"] &&
+          [packet[@"purpose"] isEqualToString:@"routing_only"];
+      for (NSString *key in @[ @"originalSourceEvidence", @"verifiedClaims", @"relationStrength",
+                                @"classification", @"writesGraph", @"writesUsage", @"writesResearchMemory" ]) {
+        routingOnly = routingOnly && [packetGuardrails[key] isKindOfClass:NSNumber.class] &&
+            ![packetGuardrails[key] boolValue];
+      }
+      if (!routingOnly) {
+        if (error && !*error) *error = [self storageError:
+            @"The review packet is not a provisional routing-only cache and cannot be adopted."
+                                                     code:633];
+        return nil;
+      }
+    }
+    totalOutputSize += actualSize;
+    if (totalOutputSize > kPDFLimit + kFulltextLimit + kCardLimit + kReviewPacketLimit) {
+      if (error) *error = [self storageError:@"The local preparation result exceeds the total output size limit." code:618];
+      return nil;
+    }
+  }
+  NSString *state = manifest[@"state"];
+  if (([state isEqualToString:@"ready"] && ![roles isEqualToSet:[NSSet setWithArray:@[ @"pdf", @"fulltext", @"card", @"review_packet" ]]]) ||
+      ([state isEqualToString:@"duplicate"] && outputs.count != 0)) {
+    if (error) *error = [self storageError:@"The local preparation state and output closure do not agree." code:619];
+    return nil;
+  }
+  NSDictionary *paper = [manifest[@"paper"] isKindOfClass:NSDictionary.class] ? manifest[@"paper"] : nil;
+  if (paper && (![paper[@"libraryItemId"] isEqualToString:itemID] ||
+                ![self revision:paper[@"libraryItemRevision"] matches:@(expectedRevision)])) {
+    if (error) *error = [self storageError:@"The prepared paper metadata points to a different Library revision." code:620];
+    return nil;
+  }
+  if (manifestSHA256) *manifestSHA256 = [self sha256ForData:storedManifest];
+  if (manifestPath) *manifestPath = [NSString stringWithFormat:@"Work/LocalPipeline/%@/manifest.json", jobID];
+  return manifest;
+}
+
+- (void)finishLocalPreparationForItemID:(NSString *)itemID
+                       expectedRevision:(NSInteger)expectedRevision
+                                  jobID:(NSString *)jobID
+                               manifest:(NSDictionary *)manifest
+                         manifestSHA256:(NSString *)manifestSHA256
+                           manifestPath:(NSString *)manifestPath
+                          failureReason:(NSString *)failureReason {
+  __block NSError *error = nil;
+  NSDictionary *storedLibrary = [self readDictionaryAtURL:[self libraryURL]
+                                              defaultValue:[self defaultLibrary]
+                                                     error:&error];
+  if (!storedLibrary) {
+    [self sendWorkspaceErrorForAction:@"localPreparation" error:error];
+    return;
+  }
+  NSArray *storedItems = [storedLibrary[@"items"] isKindOfClass:NSArray.class] ? storedLibrary[@"items"] : @[];
+  NSMutableArray *items = [storedItems mutableCopy];
+  NSUInteger matchingIndex = NSNotFound;
+  NSUInteger matches = 0;
+  for (NSUInteger index = 0; index < items.count; index += 1) {
+    NSDictionary *candidate = [items[index] isKindOfClass:NSDictionary.class] ? items[index] : nil;
+    if ([candidate[@"id"] isEqualToString:itemID]) {
+      matchingIndex = index;
+      matches += 1;
+    }
+  }
+  if (matches != 1) {
+    [self sendWorkspaceErrorForAction:@"localPreparation"
+                                error:[self storageError:@"The queued Library item is missing or duplicated; its local result was not adopted." code:621]];
+    return;
+  }
+  NSDictionary *current = items[matchingIndex];
+  NSDictionary *preparation = [current[@"preparation"] isKindOfClass:NSDictionary.class]
+      ? current[@"preparation"] : nil;
+  if (![self revision:current[@"revision"] matches:@(expectedRevision)] ||
+      ![preparation[@"state"] isEqualToString:@"queued"] ||
+      ![preparation[@"jobId"] isEqualToString:jobID] ||
+      ![self revision:preparation[@"sourceRevision"] matches:@(expectedRevision)]) {
+    [self sendWorkspaceErrorForAction:@"localPreparation"
+                                error:[self storageError:@"The Library item changed while local preparation was running; the stale result was preserved but not adopted." code:622]];
+    return;
+  }
+
+  BOOL ready = manifest && !failureReason && ![manifest[@"state"] isEqualToString:@"needs_attention"];
+  NSMutableDictionary *nextPreparation = [@{
+    @"schemaVersion": @1,
+    @"state": ready ? @"ready" : @"needs_attention",
+    @"jobId": jobID,
+    @"sourceRevision": @(expectedRevision),
+    @"resultSha256": manifestSHA256 ?: NSNull.null,
+    @"manifestPath": manifestPath ?: NSNull.null,
+    @"completedAt": [self isoTimestamp]
+  } mutableCopy];
+  NSString *manifestState = [manifest[@"state"] isKindOfClass:NSString.class] ? manifest[@"state"] : nil;
+  NSString *extractionStatus = [manifest[@"extractionStatus"] isKindOfClass:NSString.class]
+      ? manifest[@"extractionStatus"] : nil;
+  NSDictionary *manifestPreparation = [manifest[@"preparation"] isKindOfClass:NSDictionary.class]
+      ? manifest[@"preparation"] : nil;
+  NSString *manifestReason = [manifestPreparation[@"reason"] isKindOfClass:NSString.class]
+      ? manifestPreparation[@"reason"] : nil;
+  if (manifestState) nextPreparation[@"resultState"] = manifestState;
+  if (extractionStatus) nextPreparation[@"extractionStatus"] = extractionStatus;
+  for (NSDictionary *output in [manifest[@"outputs"] isKindOfClass:NSArray.class] ? manifest[@"outputs"] : @[]) {
+    if ([output[@"role"] isEqualToString:@"review_packet"] && [output[@"path"] isKindOfClass:NSString.class]) {
+      nextPreparation[@"reviewPacketPath"] = [NSString stringWithFormat:@"Work/LocalPipeline/%@/%@", jobID, output[@"path"]];
+      break;
+    }
+  }
+  if (ready && [manifestState isEqualToString:@"ready"]) {
+    NSDictionary *canonical = [manifest[@"canonicalMetadata"] isKindOfClass:NSDictionary.class]
+        ? manifest[@"canonicalMetadata"] : nil;
+    NSString *canonicalTitle = [canonical[@"title"] isKindOfClass:NSString.class]
+        ? [canonical[@"title"] stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet]
+        : @"";
+    NSMutableArray *candidates = [NSMutableArray array];
+    if (canonicalTitle.length > 0 && canonicalTitle.length <= 2000) {
+      NSError *searchError = nil;
+      NSDictionary *searchResult = [self searchLiteratureAtIndexForQuery:canonicalTitle limit:12 error:&searchError];
+      for (NSDictionary *candidate in [searchResult[@"results"] isKindOfClass:NSArray.class]
+               ? searchResult[@"results"] : @[]) {
+        NSString *paperID = [candidate[@"paperId"] isKindOfClass:NSString.class] ? candidate[@"paperId"] : nil;
+        NSNumber *rank = [candidate[@"rank"] isKindOfClass:NSNumber.class] ? candidate[@"rank"] : nil;
+        if (paperID.length > 0 && rank) [candidates addObject:@{ @"paperId": paperID, @"rank": rank }];
+      }
+      // Search is a rebuildable convenience. A missing, stale, or unhealthy
+      // FTS index never downgrades otherwise valid local preparation.
+      (void)searchError;
+    }
+    nextPreparation[@"screeningCandidates"] = candidates;
+    nextPreparation[@"screeningMethod"] = @"fts5_bm25_title_v1";
+  }
+  if (!ready) nextPreparation[@"reason"] = [self boundedLocalPreparationReason:failureReason ?: manifestReason];
+
+  NSMutableDictionary *updated = [current mutableCopy];
+  updated[@"preparation"] = nextPreparation;
+  updated[@"revision"] = @(expectedRevision + 1);
+  updated[@"updatedAt"] = [self isoTimestamp];
+  updated[@"status"] = ready ? @"pending_codex" : @"needs_attention";
+  items[matchingIndex] = updated;
+  NSMutableDictionary *library = [storedLibrary mutableCopy];
+  library[@"items"] = items;
+  if (![self writeJSONObject:library toURL:[self libraryURL] error:&error]) {
+    [self sendWorkspaceErrorForAction:@"localPreparation" error:error];
+    return;
+  }
+  NSString *notice = ready
+      ? @"Local preparation finished. The paper remains pending until Codex verifies its scientific content."
+      : @"Local preparation needs attention. Review the status in Library and retry when ready.";
+  [self sendWorkspaceWithNotice:notice];
+}
+
+- (void)runLocalPreparationForItem:(NSDictionary *)item {
+  NSString *itemID = [item[@"id"] isKindOfClass:NSString.class] ? item[@"id"] : nil;
+  NSInteger expectedRevision = [item[@"revision"] integerValue];
+  NSDictionary *preparation = [item[@"preparation"] isKindOfClass:NSDictionary.class]
+      ? item[@"preparation"] : nil;
+  NSString *jobID = [preparation[@"jobId"] isKindOfClass:NSString.class] ? preparation[@"jobId"] : nil;
+  if (!itemID || expectedRevision < 1 || ![self isSafeLocalPreparationJobID:jobID] ||
+      ![preparation[@"state"] isEqualToString:@"queued"] ||
+      ![self revision:preparation[@"sourceRevision"] matches:@(expectedRevision)]) return;
+
+  __block NSError *error = nil;
+  NSString *catalogFingerprint = [self localPreparationCatalogFingerprint:&error];
+  if (!catalogFingerprint) {
+    dispatch_async(_persistenceQueue, ^{
+      [self finishLocalPreparationForItemID:itemID expectedRevision:expectedRevision jobID:jobID
+                                   manifest:nil manifestSHA256:nil manifestPath:nil
+                              failureReason:error.localizedDescription];
+    });
+    return;
+  }
+  NSMutableDictionary *source = [NSMutableDictionary dictionary];
+  NSString *sourceType = item[@"sourceType"];
+  if ([sourceType isEqualToString:@"pdf"]) {
+    NSString *relativePath = [item[@"localPath"] isKindOfClass:NSString.class]
+        ? item[@"localPath"] : [item[@"source"] isKindOfClass:NSDictionary.class] ? item[@"source"][@"pdfPath"] : nil;
+    NSURL *managedURL = [self URLForWorkspaceRelativePath:relativePath error:&error];
+    NSURL *managedRoot = [self pdfDirectoryURL].URLByStandardizingPath.URLByResolvingSymlinksInPath;
+    NSURL *resolvedManagedURL = managedURL.URLByStandardizingPath.URLByResolvingSymlinksInPath;
+    NSString *managedPrefix = [managedRoot.path stringByAppendingString:@"/"];
+    if (!managedURL || ![resolvedManagedURL.path hasPrefix:managedPrefix] ||
+        ![self localPreparationFileAtURL:resolvedManagedURL isConfinedToRoot:managedRoot error:&error]) {
+      if (!error) error = [self storageError:@"The queued PDF is outside the managed Library/PDFs directory." code:623];
+    } else {
+      source[@"kind"] = @"pdf";
+      source[@"pdfPath"] = resolvedManagedURL.path;
+    }
+  } else if ([sourceType isEqualToString:@"arxiv"]) {
+    NSString *arxivID = [self normalizedArxivIDFromValue:item[@"arxivId"]];
+    if (!arxivID) error = [self storageError:@"The queued arXiv identifier is invalid." code:624];
+    else {
+      source[@"kind"] = @"arxiv";
+      source[@"arxivId"] = arxivID;
+    }
+  } else {
+    error = [self storageError:@"The queued literature source type is unsupported." code:625];
+  }
+  if (error) {
+    dispatch_async(_persistenceQueue, ^{
+      [self finishLocalPreparationForItemID:itemID expectedRevision:expectedRevision jobID:jobID
+                                   manifest:nil manifestSHA256:nil manifestPath:nil
+                              failureReason:error.localizedDescription];
+    });
+    return;
+  }
+
+  NSDictionary *request = @{
+    @"schemaVersion": @"liteverse-local-job-v1",
+    @"operation": @"materialize",
+    @"jobId": jobID,
+    @"itemId": itemID,
+    @"itemRevision": @(expectedRevision),
+    @"catalogFingerprint": catalogFingerprint,
+    @"supportDir": [self applicationSupportURL].path,
+    @"timeoutSeconds": @60,
+    @"source": source
+  };
+  NSData *requestData = [NSJSONSerialization dataWithJSONObject:request options:NSJSONWritingSortedKeys error:&error];
+  NSURL *workerURL = [self localPreparationWorkerURL];
+  if (!requestData || ![NSFileManager.defaultManager isExecutableFileAtPath:workerURL.path]) {
+    if (!error) error = [self storageError:@"The bundled LiteverseLocalWorker helper is missing or is not executable." code:626];
+  }
+  if (error) {
+    dispatch_async(_persistenceQueue, ^{
+      [self finishLocalPreparationForItemID:itemID expectedRevision:expectedRevision jobID:jobID
+                                   manifest:nil manifestSHA256:nil manifestPath:nil
+                              failureReason:error.localizedDescription];
+    });
+    return;
+  }
+
+  NSTask *task = [[NSTask alloc] init];
+  NSPipe *stdinPipe = [NSPipe pipe];
+  NSPipe *stdoutPipe = [NSPipe pipe];
+  NSPipe *stderrPipe = [NSPipe pipe];
+  task.executableURL = workerURL;
+  task.arguments = @[];
+  task.standardInput = stdinPipe;
+  task.standardOutput = stdoutPipe;
+  task.standardError = stderrPipe;
+  if (![task launchAndReturnError:&error]) {
+    dispatch_async(_persistenceQueue, ^{
+      [self finishLocalPreparationForItemID:itemID expectedRevision:expectedRevision jobID:jobID
+                                   manifest:nil manifestSHA256:nil manifestPath:nil
+                              failureReason:error.localizedDescription];
+    });
+    return;
+  }
+  @try {
+    [stdinPipe.fileHandleForWriting writeData:requestData];
+    [stdinPipe.fileHandleForWriting closeFile];
+  } @catch (NSException *exception) {
+    [task terminate];
+    error = [self storageError:
+        [NSString stringWithFormat:@"Could not send the local preparation request: %@", exception.reason ?: @"unknown error"]
+                            code:627];
+  }
+  NSData *stdoutData = [stdoutPipe.fileHandleForReading readDataToEndOfFile];
+  NSData *stderrData = [stderrPipe.fileHandleForReading readDataToEndOfFile];
+  [task waitUntilExit];
+  if (!error && task.terminationStatus != 0) {
+    NSString *detail = [[NSString alloc] initWithData:stderrData encoding:NSUTF8StringEncoding];
+    if (detail.length > 0) {
+      id rawError = [NSJSONSerialization JSONObjectWithData:stderrData options:0 error:nil];
+      if ([rawError isKindOfClass:NSDictionary.class] && [rawError[@"error"] isKindOfClass:NSString.class]) {
+        detail = rawError[@"error"];
+      }
+    }
+    error = [self storageError:
+        [NSString stringWithFormat:@"LiteverseLocalWorker failed: %@", [self boundedLocalPreparationReason:detail]]
+                            code:628];
+  }
+
+  NSString *manifestSHA256 = nil;
+  NSString *manifestPath = nil;
+  NSDictionary *manifest = error ? nil : [self validatedLocalPreparationOutput:stdoutData
+      item:item jobID:jobID expectedRevision:expectedRevision catalogFingerprint:catalogFingerprint
+      manifestSHA256:&manifestSHA256 manifestPath:&manifestPath error:&error];
+  dispatch_async(_persistenceQueue, ^{
+    NSError *fingerprintError = nil;
+    NSString *liveFingerprint = [self localPreparationCatalogFingerprint:&fingerprintError];
+    if (!error && (![liveFingerprint isEqualToString:catalogFingerprint] || fingerprintError)) {
+      error = fingerprintError ?: [self storageError:
+          @"Knowledge/papers.json changed while local preparation was running; retry against the current catalog."
+                                           code:629];
+    }
+    [self finishLocalPreparationForItemID:itemID expectedRevision:expectedRevision jobID:jobID
+                                 manifest:error ? nil : manifest
+                           manifestSHA256:error ? nil : manifestSHA256
+                             manifestPath:error ? nil : manifestPath
+                            failureReason:error.localizedDescription];
+  });
+}
+
+- (void)scheduleLocalPreparationForItem:(NSDictionary *)item {
+  NSDictionary *immutableItem = [item copy];
+  dispatch_async(_localPreparationQueue, ^{
+    @autoreleasepool { [self runLocalPreparationForItem:immutableItem]; }
+  });
+}
+
+- (void)retryLocalPreparationForItemID:(NSString *)itemID expectedRevision:(NSNumber *)expectedRevision {
+  if (![itemID isKindOfClass:NSString.class] || itemID.length == 0 ||
+      ![expectedRevision isKindOfClass:NSNumber.class] || expectedRevision.integerValue < 1) {
+    [self sendWorkspaceErrorForAction:@"retryLocalPreparation"
+                                error:[self storageError:@"Retry requires an exact Library item ID and revision." code:630]];
+    return;
+  }
+  dispatch_async(_persistenceQueue, ^{
+    NSError *error = nil;
+    NSDictionary *storedLibrary = [self readDictionaryAtURL:[self libraryURL]
+                                                defaultValue:[self defaultLibrary]
+                                                       error:&error];
+    if (!storedLibrary) {
+      [self sendWorkspaceErrorForAction:@"retryLocalPreparation" error:error];
+      return;
+    }
+    NSArray *storedItems = [storedLibrary[@"items"] isKindOfClass:NSArray.class] ? storedLibrary[@"items"] : @[];
+    NSMutableArray *items = [storedItems mutableCopy];
+    NSUInteger matchingIndex = NSNotFound;
+    NSUInteger matches = 0;
+    for (NSUInteger index = 0; index < items.count; index += 1) {
+      NSDictionary *candidate = [items[index] isKindOfClass:NSDictionary.class] ? items[index] : nil;
+      if ([candidate[@"id"] isEqualToString:itemID]) { matchingIndex = index; matches += 1; }
+    }
+    if (matches != 1) {
+      [self sendWorkspaceErrorForAction:@"retryLocalPreparation"
+                                  error:[self storageError:@"The Library item is missing or duplicated." code:631]];
+      return;
+    }
+    NSDictionary *current = items[matchingIndex];
+    NSDictionary *currentPreparation = [current[@"preparation"] isKindOfClass:NSDictionary.class]
+        ? current[@"preparation"] : nil;
+    if (![self revision:current[@"revision"] matches:expectedRevision] ||
+        [current[@"catalogSource"] isEqualToString:@"universe"] ||
+        !([currentPreparation[@"state"] isEqualToString:@"needs_attention"] ||
+          [currentPreparation[@"state"] isEqualToString:@"queued"])) {
+      [self sendWorkspaceErrorForAction:@"retryLocalPreparation"
+                                  error:[self storageError:@"The Library item changed or is not eligible for local preparation retry." code:632]];
+      return;
+    }
+    NSInteger nextRevision = expectedRevision.integerValue + 1;
+    NSString *jobID = [self localPreparationJobID];
+    NSMutableDictionary *updated = [current mutableCopy];
+    updated[@"revision"] = @(nextRevision);
+    updated[@"updatedAt"] = [self isoTimestamp];
+    updated[@"status"] = @"pending_codex";
+    updated[@"preparation"] = [self queuedPreparationWithJobID:jobID sourceRevision:nextRevision];
+    items[matchingIndex] = updated;
+    NSMutableDictionary *library = [storedLibrary mutableCopy];
+    library[@"items"] = items;
+    if (![self writeJSONObject:library toURL:[self libraryURL] error:&error]) {
+      [self sendWorkspaceErrorForAction:@"retryLocalPreparation" error:error];
+      return;
+    }
+    [self sendWorkspaceWithNotice:@"Local preparation was queued again using the current Library revision."];
+    [self scheduleLocalPreparationForItem:updated];
+  });
 }
 
 - (void)saveArxivValue:(NSString *)rawValue {
@@ -3077,6 +4165,7 @@
     NSInteger number = MAX(1, [library[@"nextNumber"] integerValue]);
     NSString *timestamp = [self isoTimestamp];
     NSString *itemID = [NSString stringWithFormat:@"lit-%@", NSUUID.UUID.UUIDString.lowercaseString];
+    NSString *jobID = [self localPreparationJobID];
     NSString *arxivURL = [NSString stringWithFormat:@"https://arxiv.org/abs/%@", arxivID];
     NSDictionary *item = @{
       @"id": itemID,
@@ -3088,6 +4177,7 @@
       @"arxivUrl": arxivURL,
       @"status": @"pending_codex",
       @"revision": @1,
+      @"preparation": [self queuedPreparationWithJobID:jobID sourceRevision:1],
       @"createdAt": timestamp,
       @"updatedAt": timestamp
     };
@@ -3099,13 +4189,18 @@
       [self sendWorkspaceErrorForAction:@"saveArxiv" error:error];
       return;
     }
-    [self appendJSONObject:@{
+    if (![self appendJSONObject:@{
       @"eventId": NSUUID.UUID.UUIDString,
       @"action": @"literature_arxiv_added",
       @"timestamp": timestamp,
       @"item": item
-    } toURL:[self workspaceInboxURL]];
-    [self sendWorkspaceWithNotice:@"The arXiv link was saved locally and is ready for the next Codex curation run."];
+    } toURL:[self workspaceInboxURL] error:&error]) {
+      [self writeJSONObject:storedLibrary toURL:[self libraryURL] error:nil];
+      [self sendWorkspaceErrorForAction:@"saveArxiv" error:error];
+      return;
+    }
+    [self sendWorkspaceWithNotice:@"The arXiv link was saved locally. Deterministic preparation is running before Codex scientific review."];
+    [self scheduleLocalPreparationForItem:item];
   });
 }
 
@@ -3170,6 +4265,7 @@
     NSURL *destinationURL = [pdfDirectory URLByAppendingPathComponent:storedFilename];
     [createdFiles addObject:destinationURL];
     NSString *timestamp = [self isoTimestamp];
+    NSString *jobID = [self localPreparationJobID];
     NSDictionary *item = @{
       @"id": itemID,
       @"number": @(nextNumber),
@@ -3187,6 +4283,7 @@
       @"verificationStatus": @"imported",
       @"status": @"pending_codex",
       @"revision": @1,
+      @"preparation": [self queuedPreparationWithJobID:jobID sourceRevision:1],
       @"createdAt": timestamp,
       @"updatedAt": timestamp
     };
@@ -3209,15 +4306,25 @@
     [self sendWorkspaceErrorForAction:@"pickLiteraturePDF" error:error];
     return;
   }
+  NSMutableArray<NSDictionary *> *importEvents = [NSMutableArray arrayWithCapacity:createdItems.count];
   for (NSDictionary *item in createdItems) {
-    [self appendJSONObject:@{
+    [importEvents addObject:@{
       @"eventId": NSUUID.UUID.UUIDString,
       @"action": @"literature_pdf_imported",
       @"timestamp": item[@"createdAt"],
       @"item": item
-    } toURL:[self workspaceInboxURL]];
+    }];
   }
-  [self sendWorkspaceWithNotice:[NSString stringWithFormat:@"Saved %lu PDF files to the local literature library for Codex curation.", (unsigned long)createdItems.count]];
+  if (![self appendJSONObjects:importEvents toURL:[self workspaceInboxURL] error:&error]) {
+    [self writeJSONObject:storedLibrary toURL:[self libraryURL] error:nil];
+    for (NSURL *createdURL in createdFiles) {
+      [NSFileManager.defaultManager removeItemAtURL:createdURL error:nil];
+    }
+    [self sendWorkspaceErrorForAction:@"pickLiteraturePDF" error:error];
+    return;
+  }
+  [self sendWorkspaceWithNotice:[NSString stringWithFormat:@"Saved %lu PDF files. Deterministic local preparation is running before Codex scientific review.", (unsigned long)createdItems.count]];
+  for (NSDictionary *item in createdItems) [self scheduleLocalPreparationForItem:item];
 }
 
 - (void)presentPDFImporter {
@@ -3365,7 +4472,204 @@
   });
 }
 
-- (void)saveResearchText:(NSString *)rawText projectID:(NSString *)requestedProjectID {
+- (BOOL)isLowercaseSHA256:(NSString *)value {
+  if (![value isKindOfClass:NSString.class] || value.length != 64) return NO;
+  NSCharacterSet *allowed = [NSCharacterSet characterSetWithCharactersInString:@"0123456789abcdef"];
+  return [value rangeOfCharacterFromSet:allowed.invertedSet].location == NSNotFound;
+}
+
+- (BOOL)isResearchMemoryProjectID:(NSString *)projectID {
+  if (![projectID isKindOfClass:NSString.class] || projectID.length == 0 || projectID.length > 120 ||
+      [projectID hasPrefix:@"-"] || [projectID hasSuffix:@"-"] ||
+      [projectID containsString:@"--"]) return NO;
+  NSCharacterSet *allowed = [NSCharacterSet characterSetWithCharactersInString:
+      @"abcdefghijklmnopqrstuvwxyz0123456789-"];
+  return [projectID rangeOfCharacterFromSet:allowed.invertedSet].location == NSNotFound;
+}
+
+- (NSDictionary *)validatedResearchMemoryStateForProjectID:(NSString *)projectID
+                                                       error:(NSError **)error {
+  if (![self isResearchMemoryProjectID:projectID]) {
+    if (error) *error = [self storageError:
+        @"This legacy project ID cannot be represented by the Research Memory contract." code:605];
+    return nil;
+  }
+  NSURL *projectDirectory = [self projectDirectoryURLForID:projectID error:error];
+  if (!projectDirectory) return nil;
+  NSURL *memoryDirectory = [projectDirectory URLByAppendingPathComponent:@"memory" isDirectory:YES];
+  NSURL *ledgerURL = [memoryDirectory URLByAppendingPathComponent:@"events.jsonl"];
+  NSURL *projectURL = [projectDirectory URLByAppendingPathComponent:@"project.json"];
+  NSURL *memoryURL = [memoryDirectory URLByAppendingPathComponent:@"current.json"];
+  NSURL *tasksURL = [projectDirectory URLByAppendingPathComponent:@"tasks.json"];
+  NSFileManager *manager = NSFileManager.defaultManager;
+  BOOL ledgerExists = [manager fileExistsAtPath:ledgerURL.path];
+  BOOL anyProjectionExists = [manager fileExistsAtPath:projectURL.path] ||
+      [manager fileExistsAtPath:memoryURL.path] || [manager fileExistsAtPath:tasksURL.path];
+  if (!ledgerExists) {
+    if (anyProjectionExists) {
+      if (error) *error = [self storageError:
+          @"Project memory projections exist without their append-only ledger. Liteverse refused to invent replacement history."
+                                      code:592];
+      return nil;
+    }
+    NSData *empty = NSData.data;
+    return @{
+      @"initialized": @NO, @"ledgerURL": ledgerURL, @"ledgerData": empty,
+      @"ledgerHash": [self sha256ForData:empty], @"revision": @0,
+      @"project": @{}, @"memory": @{ @"items": @[] },
+      @"tasks": @{ @"tasks": @[], @"handoffs": @[] }
+    };
+  }
+
+  NSData *ledgerData = [NSData dataWithContentsOfURL:ledgerURL options:0 error:error];
+  if (!ledgerData) return nil;
+  NSString *ledgerText = [[NSString alloc] initWithData:ledgerData encoding:NSUTF8StringEncoding];
+  if (!ledgerText) {
+    if (error) *error = [self storageError:@"The research-memory ledger is not valid UTF-8." code:593];
+    return nil;
+  }
+  NSInteger revision = 0;
+  NSMutableSet<NSString *> *eventIDs = [NSMutableSet set];
+  NSSet<NSString *> *eventTypes = [NSSet setWithArray:@[
+    @"project_initialized", @"project_metadata_updated", @"memory_recorded",
+    @"memory_retired", @"task_started", @"task_completed", @"handoff_built"
+  ]];
+  NSArray<NSString *> *lines = [ledgerText componentsSeparatedByString:@"\n"];
+  for (NSUInteger index = 0; index < lines.count; index += 1) {
+    NSString *line = lines[index];
+    if (line.length == 0) {
+      if (index + 1 == lines.count) continue;
+      if (error) *error = [self storageError:
+          @"The research-memory ledger contains a blank line and was preserved unchanged." code:594];
+      return nil;
+    }
+    NSData *lineData = [line dataUsingEncoding:NSUTF8StringEncoding];
+    id rawEvent = [NSJSONSerialization JSONObjectWithData:lineData options:0 error:error];
+    if (![rawEvent isKindOfClass:NSDictionary.class]) {
+      if (error && !*error) *error = [self storageError:
+          @"The research-memory ledger contains an invalid event." code:595];
+      return nil;
+    }
+    NSDictionary *event = rawEvent;
+    NSString *eventID = [event[@"eventId"] isKindOfClass:NSString.class] ? event[@"eventId"] : nil;
+    NSString *eventType = [event[@"type"] isKindOfClass:NSString.class] ? event[@"type"] : nil;
+    NSInteger eventRevision = [event[@"revision"] integerValue];
+    if (![event[@"schemaVersion"] isEqual:@1] ||
+        ![event[@"projectId"] isEqualToString:projectID] ||
+        ![eventTypes containsObject:eventType] ||
+        (revision == 0 && ![eventType isEqualToString:@"project_initialized"]) ||
+        (revision > 0 && [eventType isEqualToString:@"project_initialized"]) ||
+        eventID.length == 0 || [eventIDs containsObject:eventID] ||
+        eventRevision != revision + 1) {
+      if (error) *error = [self storageError:
+          @"The research-memory ledger has an identity, duplicate-event, or revision-gap conflict and was preserved unchanged."
+                                      code:596];
+      return nil;
+    }
+    [eventIDs addObject:eventID];
+    revision = eventRevision;
+  }
+  if (revision == 0) {
+    if (error) *error = [self storageError:
+        @"The research-memory ledger exists but contains no initialization event." code:597];
+    return nil;
+  }
+  NSString *ledgerHash = [self sha256ForData:ledgerData];
+  NSDictionary *project = [self readDictionaryAtURL:projectURL defaultValue:nil error:error];
+  NSDictionary *memory = [self readDictionaryAtURL:memoryURL defaultValue:nil error:error];
+  NSDictionary *tasks = [self readDictionaryAtURL:tasksURL defaultValue:nil error:error];
+  if (!project || !memory || !tasks) return nil;
+  for (NSDictionary *projection in @[project, memory, tasks]) {
+    if (![projection[@"projectId"] isEqualToString:projectID] ||
+        [projection[@"revision"] integerValue] != revision ||
+        ![projection[@"ledgerHash"] isEqualToString:ledgerHash]) {
+      if (error) *error = [self storageError:
+          @"Project memory has a mismatched revision or ledgerHash. Run Liteverse doctor before saving."
+                                      code:598];
+      return nil;
+    }
+  }
+  if (![memory[@"items"] isKindOfClass:NSArray.class] ||
+      ![tasks[@"tasks"] isKindOfClass:NSArray.class] ||
+      ![tasks[@"handoffs"] isKindOfClass:NSArray.class]) {
+    if (error) *error = [self storageError:
+        @"A research-memory projection has an invalid collection." code:599];
+    return nil;
+  }
+  return @{
+    @"initialized": @YES, @"ledgerURL": ledgerURL, @"ledgerData": ledgerData,
+    @"ledgerHash": ledgerHash, @"revision": @(revision), @"project": project,
+    @"memory": memory, @"tasks": tasks
+  };
+}
+
+- (BOOL)writeResearchMemoryProjectionsForProjectID:(NSString *)projectID
+                                           project:(NSDictionary *)project
+                                            memory:(NSDictionary *)memory
+                                             tasks:(NSDictionary *)tasks
+                                          registry:(NSDictionary *)storedRegistry
+                                             error:(NSError **)error {
+  NSURL *projectDirectory = [self projectDirectoryURLForID:projectID error:error];
+  if (!projectDirectory) return NO;
+  NSURL *memoryDirectory = [projectDirectory URLByAppendingPathComponent:@"memory" isDirectory:YES];
+  if (![self writeJSONObject:project
+                       toURL:[projectDirectory URLByAppendingPathComponent:@"project.json"] error:error] ||
+      ![self writeJSONObject:memory
+                       toURL:[memoryDirectory URLByAppendingPathComponent:@"current.json"] error:error] ||
+      ![self writeJSONObject:tasks
+                       toURL:[projectDirectory URLByAppendingPathComponent:@"tasks.json"] error:error]) return NO;
+
+  NSArray *taskItems = [tasks[@"tasks"] isKindOfClass:NSArray.class] ? tasks[@"tasks"] : @[];
+  NSArray *handoffs = [tasks[@"handoffs"] isKindOfClass:NSArray.class] ? tasks[@"handoffs"] : @[];
+  for (NSDictionary *task in taskItems) {
+    NSString *taskHash = [task[@"taskHash"] isKindOfClass:NSString.class] ? task[@"taskHash"] : nil;
+    if (![self isLowercaseSHA256:taskHash]) {
+      if (error) *error = [self storageError:@"A task projection contains an unsafe task hash." code:600];
+      return NO;
+    }
+    NSMutableArray *matchingHandoffs = [NSMutableArray array];
+    for (NSDictionary *handoff in handoffs) {
+      if ([handoff[@"taskHash"] isEqualToString:taskHash]) [matchingHandoffs addObject:handoff];
+    }
+    NSURL *taskDirectory = [[projectDirectory URLByAppendingPathComponent:@"Tasks" isDirectory:YES]
+        URLByAppendingPathComponent:taskHash isDirectory:YES];
+    if (![NSFileManager.defaultManager createDirectoryAtURL:taskDirectory
+                                withIntermediateDirectories:YES attributes:nil error:error] ||
+        ![self writeJSONObject:@{
+          @"schemaVersion": @1, @"projectId": projectID,
+          @"revision": tasks[@"revision"], @"ledgerHash": tasks[@"ledgerHash"],
+          @"task": task, @"handoffs": matchingHandoffs
+        } toURL:[taskDirectory URLByAppendingPathComponent:@"task.json"] error:error]) return NO;
+  }
+
+  NSArray *storedItems = [storedRegistry[@"items"] isKindOfClass:NSArray.class]
+      ? storedRegistry[@"items"] : @[];
+  NSMutableArray *registryItems = [NSMutableArray arrayWithCapacity:storedItems.count];
+  BOOL replaced = NO;
+  for (NSDictionary *item in storedItems) {
+    NSString *itemID = [item[@"projectId"] isKindOfClass:NSString.class] ? item[@"projectId"] : item[@"id"];
+    if ([itemID isEqualToString:projectID]) {
+      [registryItems addObject:project];
+      replaced = YES;
+    } else {
+      [registryItems addObject:item];
+    }
+  }
+  if (!replaced) {
+    if (error) *error = [self storageError:
+        @"The active project disappeared from the project registry." code:601];
+    return NO;
+  }
+  NSMutableDictionary *registry = [storedRegistry mutableCopy];
+  registry[@"schemaVersion"] = @1;
+  registry[@"items"] = registryItems;
+  registry[@"generatedAt"] = [self isoTimestamp];
+  return [self writeJSONObject:registry toURL:[self projectsRegistryURL] error:error];
+}
+
+- (void)saveResearchText:(NSString *)rawText
+                projectID:(NSString *)requestedProjectID
+         expectedRevision:(NSNumber *)expectedRevision {
   if (![rawText isKindOfClass:NSString.class]) return;
   NSString *trimmedText = [rawText stringByTrimmingCharactersInSet:
       NSCharacterSet.whitespaceAndNewlineCharacterSet];
@@ -3373,112 +4677,267 @@
   NSString *text = rawText;
   dispatch_async(_persistenceQueue, ^{
     NSError *error = nil;
-    if (![self ensureProjectStorage:&error]) {
+    NSURL *lockURL = [self researchMemoryLockURL];
+    NSString *lockToken = [self acquireDirectoryLockAtURL:lockURL
+        operation:@"Research memory update" timeout:15.0 error:&error];
+    if (!lockToken) {
       [self sendWorkspaceErrorForAction:@"saveResearchInformation" error:error];
       return;
     }
-    NSDictionary *registry = [self readDictionaryAtURL:[self projectsRegistryURL] defaultValue:nil error:&error];
-    NSString *activeProjectID = registry ? [self activeProjectIDFromRegistry:registry] : nil;
-    NSString *projectID = [self isSafeProjectID:requestedProjectID] ? requestedProjectID : activeProjectID;
-    if (!projectID || ![projectID isEqualToString:activeProjectID]) {
-      [self sendWorkspaceErrorForAction:@"saveResearchInformation"
-                                  error:[self storageError:@"The active project changed; reopen Memory Center before saving." code:540]];
-      return;
-    }
-    NSURL *researchURL = [self projectResearchInformationURLForID:projectID error:&error];
-    NSDictionary *stored = [self readDictionaryAtURL:researchURL
-                                        defaultValue:[self defaultResearchInformation]
-                                               error:&error];
-    if (!stored) {
-      [self sendWorkspaceErrorForAction:@"saveResearchInformation" error:error];
-      return;
-    }
-    NSMutableDictionary *research = [stored mutableCopy];
-    NSDictionary *oldDraft = [research[@"draft"] isKindOfClass:NSDictionary.class] ? research[@"draft"] : @{};
-    NSDictionary *oldFormal = [research[@"formal"] isKindOfClass:NSDictionary.class] ? research[@"formal"] : @{};
-    NSInteger previousRevision = MAX([oldDraft[@"revision"] integerValue], [oldFormal[@"sourceRevision"] integerValue]);
-    NSInteger revision = previousRevision + 1;
-    NSString *timestamp = [self isoTimestamp];
-    research[@"schemaVersion"] = @1;
-    research[@"status"] = @"organized";
-    research[@"draft"] = @{
-      @"text": text,
-      @"revision": @(revision),
-      @"updatedAt": timestamp
-    };
-    research[@"formal"] = @{
-      @"text": text,
-      @"sourceRevision": @(revision),
-      @"organizedAt": timestamp
-    };
-    NSURL *projectDirectory = [self projectDirectoryURLForID:projectID error:&error];
-    NSURL *generatedDirectory = [projectDirectory URLByAppendingPathComponent:@"generated" isDirectory:YES];
-    if (![NSFileManager.defaultManager createDirectoryAtURL:generatedDirectory
-                                withIntermediateDirectories:YES
-                                                 attributes:nil
-                                                      error:&error]) {
-      [self sendWorkspaceErrorForAction:@"saveResearchInformation" error:error];
-      return;
-    }
-    NSURL *historyDirectory = [generatedDirectory URLByAppendingPathComponent:@"research-history" isDirectory:YES];
-    if (![NSFileManager.defaultManager createDirectoryAtURL:historyDirectory
-                                withIntermediateDirectories:YES
-                                                 attributes:nil
-                                                      error:&error]) {
-      [self sendWorkspaceErrorForAction:@"saveResearchInformation" error:error];
-      return;
-    }
+    @try {
+      if (![self ensureProjectStorage:&error]) {
+        [self sendWorkspaceErrorForAction:@"saveResearchInformation" error:error];
+        return;
+      }
+      NSDictionary *registry = [self readDictionaryAtURL:[self projectsRegistryURL]
+                                            defaultValue:nil error:&error];
+      NSString *activeProjectID = registry ? [self activeProjectIDFromRegistry:registry] : nil;
+      NSString *projectID = [self isSafeProjectID:requestedProjectID] ? requestedProjectID : activeProjectID;
+      if (!projectID || ![projectID isEqualToString:activeProjectID]) {
+        [self sendWorkspaceErrorForAction:@"saveResearchInformation"
+                                    error:[self storageError:@"The active project changed; reopen Memory Center before saving." code:540]];
+        return;
+      }
+      NSDictionary *registryItem = nil;
+      for (NSDictionary *item in registry[@"items"]) {
+        NSString *itemID = [item[@"projectId"] isKindOfClass:NSString.class] ? item[@"projectId"] : item[@"id"];
+        if ([itemID isEqualToString:projectID]) { registryItem = item; break; }
+      }
+      if (!registryItem) {
+        [self sendWorkspaceErrorForAction:@"saveResearchInformation"
+                                    error:[self storageError:@"The active project is missing from the registry." code:602]];
+        return;
+      }
 
-    NSString *previousText = [oldFormal[@"text"] isKindOfClass:NSString.class] ? oldFormal[@"text"] : @"";
-    if (previousText.length > 0 && previousRevision > 0) {
-      NSURL *previousURL = [historyDirectory URLByAppendingPathComponent:
-          [NSString stringWithFormat:@"revision-%06ld.md", (long)previousRevision]];
-      if (![NSFileManager.defaultManager fileExistsAtPath:previousURL.path]) {
-        NSString *previousTimestamp = [oldFormal[@"organizedAt"] isKindOfClass:NSString.class]
-            ? oldFormal[@"organizedAt"] : @"";
-        NSString *previousMarkdown = [NSString stringWithFormat:
-            @"# Liteverse research memory · revision %ld\n\n- Saved: %@\n\n%@\n",
-            (long)previousRevision, previousTimestamp, previousText];
-        if (![previousMarkdown writeToURL:previousURL atomically:YES encoding:NSUTF8StringEncoding error:&error]) {
+      NSURL *researchURL = [self projectResearchInformationURLForID:projectID error:&error];
+      NSDictionary *stored = [self readDictionaryAtURL:researchURL
+                                          defaultValue:[self defaultResearchInformation]
+                                                 error:&error];
+      NSDictionary *state = [self validatedResearchMemoryStateForProjectID:projectID error:&error];
+      if (!stored || !state) {
+        [self sendWorkspaceErrorForAction:@"saveResearchInformation" error:error];
+        return;
+      }
+      NSDictionary *oldDraft = [stored[@"draft"] isKindOfClass:NSDictionary.class] ? stored[@"draft"] : @{};
+      NSDictionary *oldFormal = [stored[@"formal"] isKindOfClass:NSDictionary.class] ? stored[@"formal"] : @{};
+      NSInteger previousRevision = MAX([oldDraft[@"revision"] integerValue], [oldFormal[@"sourceRevision"] integerValue]);
+      if ([expectedRevision isKindOfClass:NSNumber.class] && expectedRevision.integerValue != previousRevision) {
+        [self sendWorkspaceErrorForAction:@"saveResearchInformation"
+                                    error:[self storageError:@"Research Information changed revision; reopen Memory Center before saving." code:603]];
+        return;
+      }
+      NSNumber *storedMemoryRevision = [stored[@"memoryRevision"] isKindOfClass:NSNumber.class]
+          ? stored[@"memoryRevision"] : nil;
+      NSString *storedLedgerHash = [stored[@"ledgerHash"] isKindOfClass:NSString.class]
+          ? stored[@"ledgerHash"] : nil;
+      if ((storedMemoryRevision && storedMemoryRevision.integerValue != [state[@"revision"] integerValue]) ||
+          (storedLedgerHash && ![storedLedgerHash isEqualToString:state[@"ledgerHash"]])) {
+        [self sendWorkspaceErrorForAction:@"saveResearchInformation"
+                                    error:[self storageError:@"Research Information is stale relative to the append-only project memory ledger." code:604]];
+        return;
+      }
+
+      NSInteger researchRevision = previousRevision + 1;
+      NSString *timestamp = [self isoTimestamp];
+      NSURL *projectDirectory = [self projectDirectoryURLForID:projectID error:&error];
+      NSURL *generatedDirectory = [projectDirectory URLByAppendingPathComponent:@"generated" isDirectory:YES];
+      NSURL *historyDirectory = [generatedDirectory URLByAppendingPathComponent:@"research-history" isDirectory:YES];
+      if (![NSFileManager.defaultManager createDirectoryAtURL:historyDirectory
+                                  withIntermediateDirectories:YES attributes:nil error:&error]) {
+        [self sendWorkspaceErrorForAction:@"saveResearchInformation" error:error];
+        return;
+      }
+      NSString *previousText = [oldFormal[@"text"] isKindOfClass:NSString.class] ? oldFormal[@"text"] : @"";
+      if (previousText.length > 0 && previousRevision > 0) {
+        NSURL *previousURL = [historyDirectory URLByAppendingPathComponent:
+            [NSString stringWithFormat:@"revision-%06ld.md", (long)previousRevision]];
+        if (![NSFileManager.defaultManager fileExistsAtPath:previousURL.path]) {
+          NSString *previousTimestamp = [oldFormal[@"organizedAt"] isKindOfClass:NSString.class]
+              ? oldFormal[@"organizedAt"] : @"";
+          NSString *previousMarkdown = [NSString stringWithFormat:
+              @"# Liteverse research memory · revision %ld\n\n- Saved: %@\n\n%@\n",
+              (long)previousRevision, previousTimestamp, previousText];
+          if (![previousMarkdown writeToURL:previousURL atomically:YES
+                                   encoding:NSUTF8StringEncoding error:&error]) {
+            [self sendWorkspaceErrorForAction:@"saveResearchInformation" error:error];
+            return;
+          }
+        }
+      }
+      NSURL *historyURL = [historyDirectory URLByAppendingPathComponent:
+          [NSString stringWithFormat:@"revision-%06ld.md", (long)researchRevision]];
+      NSString *historyMarkdown = [NSString stringWithFormat:
+          @"# Liteverse research memory · revision %ld\n\n- Saved: %@\n\n%@\n",
+          (long)researchRevision, timestamp, text];
+      if (![historyMarkdown writeToURL:historyURL atomically:YES
+                              encoding:NSUTF8StringEncoding error:&error]) {
+        [self sendWorkspaceErrorForAction:@"saveResearchInformation" error:error];
+        return;
+      }
+
+      NSInteger baseMemoryRevision = [state[@"revision"] integerValue];
+      NSMutableArray<NSDictionary *> *events = [NSMutableArray array];
+      NSDictionary *projectProjection = state[@"project"];
+      NSDictionary *memoryProjection = state[@"memory"];
+      NSDictionary *tasksProjection = state[@"tasks"];
+      if (![state[@"initialized"] boolValue]) {
+        [events addObject:@{
+          @"schemaVersion": @1, @"eventId": NSUUID.UUID.UUIDString,
+          @"timestamp": timestamp, @"projectId": projectID, @"revision": @1,
+          @"type": @"project_initialized",
+          @"name": [registryItem[@"name"] isKindOfClass:NSString.class] ? registryItem[@"name"] : projectID,
+          @"description": [registryItem[@"description"] isKindOfClass:NSString.class] ? registryItem[@"description"] : @""
+        }];
+        baseMemoryRevision = 1;
+      }
+
+      NSArray *existingMemoryItems = [memoryProjection[@"items"] isKindOfClass:NSArray.class]
+          ? memoryProjection[@"items"] : @[];
+      NSMutableArray *memoryItems = [existingMemoryItems mutableCopy];
+      NSString *supersededMemoryID = nil;
+      for (NSDictionary *item in [memoryItems reverseObjectEnumerator]) {
+        NSDictionary *source = [item[@"source"] isKindOfClass:NSDictionary.class] ? item[@"source"] : @{};
+        NSString *kind = [source[@"kind"] isKindOfClass:NSString.class] ? source[@"kind"] : @"";
+        if ([item[@"state"] isEqualToString:@"active"] &&
+            ([kind isEqualToString:@"app_research_information"] ||
+             [kind isEqualToString:@"legacy_research_information"])) {
+          supersededMemoryID = item[@"memoryId"];
+          break;
+        }
+      }
+      NSInteger memoryRevision = baseMemoryRevision + 1;
+      NSString *compactUUID = [NSUUID.UUID.UUIDString.lowercaseString
+          stringByReplacingOccurrencesOfString:@"-" withString:@""];
+      NSString *memoryID = [@"mem-app-research-" stringByAppendingString:compactUUID];
+      NSDictionary *memoryDraft = @{
+        @"memoryId": memoryID, @"type": @"project_context",
+        @"title": @"Research Information", @"content": text,
+        @"state": @"active", @"evidenceState": @"user_declared", @"provenance": @"user",
+        @"supersedes": supersededMemoryID ? @[supersededMemoryID] : @[],
+        @"contradicts": @[], @"paperEvidence": @[],
+        @"source": @{ @"kind": @"app_research_information", @"researchRevision": @(researchRevision) }
+      };
+      [events addObject:@{
+        @"schemaVersion": @1, @"eventId": NSUUID.UUID.UUIDString,
+        @"timestamp": timestamp, @"projectId": projectID, @"revision": @(memoryRevision),
+        @"type": @"memory_recorded", @"memory": memoryDraft
+      }];
+
+      NSMutableData *delta = [NSMutableData data];
+      NSData *priorLedgerData = state[@"ledgerData"];
+      if (priorLedgerData.length > 0) {
+        const unsigned char *bytes = priorLedgerData.bytes;
+        if (bytes[priorLedgerData.length - 1] != '\n') {
+          [delta appendBytes:"\n" length:1];
+        }
+      }
+      for (NSDictionary *event in events) {
+        NSData *eventData = [NSJSONSerialization dataWithJSONObject:event
+            options:NSJSONWritingSortedKeys error:&error];
+        if (!eventData) {
           [self sendWorkspaceErrorForAction:@"saveResearchInformation" error:error];
           return;
         }
+        [delta appendData:eventData];
+        [delta appendBytes:"\n" length:1];
       }
-    }
+      NSMutableData *nextLedgerData = [priorLedgerData mutableCopy];
+      [nextLedgerData appendData:delta];
+      NSString *ledgerHash = [self sha256ForData:nextLedgerData];
 
-    NSURL *historyURL = [historyDirectory URLByAppendingPathComponent:
-        [NSString stringWithFormat:@"revision-%06ld.md", (long)revision]];
-    NSString *historyMarkdown = [NSString stringWithFormat:
-        @"# Liteverse research memory · revision %ld\n\n- Saved: %@\n\n%@\n",
-        (long)revision, timestamp, text];
-    if (![historyMarkdown writeToURL:historyURL atomically:YES encoding:NSUTF8StringEncoding error:&error]) {
-      [self sendWorkspaceErrorForAction:@"saveResearchInformation" error:error];
-      return;
+      NSMutableArray *projectedItems = [NSMutableArray arrayWithCapacity:memoryItems.count + 1];
+      for (NSDictionary *item in memoryItems) {
+        if ([item[@"memoryId"] isEqualToString:supersededMemoryID]) {
+          NSMutableDictionary *updated = [item mutableCopy];
+          updated[@"state"] = @"superseded";
+          updated[@"supersededBy"] = memoryID;
+          updated[@"updatedAt"] = timestamp;
+          updated[@"updatedRevision"] = @(memoryRevision);
+          [projectedItems addObject:updated];
+        } else {
+          [projectedItems addObject:item];
+        }
+      }
+      [projectedItems addObject:@{
+        @"memoryId": memoryID, @"type": @"project_context",
+        @"title": @"Research Information", @"content": text,
+        @"state": @"active", @"evidenceState": @"user_declared", @"provenance": @"user",
+        @"supersedes": supersededMemoryID ? @[supersededMemoryID] : @[], @"contradicts": @[],
+        @"paperEvidence": @[], @"createdAt": timestamp, @"updatedAt": timestamp,
+        @"createdRevision": @(memoryRevision), @"updatedRevision": @(memoryRevision),
+        @"contradictedBy": @[],
+        @"source": @{ @"kind": @"app_research_information", @"researchRevision": @(researchRevision) }
+      }];
+
+      NSString *projectName = [projectProjection[@"name"] isKindOfClass:NSString.class]
+          ? projectProjection[@"name"] : registryItem[@"name"];
+      NSString *projectDescription = [projectProjection[@"description"] isKindOfClass:NSString.class]
+          ? projectProjection[@"description"] : (registryItem[@"description"] ?: @"");
+      NSString *createdAt = [projectProjection[@"createdAt"] isKindOfClass:NSString.class]
+          ? projectProjection[@"createdAt"] : timestamp;
+      NSDictionary *nextProject = @{
+        @"schemaVersion": @1, @"projectId": projectID,
+        @"name": projectName ?: projectID, @"description": projectDescription ?: @"",
+        @"createdAt": createdAt, @"updatedAt": timestamp,
+        @"revision": @(memoryRevision), @"ledgerHash": ledgerHash
+      };
+      NSDictionary *nextMemory = @{
+        @"schemaVersion": @1, @"projectId": projectID,
+        @"revision": @(memoryRevision), @"ledgerHash": ledgerHash,
+        @"generatedAt": timestamp, @"items": projectedItems
+      };
+      NSDictionary *nextTasks = @{
+        @"schemaVersion": @1, @"projectId": projectID,
+        @"revision": @(memoryRevision), @"ledgerHash": ledgerHash,
+        @"generatedAt": timestamp,
+        @"tasks": [tasksProjection[@"tasks"] isKindOfClass:NSArray.class] ? tasksProjection[@"tasks"] : @[],
+        @"handoffs": [tasksProjection[@"handoffs"] isKindOfClass:NSArray.class] ? tasksProjection[@"handoffs"] : @[]
+      };
+
+      // events.jsonl is the only truth. Projections are written only after the
+      // durable append succeeds and always carry the resulting revision/hash.
+      if (![self appendJSONObjects:events toURL:state[@"ledgerURL"] error:&error] ||
+          ![self writeResearchMemoryProjectionsForProjectID:projectID
+              project:nextProject memory:nextMemory tasks:nextTasks registry:registry error:&error]) {
+        [self sendWorkspaceErrorForAction:@"saveResearchInformation" error:error];
+        return;
+      }
+
+      NSMutableDictionary *research = [stored mutableCopy];
+      research[@"schemaVersion"] = @1;
+      research[@"status"] = @"organized";
+      research[@"memoryRevision"] = @(memoryRevision);
+      research[@"ledgerHash"] = ledgerHash;
+      research[@"draft"] = @{ @"text": text, @"revision": @(researchRevision), @"updatedAt": timestamp };
+      research[@"formal"] = @{ @"text": text, @"sourceRevision": @(researchRevision), @"organizedAt": timestamp };
+      if (![self writeJSONObject:research toURL:researchURL error:&error]) {
+        [self sendWorkspaceErrorForAction:@"saveResearchInformation" error:error];
+        return;
+      }
+
+      BOOL compatibilitySaved = YES;
+      if ([projectID isEqualToString:@"project-default"]) {
+        compatibilitySaved = [self writeJSONObject:research toURL:[self researchInformationURL] error:&error];
+      }
+      NSURL *markdownURL = [generatedDirectory URLByAppendingPathComponent:@"research-memory.md"];
+      BOOL mirrorSaved = [text writeToURL:markdownURL atomically:YES
+                                  encoding:NSUTF8StringEncoding error:&error];
+      NSError *auditError = nil;
+      BOOL auditSaved = [self appendJSONObject:@{
+        @"eventId": NSUUID.UUID.UUIDString, @"action": @"research_memory_updated_directly",
+        @"timestamp": timestamp, @"projectId": projectID,
+        @"revision": @(researchRevision), @"memoryRevision": @(memoryRevision),
+        @"ledgerHash": ledgerHash, @"memoryId": memoryID,
+        @"historyPath": historyURL.path, @"mirrorSaved": @(mirrorSaved)
+      } toURL:[self workspaceInboxURL] error:&auditError];
+      BOOL allMirrorsSaved = compatibilitySaved && mirrorSaved && auditSaved;
+      [self sendWorkspaceWithNotice:allMirrorsSaved
+          ? @"Research Information was appended to project memory and all projections were synchronized."
+          : [NSString stringWithFormat:@"Research Information is safely recorded in the append-only project ledger, but a compatibility projection needs repair: %@",
+              (auditError ?: error).localizedDescription ?: @"unknown storage error"]];
+    } @finally {
+      [self releaseDirectoryLockAtURL:lockURL token:lockToken];
     }
-    if (![self writeJSONObject:research toURL:researchURL error:&error]) {
-      [self sendWorkspaceErrorForAction:@"saveResearchInformation" error:error];
-      return;
-    }
-    if ([projectID isEqualToString:@"project-default"]) {
-      // Compatibility mirror for older Curator versions. Projects remains the
-      // canonical editable source for the App.
-      [self writeJSONObject:research toURL:[self researchInformationURL] error:nil];
-    }
-    NSURL *markdownURL = [generatedDirectory URLByAppendingPathComponent:@"research-memory.md"];
-    NSString *markdown = text;
-    BOOL mirrorSaved = [markdown writeToURL:markdownURL atomically:YES encoding:NSUTF8StringEncoding error:&error];
-    [self appendJSONObject:@{
-      @"eventId": NSUUID.UUID.UUIDString,
-      @"action": @"research_memory_updated_directly",
-      @"timestamp": timestamp,
-      @"projectId": projectID,
-      @"revision": @(revision),
-      @"historyPath": historyURL.path,
-      @"mirrorSaved": @(mirrorSaved)
-    } toURL:[self workspaceInboxURL]];
-    [self sendWorkspaceWithNotice:mirrorSaved
-        ? @"Research memory was updated and its traceable history was preserved."
-        : @"Research memory and its history were saved, but the Markdown mirror could not be updated."];
   });
 }
 
@@ -3511,6 +4970,14 @@
 - (void)setActiveProjectID:(NSString *)projectID {
   dispatch_async(_persistenceQueue, ^{
     NSError *error = nil;
+    NSURL *lockURL = [self researchMemoryLockURL];
+    NSString *lockToken = [self acquireDirectoryLockAtURL:lockURL
+        operation:@"Project switch" timeout:15.0 error:&error];
+    if (!lockToken) {
+      [self sendWorkspaceErrorForAction:@"setActiveProject" error:error];
+      return;
+    }
+    @try {
     if (![self ensureProjectStorage:&error] || ![self isSafeProjectID:projectID]) {
       [self sendWorkspaceErrorForAction:@"setActiveProject" error:error ?: [self storageError:@"The project ID is invalid." code:541]];
       return;
@@ -3536,6 +5003,9 @@
       return;
     }
     [self sendWorkspaceWithNotice:@"Project switched. Research memory, tasks, and project heat remain isolated."];
+    } @finally {
+      [self releaseDirectoryLockAtURL:lockURL token:lockToken];
+    }
   });
 }
 
@@ -3548,6 +5018,14 @@
   }
   dispatch_async(_persistenceQueue, ^{
     NSError *error = nil;
+    NSURL *lockURL = [self researchMemoryLockURL];
+    NSString *lockToken = [self acquireDirectoryLockAtURL:lockURL
+        operation:@"Project creation" timeout:15.0 error:&error];
+    if (!lockToken) {
+      [self sendWorkspaceErrorForAction:@"createProject" error:error];
+      return;
+    }
+    @try {
     if (![self ensureProjectStorage:&error]) { [self sendWorkspaceErrorForAction:@"createProject" error:error]; return; }
     NSDictionary *stored = [self readDictionaryAtURL:[self projectsRegistryURL] defaultValue:nil error:&error];
     if (!stored) { [self sendWorkspaceErrorForAction:@"createProject" error:error]; return; }
@@ -3557,6 +5035,11 @@
       if (itemID) [existingIDs addObject:itemID];
     }
     NSString *projectID = [self projectIDFromName:name existingIDs:existingIDs];
+    while ([NSFileManager.defaultManager fileExistsAtPath:
+        [self projectDirectoryURLForID:projectID error:nil].path]) {
+      [existingIDs addObject:projectID];
+      projectID = [self projectIDFromName:name existingIDs:existingIDs];
+    }
     NSString *timestamp = [self isoTimestamp];
     NSDictionary *initialEvent = @{
       @"schemaVersion": @1,
@@ -3593,8 +5076,8 @@
         withIntermediateDirectories:YES attributes:nil error:&error] ||
         ![NSFileManager.defaultManager createDirectoryAtURL:[projectDirectory URLByAppendingPathComponent:@"Tasks" isDirectory:YES]
         withIntermediateDirectories:YES attributes:nil error:&error] ||
-        ![ledgerData writeToURL:[memoryDirectory URLByAppendingPathComponent:@"events.jsonl"]
-                         options:NSDataWritingAtomic error:&error] ||
+        ![self appendJSONObject:initialEvent
+                         toURL:[memoryDirectory URLByAppendingPathComponent:@"events.jsonl"] error:&error] ||
         ![self writeJSONObject:project toURL:[projectDirectory URLByAppendingPathComponent:@"project.json"] error:&error] ||
         ![self writeJSONObject:memoryProjection toURL:[memoryDirectory URLByAppendingPathComponent:@"current.json"] error:&error] ||
         ![self writeJSONObject:tasksProjection toURL:[projectDirectory URLByAppendingPathComponent:@"tasks.json"] error:&error] ||
@@ -3616,9 +5099,18 @@
       [self sendWorkspaceErrorForAction:@"createProject" error:error];
       return;
     }
-    [self appendJSONObject:@{ @"eventId": NSUUID.UUID.UUIDString, @"action": @"project_created",
-      @"timestamp": timestamp, @"projectId": projectID, @"name": name } toURL:[self workspaceInboxURL]];
-    [self sendWorkspaceWithNotice:@"The new project was created. The shared literature library is unchanged and project memory starts empty."];
+    NSError *auditError = nil;
+    BOOL auditSaved = [self appendJSONObject:@{
+      @"eventId": NSUUID.UUID.UUIDString, @"action": @"project_created",
+      @"timestamp": timestamp, @"projectId": projectID, @"name": name
+    } toURL:[self workspaceInboxURL] error:&auditError];
+    [self sendWorkspaceWithNotice:auditSaved
+        ? @"The new project was created. The shared literature library is unchanged and project memory starts empty."
+        : [NSString stringWithFormat:@"The new project was created, but its workspace audit event could not be persisted: %@",
+            auditError.localizedDescription ?: @"unknown storage error"]];
+    } @finally {
+      [self releaseDirectoryLockAtURL:lockURL token:lockToken];
+    }
   });
 }
 
@@ -3644,11 +5136,14 @@
       [self sendWorkspaceErrorForAction:@"saveContextRequest" error:error]; return;
     }
     NSString *requestID = [NSString stringWithFormat:@"request-%@", NSUUID.UUID.UUIDString.lowercaseString];
-    [self appendJSONObject:@{
+    if (![self appendJSONObject:@{
       @"schemaVersion": @1, @"requestId": requestID, @"projectId": projectID,
       @"query": query, @"budgetChars": @(budget), @"createdAt": [self isoTimestamp],
       @"status": @"pending_cli", @"modelInvocation": @NO
-    } toURL:[tasksDirectory URLByAppendingPathComponent:@"context-requests.jsonl"]];
+    } toURL:[tasksDirectory URLByAppendingPathComponent:@"context-requests.jsonl"] error:&error]) {
+      [self sendWorkspaceErrorForAction:@"saveContextRequest" error:error];
+      return;
+    }
     [self sendWorkspaceWithNotice:@"The Context request was saved. The app did not call a model; run liteverse context build to generate the evidence pack."];
   });
 }
@@ -3952,22 +5447,13 @@
                                   error:(NSError **)error {
   NSFileManager *manager = NSFileManager.defaultManager;
   NSURL *lockURL = [self stageRefreshLockURL];
-  if (![manager createDirectoryAtURL:lockURL.URLByDeletingLastPathComponent
-          withIntermediateDirectories:YES
-                           attributes:nil
-                                error:error]) {
-    return nil;
-  }
   NSError *lockError = nil;
-  if (![manager createDirectoryAtURL:lockURL
-          withIntermediateDirectories:NO
-                           attributes:nil
-                                error:&lockError]) {
-    if (error) {
-      *error = [manager fileExistsAtPath:lockURL.path]
-          ? [self storageError:@"Curator or Refresh is updating the workspace. The backup did not start; try again later." code:515]
-          : lockError;
-    }
+  NSString *lockToken = [self acquireDirectoryLockAtURL:lockURL
+      operation:@"Workspace backup" timeout:0 error:&lockError];
+  if (!lockToken) {
+    if (error) *error = [manager fileExistsAtPath:lockURL.path]
+        ? [self storageError:@"Curator or Refresh is updating the workspace. The backup did not start; try again later." code:515]
+        : lockError;
     return nil;
   }
 
@@ -4026,7 +5512,7 @@
       }
     }
   } @finally {
-    [manager removeItemAtURL:lockURL error:nil];
+    [self releaseDirectoryLockAtURL:lockURL token:lockToken];
   }
 }
 
@@ -4390,6 +5876,7 @@
   dispatch_queue_attr_t persistenceAttributes = dispatch_queue_attr_make_with_autorelease_frequency(
       DISPATCH_QUEUE_SERIAL, DISPATCH_AUTORELEASE_FREQUENCY_WORK_ITEM);
   _persistenceQueue = dispatch_queue_create("com.liteverse.persistence", persistenceAttributes);
+  _localPreparationQueue = dispatch_queue_create("com.liteverse.local-preparation", persistenceAttributes);
   _sourceHashCache = [NSMutableDictionary dictionary];
   WKWebViewConfiguration *configuration = [[WKWebViewConfiguration alloc] init];
   [configuration.userContentController addScriptMessageHandler:self name:@"liteverse"];
@@ -4543,7 +6030,8 @@
   }
   if ([action isEqualToString:@"saveAnnotation"] &&
       [payload[@"annotation"] isKindOfClass:NSDictionary.class]) {
-    [self saveAnnotation:payload[@"annotation"]];
+    NSDictionary *annotation = [payload[@"annotation"] copy];
+    dispatch_async(_persistenceQueue, ^{ [self saveAnnotation:annotation]; });
     return;
   }
   if ([action isEqualToString:@"loadWorkspace"]) {
@@ -4575,8 +6063,16 @@
     [self saveArxivValue:payload[@"value"]];
     return;
   }
+  if ([action isEqualToString:@"retryLocalPreparation"]) {
+    [self retryLocalPreparationForItemID:payload[@"itemId"]
+                        expectedRevision:payload[@"expectedRevision"]];
+    return;
+  }
   if ([action isEqualToString:@"saveResearchInformation"]) {
-    [self saveResearchText:payload[@"text"] projectID:payload[@"projectId"]];
+    [self saveResearchText:payload[@"text"]
+                 projectID:payload[@"projectId"]
+          expectedRevision:[payload[@"expectedRevision"] isKindOfClass:NSNumber.class]
+              ? payload[@"expectedRevision"] : nil];
     return;
   }
   if ([action isEqualToString:@"setActiveProject"] && [payload[@"projectId"] isKindOfClass:NSString.class]) {
@@ -4585,6 +6081,20 @@
   }
   if ([action isEqualToString:@"createProject"] && [payload[@"name"] isKindOfClass:NSString.class]) {
     [self createProjectNamed:payload[@"name"]];
+    return;
+  }
+  if ([action isEqualToString:@"buildContextPreview"]) {
+    NSDictionary *request = [payload copy];
+    NSString *requestID = [request[@"requestId"] isKindOfClass:NSString.class]
+        ? request[@"requestId"] : @"";
+    dispatch_async(_persistenceQueue, ^{
+      @autoreleasepool {
+        NSError *previewError = nil;
+        NSDictionary *preview = [self buildContextPreviewForPayload:request error:&previewError];
+        if (preview) [self sendContextPreview:preview];
+        else [self sendContextPreviewError:previewError requestID:requestID];
+      }
+    });
     return;
   }
   if ([action isEqualToString:@"saveContextRequest"]) {

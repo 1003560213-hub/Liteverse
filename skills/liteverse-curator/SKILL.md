@@ -1,6 +1,6 @@
 ---
 name: liteverse-curator
-description: Organize or migrate Liteverse PDF and arXiv libraries, convert papers into full-text and knowledge-card Markdown, search a corpus and propose exactly three user-selectable macro-partition schemes, apply only an explicitly chosen partition, create or re-evaluate evidence-backed paper relationships, integrate handwritten annotations, and prepare an atomic staged graph for App Refresh. Use whenever Codex is asked to process the Liteverse literature or annotation queue, curate new papers, classify or repartition literature without default regions, score connections, or make a refresh batch ready.
+description: Organize or migrate Liteverse PDF and arXiv libraries, continue App-prepared PDF and arXiv jobs, convert papers into full-text and knowledge-card Markdown, search a corpus and propose exactly three user-selectable macro-partition schemes, apply only an explicitly chosen partition, localize graph-visible metadata or recompute an existing background-aware layout without reclassification, create or re-evaluate evidence-backed paper relationships, integrate handwritten annotations, and prepare an atomic staged graph for App Refresh. Use whenever Codex is asked to process the Liteverse literature or annotation queue, curate new papers, classify or repartition literature without default regions, localize or reposition an existing private graph, score connections, or make a refresh batch ready.
 ---
 
 # Liteverse Curator
@@ -11,7 +11,7 @@ Curate evidence first, obtain an explicit partition decision, then publish one c
 
 1. Resolve the support directory from `--support-dir`, `LITEVERSE_SUPPORT_DIR`, or `~/Library/Application Support/Liteverse`.
 2. Run `scripts/list-queue.mjs --json`. Record each literature or annotation ID and revision before reading files. Refuse to finalize an item whose revision changed.
-3. Materialize each upload with `scripts/materialize-paper.py`. Let the script hash and deduplicate the source, preserve the PDF, write page-marked full text, and create a knowledge-card skeleton. For a legacy graph with external PDF paths, first run `scripts/migrate-managed-library.py` without `--apply`, inspect its plan, then rerun with `--apply`. It writes a resumable manifest, backups, managed PDFs, draft artifacts, and a schema-v3 snapshot input without changing the current graph.
+3. Inspect each queue item's optional `preparation` record. When it is `ready`, verify the local-job manifest, source/item revision, SHA-256 outputs, and extraction state, then reuse its page-marked full text, card skeleton, and routing-only review packet instead of repeating deterministic preparation. Review-packet candidates only identify pages to inspect; reopen the cited original pages before writing scientific content. When the record is absent, use the legacy `scripts/materialize-paper.py` path. Never trust `queued`, `needs_attention`, stale, or hash-mismatched local output. For a legacy graph with external PDF paths, first run `scripts/migrate-managed-library.py` without `--apply`, inspect its plan, then rerun with `--apply`. It writes a resumable manifest, backups, managed PDFs, draft artifacts, and a schema-v3 snapshot input without changing the current graph.
 4. Read the full text or original PDF and complete every supported card claim with evidence locators. Treat an unreadable scan as `needs_ocr`; do not invent a summary.
 5. Read `references/taxonomy.md`. Search the cards, claims, and verified relations across the complete corpus. Design exactly three materially distinct options with 1–10 macro regions, complete primary assignments, optional single secondary assignments, evidence IDs, strategy, rationale, and structured strengths/limitations. Do not treat any historical four-region layout as a default. To avoid manually expanding many assignments, write a compact three-option plan and run `scripts/compose-partition-options.mjs`; it verifies pinned claim sidecars and deterministically expands the plan.
 6. Run `scripts/propose-partitions.mjs --snapshot <unstaged-snapshot> --options <expanded-options.json>`. Present its three options to the user and stop unless the user has explicitly delegated selection by saying, for example, “recommend and choose for me” or “use your recommended option without asking again.” A proposal alone is not permission to classify, stage, or refresh.
@@ -24,6 +24,12 @@ Curate evidence first, obtain an explicit partition decision, then publish one c
 13. Validate the chosen complete graph and stage it with `scripts/stage-refresh.mjs`. Category replacement is accepted only when its snapshot points to the matching append-only partition decision. The script writes `Graph/staged/<refresh-id>/` plus `Graph/pending-update.json`; it never promotes the graph.
 14. Mark exactly one annotation with `scripts/mark-annotation.mjs --id <id> --revision <n> --refresh-id <id> --derived-file <path>`. The script verifies provenance markers, staged bytes, hash, and revision before updating the annotation and audit. Never bulk-mark annotations.
 
+## Maintenance-only localization and relayout
+
+- Use `scripts/prepare-layout-localization.mjs` only when the user explicitly asks to retain the selected taxonomy while translating every graph-visible title, category, paper summary/project role/tag, and relation label, and/or recomputing all existing nebula centers. Supply an exact-ID English translation map, `--confirmed-by-user`, an English confirmation note, and an ISO decision time.
+- Treat this as a new maintenance revision, not a partition choice. Preserve category, paper, and relation IDs; primary/secondary assignments; evidence; relationship scores; artifact pins; nebula assets; and Usage. Write an unstaged Planning snapshot, validate it, then publish it with `scripts/stage-refresh.mjs`.
+- Never reuse a stale partition proposal to perform maintenance. Promotion still belongs exclusively to the App commit bridge.
+
 ## Non-negotiable rules
 
 - Do not seed a fixed taxonomy or silently continue the historical four-region layout. Every partition decision starts with exactly three corpus-derived options and ends with one explicit user selection.
@@ -32,6 +38,7 @@ Curate evidence first, obtain an explicit partition decision, then publish one c
 - Do not silently promote `needs_attention` evidence. The compact composer may use it only when both paper and claim have that state and the claim retains evidence; mark every resulting assignment provisional and expose it in metadata.
 - Do not create a narrow region for an isolated paper. Every newly created macro region requires at least four primary papers and at least 70% within-cluster consistency. For an automatic incremental region, every member must also fit all existing regions below 60%; for an explicit full-corpus repartition, record old-region scores transparently as 0–100 diagnostics but do not use the 60% cutoff to veto a competing taxonomy. Keep smaller groups in `liteverse-staging` as provisional; it is not a macro region.
 - Do not let proposal or selection scripts write `Graph/current.json`, `Graph/staged/`, `Graph/pending-update.json`, queues, or Usage. The selected output remains unstaged until `stage-refresh.mjs` passes independently.
+- Do not let localization, relayout, or local preparation change scientific identity, classification assignments, evidence, relationship scores, artifact pins, nebula assets, Usage, or immutable partition history.
 - Do not establish a formal relationship without located evidence from both original papers.
 - Do not translate legacy `verified` flags into `evidence_verified`. Mechanical extraction produces `card_draft` or `needs_ocr`; evidence verification requires a later original-source review.
 - Preserve an old `confidence` as `legacyConfidence`; never reinterpret it as the new relationship strength.
@@ -41,6 +48,7 @@ Curate evidence first, obtain an explicit partition decision, then publish one c
 - Never use a finalization or relation-merge script to rewrite `Graph/current.json`, an already staged refresh, or graph history, even when those paths are outside the configured support directory.
 - Do not overwrite a mismatched managed PDF or backup. Stop on hash conflicts and resume through the migration manifest after the conflict is resolved.
 - Do not edit queue JSON by hand. Use `list-queue.mjs`, then preserve the locked revision through materialization, staging, and single-annotation marking.
+- Treat App-generated review packets and candidate scores only as rebuildable routing aids. They may reduce the pages and pairs Codex must inspect, but they never constitute scientific evidence or a formal relationship.
 
 ## Resources
 
@@ -49,5 +57,6 @@ Curate evidence first, obtain an explicit partition decision, then publish one c
 - Read `references/relation-rubric.md` before scoring or reviewing a link.
 - Read `references/graph-contract.md` before staging a refresh or changing queue state.
 - Read `references/queue-contract.md` before reading or updating literature and annotation queues.
+- Read `references/local-preparation-contract.md` before accepting App-prepared artifacts or review packets.
 
 Run scripts with `--help` for their complete deterministic interfaces.

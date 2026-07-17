@@ -37,8 +37,13 @@ test("cinematic renderer has explicit memory and frame budgets", async () => {
   assert.match(component, /assignedNebulaAssetIds/);
   assert.match(component, /if \(!assignedNebulaAssetIds\.has\(asset\.id\)\) continue/);
   assert.match(component, /Math\.sqrt\(4_500_000 \/ Math\.max\(1, width \* height\)\)/);
-  assert.match(component, /const targetFps = reducedMotion/);
-  assert.match(component, /activelyMoving[\s\S]*\? 30[\s\S]*: 24/);
+  assert.match(component, /const INTERACTION_FPS = 30/);
+  assert.match(component, /const IDLE_FPS = 12/);
+  assert.match(component, /const BACKGROUND_FPS = 4/);
+  assert.match(component, /const targetFps = windowFocused/);
+  assert.match(component, /activelyMoving[\s\S]*\? reducedMotion[\s\S]*\? IDLE_FPS[\s\S]*: INTERACTION_FPS[\s\S]*: reducedMotion[\s\S]*\? BACKGROUND_FPS[\s\S]*: IDLE_FPS[\s\S]*: BACKGROUND_FPS/);
+  assert.match(component, /if \(document\.hidden\) \{[\s\S]*frame = 0/);
+  assert.match(component, /categoryFilterRef\.current/);
   assert.match(component, /backdropCanvas\.width = 0/);
   assert.match(component, /regionNebulaSprites\.clear\(\)/);
 });

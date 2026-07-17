@@ -44,6 +44,8 @@ done
   "$ROOT/macos/LiteverseApp.m" \
   -o "$CONTENTS/MacOS/Liteverse"
 
+/bin/zsh "$ROOT/scripts/build-local-worker.sh" "$CONTENTS/MacOS/LiteverseLocalWorker"
+
 /usr/bin/ditto "$ROOT/dist-desktop" "$CONTENTS/Resources/web"
 /usr/bin/find "$CONTENTS/Resources/web" -name '.DS_Store' -delete
 # The UI never displays these sources above the sizes below. Pre-scaling the
@@ -74,6 +76,16 @@ mkdir -p "$CONTENTS/Resources/LiteverseCLI/lib"
 # deliberately never bundled into a distributable app.
 mkdir -p "$CONTENTS/Resources/seed-papers"
 /bin/cp "$ROOT/macos/Info.plist" "$CONTENTS/Info.plist"
+if [[ -n "${LITEVERSE_WORKSPACE_DIRECTORY:-}" ]]; then
+  if [[ ! "$LITEVERSE_WORKSPACE_DIRECTORY" =~ '^[A-Za-z0-9._-]{1,64}$' ]] || \
+      [[ "$LITEVERSE_WORKSPACE_DIRECTORY" == "." || "$LITEVERSE_WORKSPACE_DIRECTORY" == ".." ]]; then
+    echo "Invalid LITEVERSE_WORKSPACE_DIRECTORY" >&2
+    exit 1
+  fi
+  /usr/libexec/PlistBuddy -c \
+    "Add :LiteverseWorkspaceDirectory string $LITEVERSE_WORKSPACE_DIRECTORY" \
+    "$CONTENTS/Info.plist"
+fi
 /usr/bin/xattr -cr "$APP"
 /usr/bin/codesign --force --deep --sign - "$APP"
 /usr/bin/xattr -dr com.apple.quarantine "$APP" 2>/dev/null || true
