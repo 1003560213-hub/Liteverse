@@ -5,7 +5,7 @@ import PDFKit
 
 private let jobSchemaVersion = "liteverse-local-job-v1"
 private let resultSchemaVersion = "liteverse-local-result-v1"
-private let workerVersion = "0.4.0"
+private let workerVersion = "0.5.0"
 
 private enum WorkerFailure: Error, CustomStringConvertible {
     case invalidRequest(String)
@@ -26,7 +26,11 @@ private enum WorkerFailure: Error, CustomStringConvertible {
 
 private struct SourceRequest {
     let kind: String
+    let storageMode: String
     let path: String?
+    let linkedRootPath: String?
+    let relativePath: String?
+    let expectedSHA256: String?
     let arxiv: String?
     let title: String?
     let authors: [String]
@@ -82,17 +86,69 @@ private struct ArtifactRecord {
 }
 
 private struct RoutingCandidate {
+    let identifier: String
+    let kind: String
+    let isAnchor: Bool
     let page: Int
+    let section: String?
+    let ordinal: Int
+    let characterStart: Int
+    let characterEnd: Int
+    let sourceSHA256: String
+    let pageTextSHA256: String
     let text: String
+    let previousContext: String?
+    let nextContext: String?
     let signals: [String]
+    let routingScore: Int
+
+    var json: [String: Any] {
+        var value: [String: Any] = [
+            "id": identifier,
+            "kind": kind,
+            "page": page,
+            "section": nullable(section),
+            "ordinal": ordinal,
+            "characterRange": [
+                "start": characterStart,
+                "end": characterEnd,
+                "encoding": "utf16",
+            ],
+            "sourceSha256": sourceSHA256,
+            "pageTextSha256": pageTextSHA256,
+            "text": text,
+            "context": [
+                "previous": nullable(previousContext),
+                "current": text,
+                "next": nullable(nextContext),
+            ],
+            "signals": signals,
+            "routingScore": routingScore,
+            "status": "provisional",
+            "purpose": "routing_only",
+            "verificationState": "unverified",
+        ]
+        value[isAnchor ? "anchorId" : "candidateId"] = identifier
+        return value
+    }
+}
+
+private struct PageExtractionSummary {
+    let page: Int
+    let textSHA256: String
+    let characterCount: Int
+    let meaningfulCharacterCount: Int
+    let wordCount: Int
+    let quality: String
 
     var json: [String: Any] {
         [
             "page": page,
-            "text": text,
-            "signals": signals,
-            "status": "provisional",
-            "purpose": "routing_only",
+            "pageTextSha256": textSHA256,
+            "characterCount": characterCount,
+            "meaningfulCharacterCount": meaningfulCharacterCount,
+            "wordCount": wordCount,
+            "quality": quality,
         ]
     }
 }
@@ -100,19 +156,30 @@ private struct RoutingCandidate {
 private struct ExtractionSummary {
     let pageCount: Int
     let meaningfulCharacters: Int
+    let pageExtractions: [PageExtractionSummary]
     let sectionHeadings: [RoutingCandidate]
     let equationLikeLines: [RoutingCandidate]
+    let figureAnchors: [RoutingCandidate]
+    let tableAnchors: [RoutingCandidate]
+    let citationAnchors: [RoutingCandidate]
+    let researchQuestionSentences: [RoutingCandidate]
     let methodSentences: [RoutingCandidate]
     let resultSentences: [RoutingCandidate]
     let limitationSentences: [RoutingCandidate]
+    let assumptionSentences: [RoutingCandidate]
 }
 
 private let routingCaps = (
     sectionHeadings: 32,
     equationLikeLines: 24,
+    figureAnchors: 16,
+    tableAnchors: 16,
+    citationAnchors: 24,
+    researchQuestionSentences: 16,
     methodSentences: 16,
     resultSentences: 16,
-    limitationSentences: 16
+    limitationSentences: 16,
+    assumptionSentences: 16
 )
 
 private let numberedHeadingExpression = try! NSRegularExpression(
@@ -151,6 +218,21 @@ private let methodRoutingSignals = [
     "we use",
 ]
 
+private let researchQuestionRoutingSignals = [
+    "aim of this",
+    "central question",
+    "goal of this",
+    "motivated by",
+    "open question",
+    "purpose of this",
+    "we ask",
+    "we examine",
+    "we explore",
+    "we investigate",
+    "we study",
+    "whether",
+]
+
 private let resultRoutingSignals = [
     "consistent with",
     "demonstrate",
@@ -165,7 +247,6 @@ private let resultRoutingSignals = [
 
 private let limitationRoutingSignals = [
     "approximation",
-    "assume",
     "cannot",
     "caveat",
     "does not",
@@ -175,6 +256,43 @@ private let limitationRoutingSignals = [
     "restricted",
     "uncertain",
 ]
+
+private let assumptionRoutingSignals = [
+    "assuming",
+    "for simplicity",
+    "is assumed",
+    "under the assumption",
+    "we adopt",
+    "we assume",
+    "we consider only",
+    "we neglect",
+    "we restrict",
+]
+
+private let figureAnchorExpression = try! NSRegularExpression(
+    pattern: #"\bfig(?:ure)?s?\.?\s*\d+[a-z]?\b"#,
+    options: [.caseInsensitive]
+)
+
+private let tableAnchorExpression = try! NSRegularExpression(
+    pattern: #"\btables?\.?\s*\d+[a-z]?\b"#,
+    options: [.caseInsensitive]
+)
+
+private let citationAnchorExpressions = [
+    try! NSRegularExpression(pattern: #"\[\s*\d+(?:\s*[-,]\s*\d+)*\s*\]"#),
+    try! NSRegularExpression(
+        pattern: #"\([A-Z][A-Za-z'`-]+(?:\s+et\s+al\.)?,?\s+(?:19|20)\d{2}[a-z]?\)"#,
+        options: []
+    ),
+]
+
+private struct TextSpan {
+    let text: String
+    let start: Int
+    let end: Int
+    let ordinal: Int
+}
 
 private final class WorkerLock {
     private var descriptor: Int32 = -1
@@ -458,6 +576,13 @@ private func parseJob(data: Data) throws -> JobRequest {
     }
     let path = sourceObject["pdfPath"] as? String
     let arxiv = sourceObject["arxivId"] as? String
+    let storageMode = sourceObject["storageMode"] as? String ?? "managed"
+    let linkedRootPath = sourceObject["linkedRootPath"] as? String
+    let relativePath = sourceObject["relativePath"] as? String
+    let expectedSHA256 = (sourceObject["expectedSha256"] as? String)?.lowercased()
+    if storageMode != "managed" && storageMode != "linked" {
+        throw WorkerFailure.invalidRequest("source.storageMode must be managed or linked")
+    }
     if kind == "pdf" && (path == nil || !(path?.hasPrefix("/") ?? false)) {
         throw WorkerFailure.invalidRequest("a local PDF source requires an absolute source.pdfPath")
     }
@@ -469,6 +594,31 @@ private func parseJob(data: Data) throws -> JobRequest {
     }
     if kind == "arxiv" && path != nil {
         throw WorkerFailure.invalidRequest("an arXiv source may not include source.pdfPath")
+    }
+    if kind == "arxiv" && storageMode != "managed" {
+        throw WorkerFailure.invalidRequest("an arXiv source must use managed storage")
+    }
+    if kind == "pdf" && expectedSHA256?.range(of: #"^[a-f0-9]{64}$"#, options: .regularExpression) == nil {
+        throw WorkerFailure.invalidRequest("a PDF source requires source.expectedSha256")
+    }
+    if kind == "pdf" && storageMode == "linked" {
+        guard let linkedRootPath, linkedRootPath.hasPrefix("/"),
+              let relativePath, !relativePath.isEmpty, !relativePath.hasPrefix("/") else {
+            throw WorkerFailure.invalidRequest("a linked PDF requires an absolute linkedRootPath and a relativePath")
+        }
+        let rootURL = URL(fileURLWithPath: linkedRootPath, isDirectory: true).standardizedFileURL
+        let sourceURL = URL(fileURLWithPath: path ?? "").standardizedFileURL
+        let relativeNSString = relativePath as NSString
+        guard linkedRootPath == rootURL.path,
+              relativePath == relativeNSString.standardizingPath,
+              !relativeNSString.pathComponents.contains(".."),
+              relativeNSString.pathExtension.lowercased() == "pdf",
+              sourceURL.path == rootURL.appendingPathComponent(relativePath).standardizedFileURL.path,
+              sourceURL.path.hasPrefix(rootURL.path + "/") else {
+            throw WorkerFailure.invalidRequest("the linked PDF path must close exactly under linkedRootPath")
+        }
+    } else if linkedRootPath != nil || relativePath != nil {
+        throw WorkerFailure.invalidRequest("managed and arXiv sources may not include linked-path fields")
     }
     if let requestedPaperID = root["paperId"] as? String,
        requestedPaperID.range(of: #"^[a-z0-9]+(?:-[a-z0-9]+)*$"#, options: .regularExpression) == nil {
@@ -503,7 +653,11 @@ private func parseJob(data: Data) throws -> JobRequest {
         requestedPaperID: root["paperId"] as? String,
         source: SourceRequest(
             kind: kind,
+            storageMode: storageMode,
             path: path,
+            linkedRootPath: linkedRootPath,
+            relativePath: relativePath,
+            expectedSHA256: expectedSHA256,
             arxiv: arxiv,
             title: (sourceObject["title"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
             authors: authors,
@@ -532,6 +686,70 @@ private func validatePDF(_ url: URL) throws {
     guard String(decoding: prefix, as: UTF8.self).contains("%PDF-") else {
         throw WorkerFailure.invalidSource("source is not a PDF")
     }
+}
+
+private func lstatMode(_ url: URL) throws -> mode_t {
+    var metadata = stat()
+    guard Darwin.lstat(url.path, &metadata) == 0 else {
+        throw WorkerFailure.invalidSource("linked source component is missing or unreadable: \(url.path)")
+    }
+    return metadata.st_mode
+}
+
+private func canonicalPath(_ url: URL) throws -> String {
+    guard let pointer = Darwin.realpath(url.path, nil) else {
+        throw WorkerFailure.invalidSource("could not resolve linked source path: \(url.path)")
+    }
+    defer { Darwin.free(pointer) }
+    return String(cString: pointer)
+}
+
+private func validateLinkedSource(_ source: SourceRequest, verifyExpectedHash: Bool) throws -> URL {
+    guard source.kind == "pdf", source.storageMode == "linked",
+          let path = source.path, let rootPath = source.linkedRootPath,
+          let relativePath = source.relativePath else {
+        throw WorkerFailure.invalidRequest("the linked source descriptor is incomplete")
+    }
+    let rootURL = URL(fileURLWithPath: rootPath, isDirectory: true).standardizedFileURL
+    let fileURL = URL(fileURLWithPath: path, isDirectory: false).standardizedFileURL
+    guard fileURL.path == rootURL.appendingPathComponent(relativePath).standardizedFileURL.path,
+          fileURL.path.hasPrefix(rootURL.path + "/") else {
+        throw WorkerFailure.invalidSource("linked PDF escaped its registered root")
+    }
+
+    let rootMode = try lstatMode(rootURL)
+    guard rootMode & mode_t(S_IFMT) == mode_t(S_IFDIR) else {
+        throw WorkerFailure.invalidSource("linkedRootPath must be a real directory, not a symbolic link")
+    }
+    var componentURL = rootURL
+    let components = (relativePath as NSString).pathComponents
+    for (index, component) in components.enumerated() {
+        componentURL.appendPathComponent(component)
+        let mode = try lstatMode(componentURL)
+        let type = mode & mode_t(S_IFMT)
+        if type == mode_t(S_IFLNK) {
+            throw WorkerFailure.invalidSource("linked source paths may not traverse symbolic links")
+        }
+        if index == components.count - 1 {
+            guard type == mode_t(S_IFREG) else {
+                throw WorkerFailure.invalidSource("linked PDF must be a regular file")
+            }
+        } else if type != mode_t(S_IFDIR) {
+            throw WorkerFailure.invalidSource("a linked source intermediate component is not a directory")
+        }
+    }
+    let realRoot = try canonicalPath(rootURL)
+    let realFile = try canonicalPath(fileURL)
+    guard realRoot == rootURL.path, realFile == fileURL.path,
+          realFile.hasPrefix(realRoot + "/") else {
+        throw WorkerFailure.invalidSource("linked PDF realpath no longer closes under linkedRootPath")
+    }
+    if verifyExpectedHash {
+        guard let expected = source.expectedSHA256, try sha256File(fileURL) == expected else {
+            throw WorkerFailure.invalidSource("linked PDF changed after folder registration")
+        }
+    }
+    return fileURL
 }
 
 private func synchronousDataRequest(_ request: URLRequest, timeout: TimeInterval) throws -> (Data, HTTPURLResponse) {
@@ -765,6 +983,8 @@ private func fulltextHeader(
     paperID: String,
     metadata: SourceMetadata,
     sourceKind: String,
+    storageMode: String,
+    sourcePDFPath: String,
     sourceHash: String,
     extractionStatus: String,
     verificationStatus: String,
@@ -778,6 +998,8 @@ private func fulltextHeader(
         "authors: \(yaml(metadata.authors))",
         "metadata_status: \(yaml(metadata.metadataStatus))",
         "source_type: \(yaml(sourceKind))",
+        "source_storage_mode: \(yaml(storageMode))",
+        "source_pdf_path: \(yaml(sourcePDFPath))",
         "source_sha256: \(yaml(sourceHash))",
         "arxiv_id: \(yaml(metadata.arxivID))",
         "doi: \(yaml(metadata.doi))",
@@ -800,6 +1022,8 @@ private func cardMarkdown(
     paperID: String,
     metadata: SourceMetadata,
     sourceKind: String,
+    storageMode: String,
+    sourcePDFPath: String,
     sourceHash: String,
     extractionStatus: String,
     verificationStatus: String,
@@ -813,10 +1037,12 @@ private func cardMarkdown(
         "authors: \(yaml(metadata.authors))",
         "metadata_status: \(yaml(metadata.metadataStatus))",
         "source_type: \(yaml(sourceKind))",
+        "source_storage_mode: \(yaml(storageMode))",
+        "source_pdf_path: \(yaml(sourcePDFPath))",
         "source_sha256: \(yaml(sourceHash))",
         "arxiv_id: \(yaml(metadata.arxivID))",
         "doi: \(yaml(metadata.doi))",
-        "pdf_path: \(yaml("Library/PDFs/\(paperID).pdf"))",
+        "pdf_path: \(yaml(sourcePDFPath))",
         "fulltext_path: \(yaml("Knowledge/fulltext/\(paperID).md"))",
         "extraction_status: \(yaml(extractionStatus))",
         "extraction_engine: \(yaml("pdfkit"))",
@@ -905,15 +1131,151 @@ private func writeFulltext(prefix: String, body: URL, destination: URL) throws {
     }
 }
 
-private func appendRoutingCandidate(_ candidate: RoutingCandidate, to values: inout [RoutingCandidate], cap: Int) {
-    guard values.count < cap else { return }
-    let key = normalizedText(candidate.text)
-    guard !key.isEmpty, !values.contains(where: { normalizedText($0.text) == key }) else { return }
-    values.append(candidate)
+private func stableRoutingIdentifier(
+    namespace: String,
+    sourceSHA256: String,
+    kind: String,
+    page: Int,
+    start: Int,
+    end: Int,
+    ordinal: Int,
+    text: String
+) -> String {
+    let pin = [
+        sourceSHA256,
+        namespace,
+        kind,
+        String(page),
+        String(start),
+        String(end),
+        String(ordinal),
+        normalizedText(text),
+    ].joined(separator: "\u{1f}")
+    return "rp2-\(namespace)-\(sha256(Data(pin.utf8)))"
 }
 
-private func headingCandidate(_ line: String, page: Int) -> RoutingCandidate? {
-    let text = collapsedWhitespace(line)
+private func textSpans(_ text: String, splitOnSentenceTerminators: Bool) -> [TextSpan] {
+    let source = text as NSString
+    var values: [TextSpan] = []
+    var start = 0
+    var ordinal = 0
+
+    func append(end: Int) {
+        defer {
+            start = end
+            ordinal += 1
+        }
+        guard end > start else { return }
+        let raw = source.substring(with: NSRange(location: start, length: end - start))
+        let value = collapsedWhitespace(raw)
+        guard !value.isEmpty else { return }
+        values.append(TextSpan(text: value, start: start, end: end, ordinal: ordinal))
+    }
+
+    for index in 0..<source.length {
+        let unit = source.character(at: index)
+        let isNewline = unit == 10 || unit == 13
+        let isTerminator = unit == 33 || unit == 46 || unit == 63
+        if (splitOnSentenceTerminators && isTerminator) || (!splitOnSentenceTerminators && isNewline) {
+            append(end: index + (isTerminator ? 1 : 0))
+            start = index + 1
+        } else if splitOnSentenceTerminators && isNewline {
+            // Newlines are normalized into spaces so wrapped PDF sentences retain their context.
+            continue
+        }
+    }
+    append(end: source.length)
+    return values
+}
+
+private func routingScore(kind: String, text: String, signals: [String], section: String?) -> Int {
+    let loweredSection = section?.lowercased() ?? ""
+    let wordCount = text.split(whereSeparator: { $0.isWhitespace }).count
+    var score = signals.count * 100 + min(wordCount, 60)
+    let sectionSignals: [String: [String]] = [
+        "research_question": ["abstract", "introduction", "motivation"],
+        "method": ["method", "methods", "methodology", "simulation"],
+        "result": ["result", "results", "discussion", "conclusion", "conclusions"],
+        "limitation": ["limitation", "limitations", "discussion", "conclusion", "conclusions"],
+        "assumption": ["method", "methods", "model", "theory"],
+        "equation": ["method", "methods", "model", "theory"],
+        "figure": ["result", "results", "discussion"],
+        "table": ["result", "results", "method", "methods"],
+        "citation": ["introduction", "discussion", "references"],
+    ]
+    if sectionSignals[kind, default: []].contains(where: { loweredSection.contains($0) }) { score += 50 }
+    if kind == "research_question", text.contains("?") { score += 25 }
+    if text.lowercased().hasPrefix("we ") || text.lowercased().contains(" we ") { score += 10 }
+    return score
+}
+
+private func makeRoutingCandidate(
+    kind: String,
+    isAnchor: Bool,
+    span: TextSpan,
+    page: Int,
+    section: String?,
+    sourceSHA256: String,
+    pageTextSHA256: String,
+    previousContext: String?,
+    nextContext: String?,
+    signals: [String]
+) -> RoutingCandidate {
+    RoutingCandidate(
+        identifier: stableRoutingIdentifier(
+            namespace: isAnchor ? "anchor" : "candidate",
+            sourceSHA256: sourceSHA256,
+            kind: kind,
+            page: page,
+            start: span.start,
+            end: span.end,
+            ordinal: span.ordinal,
+            text: span.text
+        ),
+        kind: kind,
+        isAnchor: isAnchor,
+        page: page,
+        section: section,
+        ordinal: span.ordinal,
+        characterStart: span.start,
+        characterEnd: span.end,
+        sourceSHA256: sourceSHA256,
+        pageTextSHA256: pageTextSHA256,
+        text: span.text,
+        previousContext: previousContext,
+        nextContext: nextContext,
+        signals: signals.sorted(),
+        routingScore: routingScore(kind: kind, text: span.text, signals: signals, section: section)
+    )
+}
+
+private func rankedRoutingCandidates(_ values: [RoutingCandidate], cap: Int) -> [RoutingCandidate] {
+    let ordered = values.sorted {
+        if $0.routingScore != $1.routingScore { return $0.routingScore > $1.routingScore }
+        if $0.page != $1.page { return $0.page < $1.page }
+        if $0.characterStart != $1.characterStart { return $0.characterStart < $1.characterStart }
+        return $0.identifier < $1.identifier
+    }
+    var seen: Set<String> = []
+    var ranked: [RoutingCandidate] = []
+    for candidate in ordered {
+        let key = "\(candidate.kind)\u{1f}\(normalizedText(candidate.text))"
+        guard !key.isEmpty, seen.insert(key).inserted else { continue }
+        ranked.append(candidate)
+        if ranked.count == cap { break }
+    }
+    return ranked
+}
+
+private func headingCandidate(
+    _ span: TextSpan,
+    page: Int,
+    sourceSHA256: String,
+    pageTextSHA256: String,
+    previousContext: String?,
+    nextContext: String?
+) -> RoutingCandidate? {
+    let text = span.text
     guard text.count >= 3, text.count <= 120 else { return nil }
     let words = text.split(whereSeparator: { $0.isWhitespace })
     guard words.count <= 14 else { return nil }
@@ -929,37 +1291,51 @@ private func headingCandidate(_ line: String, page: Int) -> RoutingCandidate? {
     let uppercaseLetters = letters.filter { CharacterSet.uppercaseLetters.contains($0) }
     if letters.count >= 3 && letters.count == uppercaseLetters.count { signals.append("uppercase_heading") }
     guard !signals.isEmpty else { return nil }
-    return RoutingCandidate(page: page, text: text, signals: signals.sorted())
+    return makeRoutingCandidate(
+        kind: "section",
+        isAnchor: true,
+        span: span,
+        page: page,
+        section: text,
+        sourceSHA256: sourceSHA256,
+        pageTextSHA256: pageTextSHA256,
+        previousContext: previousContext,
+        nextContext: nextContext,
+        signals: signals
+    )
 }
 
-private func equationCandidate(_ line: String, page: Int) -> RoutingCandidate? {
-    let text = collapsedWhitespace(line)
+private func equationCandidate(
+    _ span: TextSpan,
+    page: Int,
+    section: String?,
+    sourceSHA256: String,
+    pageTextSHA256: String,
+    previousContext: String?,
+    nextContext: String?
+) -> RoutingCandidate? {
+    let text = span.text
     guard text.count >= 3, text.count <= 180, !text.lowercased().contains("http") else { return nil }
     let operators = ["=", "≈", "∝", "≤", "≥", "∫", "∑", "∇", "±"]
     let signals = operators.filter { text.contains($0) }.map { "operator:\($0)" }
     guard !signals.isEmpty,
           text.unicodeScalars.contains(where: { CharacterSet.alphanumerics.contains($0) }) else { return nil }
-    return RoutingCandidate(page: page, text: text, signals: signals.sorted())
+    return makeRoutingCandidate(
+        kind: "equation",
+        isAnchor: true,
+        span: span,
+        page: page,
+        section: section,
+        sourceSHA256: sourceSHA256,
+        pageTextSHA256: pageTextSHA256,
+        previousContext: previousContext,
+        nextContext: nextContext,
+        signals: signals
+    )
 }
 
-private func routingSentences(_ text: String) -> [String] {
-    var values: [String] = []
-    var buffer = ""
-    func flush() {
-        let candidate = collapsedWhitespace(buffer)
-        if !candidate.isEmpty { values.append(candidate) }
-        buffer = ""
-    }
-    for character in text {
-        if character == "\n" || character == "\r" {
-            if !buffer.isEmpty && !(buffer.last?.isWhitespace ?? false) { buffer.append(" ") }
-            continue
-        }
-        buffer.append(character)
-        if character == "." || character == "!" || character == "?" { flush() }
-    }
-    flush()
-    return values
+private func routingSentences(_ text: String) -> [TextSpan] {
+    textSpans(text, splitOnSentenceTerminators: true)
 }
 
 private func routingSignals(in sentence: String, from vocabulary: [String]) -> [String] {
@@ -967,81 +1343,211 @@ private func routingSignals(in sentence: String, from vocabulary: [String]) -> [
     return vocabulary.filter { lowered.contains($0) }.sorted()
 }
 
+private func regexMatches(_ expression: NSRegularExpression, in text: String) -> Bool {
+    expression.firstMatch(in: text, range: NSRange(text.startIndex..<text.endIndex, in: text)) != nil
+}
+
+private func sectionName(at position: Int, headings: [RoutingCandidate]) -> String? {
+    headings.last(where: { $0.characterStart <= position })?.text
+}
+
+private func context(at index: Int, in spans: [TextSpan]) -> (String?, String?) {
+    let previous = index > 0 ? spans[index - 1].text : nil
+    let next = index + 1 < spans.count ? spans[index + 1].text : nil
+    return (previous, next)
+}
+
 private func collectRoutingCandidates(
     from pageText: String,
     page: Int,
+    sourceSHA256: String,
+    pageTextSHA256: String,
     sectionHeadings: inout [RoutingCandidate],
     equationLikeLines: inout [RoutingCandidate],
+    figureAnchors: inout [RoutingCandidate],
+    tableAnchors: inout [RoutingCandidate],
+    citationAnchors: inout [RoutingCandidate],
+    researchQuestionSentences: inout [RoutingCandidate],
     methodSentences: inout [RoutingCandidate],
     resultSentences: inout [RoutingCandidate],
-    limitationSentences: inout [RoutingCandidate]
+    limitationSentences: inout [RoutingCandidate],
+    assumptionSentences: inout [RoutingCandidate]
 ) {
-    for rawLine in pageText.components(separatedBy: .newlines) {
-        if let candidate = headingCandidate(rawLine, page: page) {
-            appendRoutingCandidate(candidate, to: &sectionHeadings, cap: routingCaps.sectionHeadings)
-        }
-        if let candidate = equationCandidate(rawLine, page: page) {
-            appendRoutingCandidate(candidate, to: &equationLikeLines, cap: routingCaps.equationLikeLines)
+    let lines = textSpans(pageText, splitOnSentenceTerminators: false)
+    var pageHeadings: [RoutingCandidate] = []
+    for (index, span) in lines.enumerated() {
+        let nearby = context(at: index, in: lines)
+        if let candidate = headingCandidate(
+            span,
+            page: page,
+            sourceSHA256: sourceSHA256,
+            pageTextSHA256: pageTextSHA256,
+            previousContext: nearby.0,
+            nextContext: nearby.1
+        ) {
+            pageHeadings.append(candidate)
+            sectionHeadings.append(candidate)
         }
     }
 
-    for sentence in routingSentences(pageText) {
+    for (index, span) in lines.enumerated() {
+        let nearby = context(at: index, in: lines)
+        let section = sectionName(at: span.start, headings: pageHeadings)
+        if let candidate = equationCandidate(
+            span,
+            page: page,
+            section: section,
+            sourceSHA256: sourceSHA256,
+            pageTextSHA256: pageTextSHA256,
+            previousContext: nearby.0,
+            nextContext: nearby.1
+        ) {
+            equationLikeLines.append(candidate)
+        }
+    }
+
+    let sentences = routingSentences(pageText)
+    for (index, span) in sentences.enumerated() {
+        var candidateSpan = span
+        if let embeddedHeading = pageHeadings.last(where: {
+            $0.characterStart >= span.start && $0.characterEnd <= span.end
+        }), embeddedHeading.characterEnd < span.end {
+            let source = pageText as NSString
+            let text = collapsedWhitespace(source.substring(with: NSRange(
+                location: embeddedHeading.characterEnd,
+                length: span.end - embeddedHeading.characterEnd
+            )))
+            if !text.isEmpty {
+                candidateSpan = TextSpan(
+                    text: text,
+                    start: embeddedHeading.characterEnd,
+                    end: span.end,
+                    ordinal: span.ordinal
+                )
+            }
+        }
+        let sentence = candidateSpan.text
+        let nearby = context(at: index, in: sentences)
+        let section = sectionName(at: candidateSpan.start, headings: pageHeadings)
+        let anchorRules: [(String, Bool)] = [
+            ("figure", regexMatches(figureAnchorExpression, in: sentence)),
+            ("table", regexMatches(tableAnchorExpression, in: sentence)),
+            ("citation", citationAnchorExpressions.contains(where: { regexMatches($0, in: sentence) })),
+        ]
+        for (kind, matches) in anchorRules where matches {
+            let signal = kind == "citation" ? "citation_marker" : "\(kind)_marker"
+            let candidate = makeRoutingCandidate(
+                kind: kind,
+                isAnchor: true,
+                span: candidateSpan,
+                page: page,
+                section: section,
+                sourceSHA256: sourceSHA256,
+                pageTextSHA256: pageTextSHA256,
+                previousContext: nearby.0,
+                nextContext: nearby.1,
+                signals: [signal]
+            )
+            switch kind {
+            case "figure": figureAnchors.append(candidate)
+            case "table": tableAnchors.append(candidate)
+            default: citationAnchors.append(candidate)
+            }
+        }
         guard sentence.count >= 40, sentence.count <= 360 else { continue }
         let wordCount = sentence.split(whereSeparator: { $0.isWhitespace }).count
         guard wordCount >= 6, wordCount <= 60 else { continue }
-        let methodSignals = routingSignals(in: sentence, from: methodRoutingSignals)
-        if !methodSignals.isEmpty {
-            appendRoutingCandidate(
-                RoutingCandidate(page: page, text: sentence, signals: methodSignals),
-                to: &methodSentences,
-                cap: routingCaps.methodSentences
+        let rules: [(String, [String])] = [
+            ("research_question", routingSignals(in: sentence, from: researchQuestionRoutingSignals)),
+            ("method", routingSignals(in: sentence, from: methodRoutingSignals)),
+            ("result", routingSignals(in: sentence, from: resultRoutingSignals)),
+            ("limitation", routingSignals(in: sentence, from: limitationRoutingSignals)),
+            ("assumption", routingSignals(in: sentence, from: assumptionRoutingSignals)),
+        ]
+        for (kind, signals) in rules where !signals.isEmpty {
+            let candidate = makeRoutingCandidate(
+                kind: kind,
+                isAnchor: false,
+                span: candidateSpan,
+                page: page,
+                section: section,
+                sourceSHA256: sourceSHA256,
+                pageTextSHA256: pageTextSHA256,
+                previousContext: nearby.0,
+                nextContext: nearby.1,
+                signals: signals
             )
-        }
-        let resultSignals = routingSignals(in: sentence, from: resultRoutingSignals)
-        if !resultSignals.isEmpty {
-            appendRoutingCandidate(
-                RoutingCandidate(page: page, text: sentence, signals: resultSignals),
-                to: &resultSentences,
-                cap: routingCaps.resultSentences
-            )
-        }
-        let limitationSignals = routingSignals(in: sentence, from: limitationRoutingSignals)
-        if !limitationSignals.isEmpty {
-            appendRoutingCandidate(
-                RoutingCandidate(page: page, text: sentence, signals: limitationSignals),
-                to: &limitationSentences,
-                cap: routingCaps.limitationSentences
-            )
+            switch kind {
+            case "research_question": researchQuestionSentences.append(candidate)
+            case "method": methodSentences.append(candidate)
+            case "result": resultSentences.append(candidate)
+            case "limitation": limitationSentences.append(candidate)
+            default: assumptionSentences.append(candidate)
+            }
         }
     }
 }
 
-private func extractPages(from document: PDFDocument, bodyURL: URL) throws -> ExtractionSummary {
+private func extractPages(from document: PDFDocument, bodyURL: URL, sourceSHA256: String) throws -> ExtractionSummary {
     guard document.pageCount > 0 else { throw WorkerFailure.invalidSource("PDF contains no pages") }
     FileManager.default.createFile(atPath: bodyURL.path, contents: nil)
     let handle = try FileHandle(forWritingTo: bodyURL)
     var meaningfulCharacters = 0
+    var pageExtractions: [PageExtractionSummary] = []
     var sectionHeadings: [RoutingCandidate] = []
     var equationLikeLines: [RoutingCandidate] = []
+    var figureAnchors: [RoutingCandidate] = []
+    var tableAnchors: [RoutingCandidate] = []
+    var citationAnchors: [RoutingCandidate] = []
+    var researchQuestionSentences: [RoutingCandidate] = []
     var methodSentences: [RoutingCandidate] = []
     var resultSentences: [RoutingCandidate] = []
     var limitationSentences: [RoutingCandidate] = []
+    var assumptionSentences: [RoutingCandidate] = []
     do {
         for pageIndex in 0..<document.pageCount {
             let text: String = autoreleasepool {
                 (document.page(at: pageIndex)?.string ?? "").replacingOccurrences(of: "\0", with: "")
             }
-            meaningfulCharacters += text.unicodeScalars.reduce(0) { count, scalar in
+            let pageMeaningfulCharacters = text.unicodeScalars.reduce(0) { count, scalar in
                 CharacterSet.whitespacesAndNewlines.contains(scalar) ? count : count + 1
             }
+            meaningfulCharacters += pageMeaningfulCharacters
+            let pageTextSHA256 = sha256(Data(text.utf8))
+            let pageWordCount = text.split(whereSeparator: { $0.isWhitespace }).count
+            let pageQuality: String
+            if pageMeaningfulCharacters == 0 {
+                pageQuality = "empty"
+            } else if pageMeaningfulCharacters < 80 || pageWordCount < 10 {
+                pageQuality = "sparse"
+            } else if pageMeaningfulCharacters < 200 || pageWordCount < 30 {
+                pageQuality = "usable"
+            } else {
+                pageQuality = "good"
+            }
+            pageExtractions.append(PageExtractionSummary(
+                page: pageIndex + 1,
+                textSHA256: pageTextSHA256,
+                characterCount: (text as NSString).length,
+                meaningfulCharacterCount: pageMeaningfulCharacters,
+                wordCount: pageWordCount,
+                quality: pageQuality
+            ))
             collectRoutingCandidates(
                 from: text,
                 page: pageIndex + 1,
+                sourceSHA256: sourceSHA256,
+                pageTextSHA256: pageTextSHA256,
                 sectionHeadings: &sectionHeadings,
                 equationLikeLines: &equationLikeLines,
+                figureAnchors: &figureAnchors,
+                tableAnchors: &tableAnchors,
+                citationAnchors: &citationAnchors,
+                researchQuestionSentences: &researchQuestionSentences,
                 methodSentences: &methodSentences,
                 resultSentences: &resultSentences,
-                limitationSentences: &limitationSentences
+                limitationSentences: &limitationSentences,
+                assumptionSentences: &assumptionSentences
             )
             let cleaned = text.trimmingCharacters(in: .whitespacesAndNewlines)
             let pageBody = cleaned.isEmpty ? "[No extractable text on this page.]" : cleaned
@@ -1057,11 +1563,20 @@ private func extractPages(from document: PDFDocument, bodyURL: URL) throws -> Ex
     return ExtractionSummary(
         pageCount: document.pageCount,
         meaningfulCharacters: meaningfulCharacters,
-        sectionHeadings: sectionHeadings,
-        equationLikeLines: equationLikeLines,
-        methodSentences: methodSentences,
-        resultSentences: resultSentences,
-        limitationSentences: limitationSentences
+        pageExtractions: pageExtractions,
+        sectionHeadings: rankedRoutingCandidates(sectionHeadings, cap: routingCaps.sectionHeadings),
+        equationLikeLines: rankedRoutingCandidates(equationLikeLines, cap: routingCaps.equationLikeLines),
+        figureAnchors: rankedRoutingCandidates(figureAnchors, cap: routingCaps.figureAnchors),
+        tableAnchors: rankedRoutingCandidates(tableAnchors, cap: routingCaps.tableAnchors),
+        citationAnchors: rankedRoutingCandidates(citationAnchors, cap: routingCaps.citationAnchors),
+        researchQuestionSentences: rankedRoutingCandidates(
+            researchQuestionSentences,
+            cap: routingCaps.researchQuestionSentences
+        ),
+        methodSentences: rankedRoutingCandidates(methodSentences, cap: routingCaps.methodSentences),
+        resultSentences: rankedRoutingCandidates(resultSentences, cap: routingCaps.resultSentences),
+        limitationSentences: rankedRoutingCandidates(limitationSentences, cap: routingCaps.limitationSentences),
+        assumptionSentences: rankedRoutingCandidates(assumptionSentences, cap: routingCaps.assumptionSentences)
     )
 }
 
@@ -1075,7 +1590,8 @@ private func reviewPacket(
     extraction: ExtractionSummary
 ) -> [String: Any] {
     [
-        "schemaVersion": "liteverse-review-packet-v1",
+        "schemaVersion": "liteverse-review-packet-v2",
+        "compatibility": ["liteverse-review-packet-v1-fields"],
         "paperId": paperID,
         "itemId": itemID,
         "itemRevision": itemRevision,
@@ -1091,6 +1607,22 @@ private func reviewPacket(
         ],
         "pageCount": extraction.pageCount,
         "extractionStatus": extractionStatus,
+        "pageExtractionQuality": extraction.pageExtractions.map(\.json),
+        "candidateSets": [
+            "researchQuestions": extraction.researchQuestionSentences.map(\.json),
+            "methods": extraction.methodSentences.map(\.json),
+            "results": extraction.resultSentences.map(\.json),
+            "limitations": extraction.limitationSentences.map(\.json),
+            "assumptions": extraction.assumptionSentences.map(\.json),
+        ],
+        "anchors": [
+            "sections": extraction.sectionHeadings.map(\.json),
+            "equations": extraction.equationLikeLines.map(\.json),
+            "figures": extraction.figureAnchors.map(\.json),
+            "tables": extraction.tableAnchors.map(\.json),
+            "citations": extraction.citationAnchors.map(\.json),
+        ],
+        // These v1 projection fields remain while App/Skill consumers migrate to candidateSets and anchors.
         "sectionHeadingCandidates": extraction.sectionHeadings.map(\.json),
         "equationLikeLineCandidates": extraction.equationLikeLines.map(\.json),
         "sentenceCandidates": [
@@ -1098,12 +1630,22 @@ private func reviewPacket(
             "results": extraction.resultSentences.map(\.json),
             "limitations": extraction.limitationSentences.map(\.json),
         ],
+        "ranking": [
+            "scope": "full_document",
+            "strategy": "deterministic_signal_score_v2",
+            "tieBreakers": ["routingScore_desc", "page_asc", "characterStart_asc", "id_asc"],
+        ],
         "caps": [
             "sectionHeadings": routingCaps.sectionHeadings,
             "equationLikeLines": routingCaps.equationLikeLines,
+            "figureAnchors": routingCaps.figureAnchors,
+            "tableAnchors": routingCaps.tableAnchors,
+            "citationAnchors": routingCaps.citationAnchors,
+            "researchQuestionSentences": routingCaps.researchQuestionSentences,
             "methodSentences": routingCaps.methodSentences,
             "resultSentences": routingCaps.resultSentences,
             "limitationSentences": routingCaps.limitationSentences,
+            "assumptionSentences": routingCaps.assumptionSentences,
         ],
         "guardrails": [
             "originalSourceEvidence": false,
@@ -1170,7 +1712,9 @@ private func runMaterialize(_ job: JobRequest) throws -> [String: Any] {
         let identifier = try parseArxiv(job.source.arxiv ?? "")
         (sourceURL, metadata) = try fetchArxiv(identifier, timeout: job.timeoutSeconds, into: final)
     } else {
-        sourceURL = URL(fileURLWithPath: job.source.path ?? "").standardizedFileURL
+        sourceURL = job.source.storageMode == "linked"
+            ? try validateLinkedSource(job.source, verifyExpectedHash: true)
+            : URL(fileURLWithPath: job.source.path ?? "").standardizedFileURL
         try validatePDF(sourceURL)
         guard let document = PDFDocument(url: sourceURL) else {
             throw WorkerFailure.invalidSource("PDFKit could not open the local PDF")
@@ -1179,6 +1723,9 @@ private func runMaterialize(_ job: JobRequest) throws -> [String: Any] {
     }
     try validatePDF(sourceURL)
     let sourceHash = try sha256File(sourceURL)
+    if job.source.kind == "pdf", sourceHash != job.source.expectedSHA256 {
+        throw WorkerFailure.invalidSource("PDF changed after it was registered")
+    }
     guard let document = PDFDocument(url: sourceURL) else {
         throw WorkerFailure.invalidSource("PDFKit could not open the PDF")
     }
@@ -1216,6 +1763,9 @@ private func runMaterialize(_ job: JobRequest) throws -> [String: Any] {
         "sourceSha256": sourceHash,
         "canonicalMetadata": [
             "kind": job.source.kind,
+            "storageMode": job.source.storageMode,
+            "linkedRootPath": nullable(job.source.linkedRootPath),
+            "relativePath": nullable(job.source.relativePath),
             "title": metadata.title,
             "authors": metadata.authors,
             "arxivId": nullable(metadata.arxivID),
@@ -1261,6 +1811,52 @@ private func runMaterialize(_ job: JobRequest) throws -> [String: Any] {
         return response
     }
 
+    // A strict key may identify one catalog paper while another supplied
+    // bibliographic identifier contradicts that same paper. For example, an
+    // identical PDF hash paired with a different DOI is not safe to resolve as
+    // a duplicate automatically. Keep the source queued for review instead of
+    // allowing one matching key to hide a conflicting identity.
+    if let duplicateID = matched.keys.first,
+       let duplicate = existing.first(where: { $0.paperID == duplicateID }) {
+        var identifierConflicts: [[String: Any]] = []
+        if let identityArxiv, let existingArxiv = duplicate.arxivBase,
+           identityArxiv != existingArxiv {
+            identifierConflicts.append([
+                "paperId": duplicateID,
+                "key": "arxiv_id",
+                "incoming": identityArxiv,
+                "existing": existingArxiv,
+            ])
+        }
+        if let identityDOI, let existingDOI = duplicate.doi,
+           identityDOI != existingDOI {
+            identifierConflicts.append([
+                "paperId": duplicateID,
+                "key": "doi",
+                "incoming": identityDOI,
+                "existing": existingDOI,
+            ])
+        }
+        if !identifierConflicts.isEmpty {
+            if sourceURL.deletingLastPathComponent().standardizedFileURL == final.standardizedFileURL {
+                try? fileManager.removeItem(at: sourceURL)
+            }
+            var manifest = baseManifest
+            manifest["state"] = "needs_attention"
+            manifest["preparation"] = ["state": "needs_attention", "reason": "conflicting_duplicate_identifiers"]
+            manifest["deduplication"] = [
+                "strictKeys": strictKeys,
+                "conflicts": identifierConflicts,
+                "matchedPaper": duplicateSummary(duplicate),
+                "matchedBy": Array(matched[duplicateID] ?? []).sorted(),
+                "possibleTitleAuthorMatches": possibleDuplicates.map(duplicateSummary),
+            ]
+            let response = try publishResult(directory: final, pipeline: pipeline, manifest: manifest)
+            shouldRemoveResult = false
+            return response
+        }
+    }
+
     if let duplicateID = matched.keys.first, let duplicate = existing.first(where: { $0.paperID == duplicateID }) {
         if sourceURL.deletingLastPathComponent().standardizedFileURL == final.standardizedFileURL {
             try? fileManager.removeItem(at: sourceURL)
@@ -1281,16 +1877,18 @@ private func runMaterialize(_ job: JobRequest) throws -> [String: Any] {
     }
 
     let paperID = choosePaperID(requested: job.requestedPaperID, metadata: metadata, sourceHash: sourceHash, existing: existing)
+    let linkedSource = job.source.kind == "pdf" && job.source.storageMode == "linked"
+    let paperPDFPath = linkedSource ? (job.source.path ?? "") : "Library/PDFs/\(paperID).pdf"
     let preservedSource = final.appendingPathComponent("source.pdf")
-    if sourceURL.standardizedFileURL != preservedSource.standardizedFileURL {
+    if !linkedSource && sourceURL.standardizedFileURL != preservedSource.standardizedFileURL {
         try durableCopy(from: sourceURL, to: preservedSource)
     }
-    if sourceURL.deletingLastPathComponent().standardizedFileURL == final.standardizedFileURL,
+    if !linkedSource && sourceURL.deletingLastPathComponent().standardizedFileURL == final.standardizedFileURL,
        sourceURL.standardizedFileURL != preservedSource.standardizedFileURL {
         try fileManager.removeItem(at: sourceURL)
     }
     let bodyURL = final.appendingPathComponent(".fulltext-body.tmp")
-    let extraction = try extractPages(from: document, bodyURL: bodyURL)
+    let extraction = try extractPages(from: document, bodyURL: bodyURL, sourceSHA256: sourceHash)
     let extractionStatus = extraction.meaningfulCharacters >= max(80, extraction.pageCount * 10) ? "extracted" : "needs_ocr"
     let verificationStatus = extractionStatus == "needs_ocr" ? "needs_ocr" : "card_draft"
     let fulltextURL = final.appendingPathComponent("fulltext.md")
@@ -1299,6 +1897,8 @@ private func runMaterialize(_ job: JobRequest) throws -> [String: Any] {
             paperID: paperID,
             metadata: metadata,
             sourceKind: job.source.kind,
+            storageMode: job.source.storageMode,
+            sourcePDFPath: paperPDFPath,
             sourceHash: sourceHash,
             extractionStatus: extractionStatus,
             verificationStatus: verificationStatus,
@@ -1314,6 +1914,8 @@ private func runMaterialize(_ job: JobRequest) throws -> [String: Any] {
         paperID: paperID,
         metadata: metadata,
         sourceKind: job.source.kind,
+        storageMode: job.source.storageMode,
+        sourcePDFPath: paperPDFPath,
         sourceHash: sourceHash,
         extractionStatus: extractionStatus,
         verificationStatus: verificationStatus,
@@ -1330,12 +1932,17 @@ private func runMaterialize(_ job: JobRequest) throws -> [String: Any] {
         extractionStatus: extractionStatus,
         extraction: extraction
     )), to: reviewPacketURL)
-    let artifacts = try [
-        artifact(role: "pdf", relativePath: "source.pdf", in: final),
+    if linkedSource {
+        _ = try validateLinkedSource(job.source, verifyExpectedHash: true)
+    }
+    var artifacts = try [
         artifact(role: "fulltext", relativePath: "fulltext.md", in: final),
         artifact(role: "card", relativePath: "card.md", in: final),
         artifact(role: "review_packet", relativePath: "review-packet.json", in: final),
     ]
+    if !linkedSource {
+        artifacts.insert(try artifact(role: "pdf", relativePath: "source.pdf", in: final), at: 0)
+    }
     var manifest = baseManifest
     manifest["state"] = extractionStatus == "needs_ocr" ? "needs_attention" : "ready"
     manifest["extractionStatus"] = extractionStatus
@@ -1348,12 +1955,15 @@ private func runMaterialize(_ job: JobRequest) throws -> [String: Any] {
         "title": metadata.title,
         "authors": metadata.authors,
         "sourceType": job.source.kind,
+        "storageMode": job.source.storageMode,
+        "linkedRootPath": nullable(job.source.linkedRootPath),
+        "relativePath": nullable(job.source.relativePath),
         "metadataStatus": metadata.metadataStatus,
         "sha256": sourceHash,
         "arxivId": nullable(metadata.arxivID),
         "arxivBase": nullable(identityArxiv),
         "doi": nullable(identityDOI),
-        "pdfPath": "Library/PDFs/\(paperID).pdf",
+        "pdfPath": paperPDFPath,
         "fulltextPath": "Knowledge/fulltext/\(paperID).md",
         "cardPath": "Knowledge/cards/\(paperID).md",
         "extractionStatus": extractionStatus,
@@ -1367,11 +1977,12 @@ private func runMaterialize(_ job: JobRequest) throws -> [String: Any] {
         "libraryItemRevision": job.itemRevision,
     ]
     manifest["outputs"] = artifacts.map(\.json)
-    manifest["suggestedDestinations"] = [
-        "source.pdf": "Library/PDFs/\(paperID).pdf",
+    var suggestedDestinations = [
         "fulltext.md": "Knowledge/fulltext/\(paperID).md",
         "card.md": "Knowledge/cards/\(paperID).md",
     ]
+    if !linkedSource { suggestedDestinations["source.pdf"] = "Library/PDFs/\(paperID).pdf" }
+    manifest["suggestedDestinations"] = suggestedDestinations
     let response = try publishResult(directory: final, pipeline: pipeline, manifest: manifest)
     shouldRemoveResult = false
     return response

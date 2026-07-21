@@ -1,9 +1,11 @@
 import { createHash, randomUUID } from "node:crypto";
 import {
   copyFile,
+  lstat,
   mkdir,
   open,
   readFile,
+  realpath,
   rename,
   stat,
 } from "node:fs/promises";
@@ -15,6 +17,7 @@ export const PAPER_ID = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
 export const PROJECT_ID = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
 export const SHA256 = /^[a-f0-9]{64}$/;
 export const VERIFIED_STATUSES = new Set(["evidence_verified", "needs_attention"]);
+export const SOURCE_STORAGE_MODES = new Set(["managed", "linked"]);
 
 export function resolveSupport(explicit) {
   return path.resolve(
@@ -124,6 +127,112 @@ export function relativeManagedPath(support, absolute) {
     throw new Error(`path is not inside Liteverse support: ${absolute}`);
   }
   return relative.split(path.sep).join("/");
+}
+
+export function sourceStorageMode(entry) {
+  const mode = entry?.source?.storageMode ?? entry?.storageMode ?? "managed";
+  if (!SOURCE_STORAGE_MODES.has(mode)) {
+    throw new Error(`source storageMode must be managed or linked; received ${mode}`);
+  }
+  return mode;
+}
+
+export function resolveSourcePdfPath(support, entry, fallback) {
+  const storageMode = sourceStorageMode(entry);
+  const configured = entry?.source?.pdfPath ?? entry?.pdfPath ?? fallback;
+  if (typeof configured !== "string" || !configured.trim()) {
+    throw new Error("source pdfPath must be a non-empty string");
+  }
+  if (storageMode === "linked") {
+    if (!path.isAbsolute(configured)) {
+      throw new Error(`linked PDF path must be absolute: ${configured}`);
+    }
+    const pdfPath = path.resolve(configured);
+    if (configured !== pdfPath) {
+      throw new Error(`linked PDF path must be normalized and absolute: ${configured}`);
+    }
+    const linkedRootPath = entry?.source?.linkedRootPath ?? entry?.linkedRootPath;
+    const relativePath = entry?.source?.relativePath ?? entry?.relativePath;
+    if (typeof linkedRootPath !== "string" || !path.isAbsolute(linkedRootPath) || path.resolve(linkedRootPath) !== linkedRootPath) {
+      throw new Error(`linked root path must be normalized and absolute: ${linkedRootPath ?? "<missing>"}`);
+    }
+    if (typeof relativePath !== "string" || !relativePath || path.isAbsolute(relativePath)) {
+      throw new Error(`linked relative path must be a non-empty relative path: ${relativePath ?? "<missing>"}`);
+    }
+    const parts = relativePath.split(/[\\/]+/);
+    if (parts.some((part) => !part || part === "." || part === "..")) {
+      throw new Error(`linked relative path contains unsafe segments: ${relativePath}`);
+    }
+    if (path.resolve(linkedRootPath, ...parts) !== pdfPath) {
+      throw new Error("linked root and relative path do not resolve to source pdfPath");
+    }
+    return { storageMode, pdfPath, sourcePath: pdfPath, linkedRootPath, relativePath, parts };
+  }
+  const pdfPath = resolveManagedPath(support, configured, fallback);
+  return {
+    storageMode,
+    pdfPath,
+    sourcePath: relativeManagedPath(support, pdfPath),
+  };
+}
+
+export async function validateLinkedSourcePath(reference) {
+  if (reference.storageMode !== "linked") return reference;
+  const rootInfo = await lstat(reference.linkedRootPath);
+  if (rootInfo.isSymbolicLink() || !rootInfo.isDirectory()) {
+    throw new Error(`linked root must be a real directory, not a symbolic link: ${reference.linkedRootPath}`);
+  }
+  let cursor = reference.linkedRootPath;
+  for (const [index, part] of reference.parts.entries()) {
+    cursor = path.join(cursor, part);
+    const info = await lstat(cursor);
+    if (info.isSymbolicLink()) throw new Error(`linked source path contains a symbolic link: ${cursor}`);
+    const final = index === reference.parts.length - 1;
+    if (final ? !info.isFile() : !info.isDirectory()) {
+      throw new Error(`linked source path component has the wrong type: ${cursor}`);
+    }
+  }
+  const [rootRealPath, pdfRealPath] = await Promise.all([
+    realpath(reference.linkedRootPath),
+    realpath(reference.pdfPath),
+  ]);
+  if (rootRealPath !== reference.linkedRootPath) {
+    throw new Error(`linked root path traverses a symbolic-link ancestor: ${reference.linkedRootPath}`);
+  }
+  if (pdfRealPath !== reference.pdfPath) {
+    throw new Error(`linked PDF path traverses a symbolic-link ancestor: ${reference.pdfPath}`);
+  }
+  const relativeRealPath = path.relative(rootRealPath, pdfRealPath);
+  if (!relativeRealPath || relativeRealPath.startsWith("..") || path.isAbsolute(relativeRealPath)) {
+    throw new Error(`linked PDF real path escapes its selected root: ${reference.pdfPath}`);
+  }
+  return { ...reference, rootRealPath, pdfRealPath };
+}
+
+export async function verifyPaperSource(support, entry, artifact = null) {
+  const paperId = entry.paperId ?? entry.id;
+  const reference = await validateLinkedSourcePath(
+    resolveSourcePdfPath(support, entry, `Library/PDFs/${paperId}.pdf`),
+  );
+  const expectedSha256 = entry.source?.sha256 ?? entry.sha256 ?? artifact?.sourceSha256;
+  if (!SHA256.test(expectedSha256 ?? "")) {
+    throw new Error(`paper ${paperId} has no valid pinned source SHA-256`);
+  }
+  const recordedMode = artifact?.sourceStorageMode ?? "managed";
+  if (recordedMode !== reference.storageMode) {
+    throw new Error(`source storage mode mismatch for ${paperId}`);
+  }
+  if (reference.storageMode === "linked" && artifact?.sourcePath !== reference.sourcePath) {
+    throw new Error(`linked source path mismatch for ${paperId}`);
+  }
+  if (artifact?.sourceSha256 && artifact.sourceSha256 !== expectedSha256) {
+    throw new Error(`source revision conflict for ${paperId}`);
+  }
+  const actualSha256 = await sha256File(reference.pdfPath);
+  if (actualSha256 !== expectedSha256) {
+    throw new Error(`source PDF hash mismatch for ${paperId}`);
+  }
+  return { ...reference, sourceSha256: actualSha256 };
 }
 
 function parseScalar(raw) {
@@ -309,11 +418,10 @@ export async function snapshotPaperArtifact(support, entry, { verifyPdf = true }
     entry.fulltextPath ?? entry.artifacts?.fulltextPath,
     `Knowledge/fulltext/${paperId}.md`,
   );
-  const pdfPath = resolveManagedPath(
-    support,
-    entry.pdfPath ?? entry.source?.pdfPath,
-    `Library/PDFs/${paperId}.pdf`,
+  const sourceReference = await validateLinkedSourcePath(
+    resolveSourcePdfPath(support, entry, `Library/PDFs/${paperId}.pdf`),
   );
+  const { pdfPath, storageMode: sourceStorageMode, sourcePath } = sourceReference;
   const [cardText, fulltextText] = await Promise.all([
     readFile(cardPath, "utf8"),
     readFile(fulltextPath, "utf8"),
@@ -333,7 +441,11 @@ export async function snapshotPaperArtifact(support, entry, { verifyPdf = true }
   const artifactRoot = path.join(support, "Knowledge", "artifacts", paperId);
   const currentPath = path.join(artifactRoot, "current.json");
   const current = await readJson(currentPath, { optional: true });
-  if (current?.artifactSha256 === artifactSha256) {
+  if (
+    current?.artifactSha256 === artifactSha256
+    && (current.sourceStorageMode ?? "managed") === sourceStorageMode
+    && current.sourcePath === sourcePath
+  ) {
     const claims = buildClaims(card, current);
     const claimsText = `${JSON.stringify(claims, null, 2)}\n`;
     if (current.claimsSha256 === sha256Text(claimsText)) {
@@ -361,11 +473,12 @@ export async function snapshotPaperArtifact(support, entry, { verifyPdf = true }
     artifactRevision,
     artifactSha256,
     sourceSha256,
+    sourceStorageMode,
     cardSha256,
     fulltextSha256,
     canonicalCardPath: relativeManagedPath(support, cardPath),
     canonicalFulltextPath: relativeManagedPath(support, fulltextPath),
-    sourcePath: relativeManagedPath(support, pdfPath),
+    sourcePath,
     immutableCardPath: relativeManagedPath(support, path.join(revisionRoot, "card.md")),
     immutableFulltextPath: relativeManagedPath(support, path.join(revisionRoot, "fulltext.md")),
     immutableClaimsPath: relativeManagedPath(support, path.join(revisionRoot, "claims.json")),
@@ -392,6 +505,8 @@ export function artifactFields(artifact) {
     artifactRevision: artifact.artifactRevision,
     artifactSha256: artifact.artifactSha256,
     sourceSha256: artifact.sourceSha256,
+    sourceStorageMode: artifact.sourceStorageMode ?? "managed",
+    sourcePath: artifact.sourcePath,
     cardSha256: artifact.cardSha256,
     fulltextSha256: artifact.fulltextSha256,
     claimsSha256: artifact.claimsSha256,
@@ -403,12 +518,17 @@ export function artifactFields(artifact) {
   };
 }
 
-export async function verifyPaperArtifact(support, entry, { requireFulltext = false, requireClaims = false } = {}) {
+export async function verifyPaperArtifact(
+  support,
+  entry,
+  { requireFulltext = false, requireClaims = false, verifySource = false } = {},
+) {
   const paperId = entry.paperId ?? entry.id;
   const artifact = entry.artifact ?? entry.artifacts?.integrity ?? entry.integrity;
   if (!artifact || !Number.isInteger(artifact.artifactRevision) || !SHA256.test(artifact.artifactSha256 ?? "")) {
     throw new Error(`paper ${paperId} has no pinned artifact revision; run liteverse doctor --fix before adoption`);
   }
+  const source = verifySource ? await verifyPaperSource(support, entry, artifact) : null;
   const cardPath = resolveManagedPath(support, entry.cardPath ?? entry.artifacts?.cardPath, `Knowledge/cards/${paperId}.md`);
   const cardText = await readFile(cardPath, "utf8");
   const cardSha256 = sha256Text(cardText);
@@ -434,6 +554,7 @@ export async function verifyPaperArtifact(support, entry, { requireFulltext = fa
   return {
     paperId,
     artifact,
+    source,
     cardPath,
     cardText,
     card: parseCard(cardText, paperId),

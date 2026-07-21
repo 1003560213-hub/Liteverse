@@ -30,6 +30,10 @@ Usage:
   liteverse-cli.mjs memory search --query TEXT [--project ID | --all-projects]
   liteverse-cli.mjs task begin|complete --project ID [research-memory options]
   liteverse-cli.mjs project create-or-init --project ID [research-memory options]
+  liteverse-cli.mjs curation batch build [--item ID ...] [--char-budget N] [--max-papers 3..5] [--allow-partial]
+  liteverse-cli.mjs curation batch apply --batch FILE --decisions FILE
+  liteverse-cli.mjs curation batch adopt --result FILE [--result FILE ...] [--assignments FILE | --write-assignment-template]
+  liteverse-cli.mjs curation classify --snapshot FILE --input FILE [--output FILE]
   liteverse-cli.mjs doctor [--fix] [--quick] [--json]
   liteverse-cli.mjs index rebuild [--json]
 
@@ -125,9 +129,19 @@ async function delegateResearchMemory(support, commandArguments) {
   });
 }
 
+async function delegateCurator(support, scriptName, commandArguments) {
+  const script = resolveSkillScript("liteverse-curator", scriptName);
+  const args = [script, ...withoutSupportArguments(commandArguments), "--support-dir", support];
+  await new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, args, { stdio: "inherit", env: process.env });
+    child.once("error", reject);
+    child.once("exit", (code, signal) => code === 0 ? resolve() : reject(new Error(`curation command exited ${code ?? signal}`)));
+  });
+}
+
 async function main() {
   if (process.argv.includes("--help") || process.argv.includes("-h") || process.argv.length < 3) return help();
-  const [command, subcommand] = process.argv.slice(2);
+  const [command, subcommand, action] = process.argv.slice(2);
   const support = resolveSupport(argument("--support-dir"));
   const json = process.argv.includes("--json");
   if (command === "status") return status(support, json);
@@ -161,6 +175,18 @@ async function main() {
   }
   if (command === "project" && subcommand === "create-or-init") {
     return delegateResearchMemory(support, process.argv.slice(2));
+  }
+  if (command === "curation" && subcommand === "batch" && action === "build") {
+    return delegateCurator(support, "build-review-batch.mjs", process.argv.slice(5));
+  }
+  if (command === "curation" && subcommand === "batch" && action === "apply") {
+    return delegateCurator(support, "apply-review-batch.mjs", process.argv.slice(5));
+  }
+  if (command === "curation" && subcommand === "batch" && action === "adopt") {
+    return delegateCurator(support, "adopt-review-results.mjs", process.argv.slice(5));
+  }
+  if (command === "curation" && subcommand === "classify") {
+    return delegateCurator(support, "screen-incremental-classification.mjs", process.argv.slice(4));
   }
   if (command === "doctor") {
     const { doctorLiteverse } = await import("./lib/liteverse-doctor.mjs");

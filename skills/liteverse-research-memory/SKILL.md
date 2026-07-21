@@ -29,6 +29,11 @@ Pass `--expected-revision <n>` on coordinated writes. On a conflict, reload stat
 - Use `provenance=paperEvidence` only with a Retriever receipt containing `paperId`, `claimId`, `evidenceId`, and SHA-256 `artifactHash`.
 - Use `provenance=computationArtifact` for code and experiments. Store only path, Git commit or content/config/data hashes, command, and result summary; never copy source code, repositories, configs, or simulation data into memory.
 - Keep contradicted items and their challengers visible. A relationship does not silently overwrite epistemic state.
+- Treat App-created nebula-region notes and user knowledge cards as
+  `project_context` with `provenance=user` and `evidenceState=user_declared`.
+  Their `scope`, `presentation`, and hash-pinned `source` metadata are routing
+  and display data, never evidence. Preserve them when rebuilding projections;
+  never silently remap a missing region ID after repartitioning.
 - Never modify `Knowledge/`, `Graph/`, `Usage/`, PDF files, or Retriever receipts from this Skill.
 
 ## Resources

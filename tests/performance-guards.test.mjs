@@ -4,6 +4,7 @@ import test from "node:test";
 
 const componentPath = new URL("../app/universe/LiteratureUniverse.tsx", import.meta.url);
 const nativePath = new URL("../macos/LiteverseApp.m", import.meta.url);
+const packageScriptPath = new URL("../scripts/build-macos-app.sh", import.meta.url);
 
 test("catalog persistence cannot feed workspace health back into itself", async () => {
   const [component, nativeBridge] = await Promise.all([
@@ -32,7 +33,10 @@ test("workspace integrity scans are cached and allocation bounded", async () => 
 });
 
 test("cinematic renderer has explicit memory and frame budgets", async () => {
-  const component = await readFile(componentPath, "utf8");
+  const [component, packageScript] = await Promise.all([
+    readFile(componentPath, "utf8"),
+    readFile(packageScriptPath, "utf8"),
+  ]);
 
   assert.match(component, /assignedNebulaAssetIds/);
   assert.match(component, /if \(!assignedNebulaAssetIds\.has\(asset\.id\)\) continue/);
@@ -46,4 +50,26 @@ test("cinematic renderer has explicit memory and frame budgets", async () => {
   assert.match(component, /categoryFilterRef\.current/);
   assert.match(component, /backdropCanvas\.width = 0/);
   assert.match(component, /regionNebulaSprites\.clear\(\)/);
+  assert.match(component, /const maximumDimension = 420/);
+  assert.match(component, /for \(const assetId of new Set[\s\S]*await loadGalaxySprite\(assetId\)/);
+  assert.match(component, /liteverse-black-hole-transparent\.png/);
+  assert.match(component, /const ALL_VIEW_AMBIENT_PAPERS_PER_NEBULA = 12/);
+  assert.match(component, /const FOCUSED_AMBIENT_PAPERS_PER_NEBULA = 48/);
+  assert.match(component, /ambientPaperSelections = new Map/);
+  assert.match(
+    component,
+    /const galaxyPositions = new Map\([\s\S]*containPointInNebulaEllipse\(rawPoint, categoryFrame, 0\.58, 0\.34\)/,
+  );
+  assert.match(component, /const source = galaxyPositions\.get\(sourceGalaxy\.id\)!/);
+  assert.match(component, /const target = galaxyPositions\.get\(targetGalaxy\.id\)!/);
+  const ambientStart = component.indexOf("const showAmbientPaperFlashes =");
+  const ambientEnd = component.indexOf("projectedGalaxiesRef.current", ambientStart);
+  assert.ok(ambientStart >= 0 && ambientEnd > ambientStart);
+  const ambientSection = component.slice(ambientStart, ambientEnd);
+  assert.match(ambientSection, /for \(const paperId of ambientPaperIds\)/);
+  assert.doesNotMatch(ambientSection, /for \(const paper of renderUniverse\.papers\)/);
+  assert.match(ambientSection, /containPointInNebulaEllipse/);
+  assert.doesNotMatch(component, /getImageData\(/);
+  assert.match(packageScript, /for GALAXY_ASSET in .*web\/galaxies.*\.png/);
+  assert.match(packageScript, /sips -Z 768 .*liteverse-black-hole-transparent\.png/);
 });

@@ -23,6 +23,7 @@ Search freely; count only papers that the task actually adopts.
 - Do not count search results, Curator reads, App clicks, or manual Markdown opens.
 - Do not reinterpret an App local preview as an adopted-evidence receipt. It remains non-adopting even when it contains verified claim metadata.
 - Verify artifact revision and hashes before appending usage. On a mismatch, stop, do not count, and run `liteverse doctor`.
+- For a folder-linked PDF, also verify its registered root, relative path, real path, storage mode, and live SHA-256 before adoption. A moved, missing, changed, or symlinked source must fail before usage is appended.
 - Never adopt a legacy provisional card section. It is excluded from the FTS index and formal Context Packs.
 - Do not edit `Usage/events.jsonl` or `Usage/counts.json` by hand. Use `scripts/rebuild-usage.mjs` only to reconstruct the cache from the append-only ledger.
 - Refuse adopted reads when neither `LITEVERSE_TASK_ID` nor `CODEX_THREAD_ID` is available. The user may explicitly provide `--task-id` only for a controlled test or recovery.

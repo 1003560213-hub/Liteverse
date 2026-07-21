@@ -1,6 +1,47 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
+import { ScientificText } from "./ScientificText";
+
+export type LibraryScreeningClaim = {
+  claimId: string;
+  text: string;
+  routingOnly: true;
+  type?: string;
+  section?: string;
+  verificationStatus?: string;
+  artifactRevision?: number;
+  artifactSha256?: string;
+  rank?: number;
+  evidence?: Array<Record<string, unknown>>;
+};
+
+export type LibraryScreeningCandidate = {
+  paperId: string;
+  rank: number;
+  routingOnly?: true;
+  title?: string;
+  verificationStatus?: string;
+  primaryCategory?: string;
+  secondaryCategory?: string;
+  artifactRevision?: number;
+  artifactSha256?: string;
+  snippet?: string;
+  matchingClaims?: LibraryScreeningClaim[];
+};
+
+export type StrictDuplicateResolution = {
+  schemaVersion: 1;
+  method: "strict_identity_v1";
+  sourceRevision: number;
+  resolvedRevision: number;
+  jobId: string;
+  resultSha256: string;
+  manifestPath: string;
+  duplicateOfPaperId: string;
+  matchedBy: string[];
+  resolvedAt: string;
+};
 
 export type LibraryItem = {
   id: string;
@@ -19,6 +60,7 @@ export type LibraryItem = {
     | "organized"
     | "needs_attention";
   revision: number;
+  verificationStatus?: string;
   preparation?: {
     schemaVersion: 1;
     state: "queued" | "ready" | "needs_attention";
@@ -29,8 +71,16 @@ export type LibraryItem = {
     reviewPacketPath?: string;
     resultState?: "ready" | "duplicate" | "needs_attention";
     extractionStatus?: "extracted" | "needs_ocr";
-    screeningMethod?: "fts5_bm25_title_v1";
-    screeningCandidates?: Array<{ paperId: string; rank: number }>;
+    screeningMethod?: "fts5_bm25_title_v1" | "fts5_bm25_review_packet_v2";
+    screeningAnchorIds?: string[];
+    screeningIndexFingerprint?: string;
+    screeningCandidates?: LibraryScreeningCandidate[];
+    duplicateOf?: { paperId: string };
+    deduplication?: {
+      method: "strict_identity_v1";
+      matchedBy: string[];
+      strictKeys: Record<string, string | null>;
+    };
     reason?: string;
     queuedAt?: string;
     completedAt?: string;
@@ -38,9 +88,30 @@ export type LibraryItem = {
   createdAt: string;
   updatedAt: string;
   organizedAt?: string;
+  disposition?: "duplicate" | "no-link";
+  duplicateOfPaperId?: string;
+  autoResolution?: StrictDuplicateResolution;
   graphPaperId?: string;
   catalogSource?: "universe";
   localPath?: string;
+  source?: {
+    kind: "pdf" | "arxiv";
+    storageMode?: "managed" | "linked";
+    pdfPath?: string;
+    linkedRootPath?: string;
+    relativePath?: string;
+    sha256?: string;
+    catalogMetadata?: {
+      title?: string;
+      authors?: string[];
+      doi?: string;
+    };
+    provenance?: {
+      catalog: "zotero";
+      itemKey: string;
+      attachmentKey: string;
+    };
+  };
   citekey?: string;
   verificationLabel?: string;
   verificationTone?: "verified" | "progress" | "draft" | "attention";
@@ -116,6 +187,24 @@ export type MemoryItem = {
   state: "active" | "superseded" | "retired" | string;
   evidenceState: "user_declared" | "provisional" | "supported" | "contradicted" | string;
   provenance: string | string[];
+  scope?: {
+    kind?: string;
+    categoryId?: string;
+    categoryNameAtAssignment?: string;
+    graphRevisionAtAssignment?: number;
+  };
+  presentation?: {
+    documentId?: string;
+    kind?: "note" | "knowledge_card" | string;
+    format?: "markdown" | "plain_text" | string;
+  };
+  source?: {
+    kind?: string;
+    input?: string;
+    fileName?: string;
+    byteLength?: number;
+    contentSha256?: string;
+  };
   supersedes?: string[];
   contradicts?: string[];
   createdAt?: string;
@@ -304,7 +393,7 @@ type SettingsDrawerProps = {
   open: boolean;
   workspace: WorkspaceState;
   researchDraft: string;
-  busyAction: "pdf" | "arxiv" | "research" | null;
+  busyAction: "pdf" | "folder" | "arxiv" | "research" | "memory-document" | null;
   notice: string;
   error: string;
   activeTab: SettingsTab;
@@ -314,9 +403,23 @@ type SettingsDrawerProps = {
   onSelectProject: (projectId: string) => void;
   onCreateProject: (name: string) => void;
   onPickPDF: () => void;
+  onPickLiteratureFolder: () => void;
+  onPickZoteroLibrary: () => void;
   onSaveArxiv: (value: string) => void;
   onResearchDraftChange: (value: string) => void;
   onSaveResearch: () => void;
+  regions: Array<{ id: string; name: string }>;
+  onSaveRegionDocument: (input: {
+    categoryId: string;
+    kind: "note" | "knowledge_card";
+    format: "markdown" | "plain_text";
+    title: string;
+    content: string;
+  }) => void;
+  onImportRegionDocument: (input: {
+    categoryId: string;
+    kind: "note" | "knowledge_card";
+  }) => void;
   localContextPreview: ContextPack | null;
   contextPreviewBusy: boolean;
   contextPreviewError: string;
@@ -418,9 +521,14 @@ export function SettingsDrawer({
   onSelectProject,
   onCreateProject,
   onPickPDF,
+  onPickLiteratureFolder,
+  onPickZoteroLibrary,
   onSaveArxiv,
   onResearchDraftChange,
   onSaveResearch,
+  regions,
+  onSaveRegionDocument,
+  onImportRegionDocument,
   localContextPreview,
   contextPreviewBusy,
   contextPreviewError,
@@ -437,7 +545,7 @@ export function SettingsDrawer({
   onExportWorkspace,
   onImportWorkspace,
 }: SettingsDrawerProps) {
-  const [uploadSource, setUploadSource] = useState<"pdf" | "arxiv">("pdf");
+  const [uploadSource, setUploadSource] = useState<"pdf" | "folder" | "arxiv">("pdf");
   const [arxivValue, setArxivValue] = useState("");
   const [arxivError, setArxivError] = useState("");
   const [libraryQuery, setLibraryQuery] = useState("");
@@ -448,7 +556,16 @@ export function SettingsDrawer({
   const [contextBudget, setContextBudget] = useState(12_000);
   const [selectedContextId, setSelectedContextId] = useState("");
   const [copiedPartitionOptionId, setCopiedPartitionOptionId] = useState("");
+  const [regionDocumentCategoryId, setRegionDocumentCategoryId] = useState("");
+  const [regionDocumentKind, setRegionDocumentKind] = useState<"note" | "knowledge_card">("note");
+  const [regionDocumentFormat, setRegionDocumentFormat] = useState<"markdown" | "plain_text">("markdown");
+  const [regionDocumentTitle, setRegionDocumentTitle] = useState("");
+  const [regionDocumentContent, setRegionDocumentContent] = useState("");
   const titleRef = useRef<HTMLHeadingElement>(null);
+  const regionDocumentByteLength = new TextEncoder().encode(regionDocumentContent).length;
+  const effectiveRegionDocumentCategoryId = regions.some(
+    (region) => region.id === regionDocumentCategoryId,
+  ) ? regionDocumentCategoryId : regions[0]?.id || "";
 
   useEffect(() => {
     if (!open) return;
@@ -687,7 +804,7 @@ export function SettingsDrawer({
             <section className="settings-card literature-upload-card">
               <div className="settings-section-heading">
                 <span className="section-label">LITERATURE UPLOAD</span>
-                <p>Choose one source type, then upload a PDF or register an arXiv link.</p>
+                <p>Import individual PDFs, link an existing local folder, or register an arXiv paper.</p>
               </div>
 
               <div className="upload-source-switch" role="tablist" aria-label="Upload source">
@@ -713,6 +830,17 @@ export function SettingsDrawer({
                 >
                   arXiv link
                 </button>
+                <button
+                  type="button"
+                  id="upload-tab-folder"
+                  role="tab"
+                  aria-selected={uploadSource === "folder"}
+                  aria-controls="upload-panel-folder"
+                  className={uploadSource === "folder" ? "is-active" : ""}
+                  onClick={() => setUploadSource("folder")}
+                >
+                  Local folder
+                </button>
               </div>
 
               {uploadSource === "pdf" ? (
@@ -724,6 +852,24 @@ export function SettingsDrawer({
                   <button type="button" disabled={busyAction !== null} onClick={onPickPDF}>
                     {busyAction === "pdf" ? "Importing…" : "Choose PDF"}
                   </button>
+                </div>
+              ) : uploadSource === "folder" ? (
+                <div id="upload-panel-folder" className="upload-method upload-source-panel" role="tabpanel" aria-labelledby="upload-tab-folder">
+                  <div>
+                    <span className="upload-icon is-folder">DIR</span>
+                    <span>
+                      <b>Address of your local literature</b>
+                      <small>Ordinary PDFs are linked in place without duplicate copies. Connect Zotero to discover its stored PDF attachments read-only; external linked-file attachments remain unchanged.</small>
+                    </span>
+                  </div>
+                  <div className="upload-folder-actions">
+                    <button type="button" disabled={busyAction !== null} onClick={onPickLiteratureFolder}>
+                      {busyAction === "folder" ? "Scanning…" : "Choose folder"}
+                    </button>
+                    <button type="button" disabled={busyAction !== null} onClick={onPickZoteroLibrary}>
+                      {busyAction === "folder" ? "Please wait…" : "Connect Zotero"}
+                    </button>
+                  </div>
                 </div>
               ) : (
                 <label id="upload-panel-arxiv" className="arxiv-input upload-source-panel" role="tabpanel" aria-labelledby="upload-tab-arxiv">
@@ -809,11 +955,13 @@ export function SettingsDrawer({
                           : item.catalogSource === "universe"
                             ? `${item.citekey || item.graphPaperId || "Organized paper"} · Local PDF`
                             : item.sourceType === "pdf"
-                              ? "arXiv ID pending"
+                              ? item.source?.storageMode === "linked"
+                                ? `Linked in place · ${item.source.relativePath || item.originalFilename || "local PDF"}`
+                                : "arXiv ID pending"
                               : `arXiv ${item.arxivId || "awaiting lookup"}`}
                       </span>
                       <footer>
-                        <small>{item.catalogSource === "universe" ? "Universe paper" : item.sourceType === "pdf" ? "PDF" : "arXiv"}</small>
+                        <small>{item.catalogSource === "universe" ? "Universe paper" : item.sourceType === "pdf" ? item.source?.storageMode === "linked" ? "Linked PDF" : "PDF" : "arXiv"}</small>
                         <small className={`library-status ${item.status}`}>{statusLabels[item.status]}</small>
                         {item.preparation && (
                           <small
@@ -929,6 +1077,100 @@ export function SettingsDrawer({
               <p className="settings-boundary">Saving updates this local research memory and preserves its revision history.</p>
             </section>
 
+            <section className="settings-card region-document-card">
+              <div className="settings-section-heading">
+                <span className="section-label">NEBULA NOTES &amp; KNOWLEDGE CARDS</span>
+                <p>Add personal knowledge to a nebula black hole. These documents become orbiting note stars and remain separate from paper evidence.</p>
+              </div>
+              {regions.length > 0 ? (
+                <>
+                  <div className="region-document-controls">
+                    <label>
+                      <span>Nebula</span>
+                      <select
+                        value={effectiveRegionDocumentCategoryId}
+                        onChange={(event) => setRegionDocumentCategoryId(event.target.value)}
+                      >
+                        {regions.map((region) => <option key={region.id} value={region.id}>{region.name}</option>)}
+                      </select>
+                    </label>
+                    <label>
+                      <span>Document type</span>
+                      <select
+                        value={regionDocumentKind}
+                        onChange={(event) => setRegionDocumentKind(event.target.value as "note" | "knowledge_card")}
+                      >
+                        <option value="note">Note</option>
+                        <option value="knowledge_card">Knowledge Card</option>
+                      </select>
+                    </label>
+                    <label>
+                      <span>Text format</span>
+                      <select
+                        value={regionDocumentFormat}
+                        onChange={(event) => setRegionDocumentFormat(event.target.value as "markdown" | "plain_text")}
+                      >
+                        <option value="markdown">Markdown</option>
+                        <option value="plain_text">Plain text</option>
+                      </select>
+                    </label>
+                  </div>
+                  <label className="region-document-title">
+                    <span>Title</span>
+                    <input
+                      value={regionDocumentTitle}
+                      onChange={(event) => setRegionDocumentTitle(event.target.value)}
+                      placeholder="For example: Core-radius convention used in this project"
+                      maxLength={1_000}
+                    />
+                  </label>
+                  <label className="region-document-editor">
+                    <span>Content</span>
+                    <textarea
+                      value={regionDocumentContent}
+                      onChange={(event) => setRegionDocumentContent(event.target.value)}
+                      placeholder="Write or paste Markdown, equations, assumptions, or a personal knowledge card…"
+                      rows={10}
+                      spellCheck
+                    />
+                    <small className={regionDocumentByteLength > 1_048_576 ? "is-over-limit" : ""}>{regionDocumentByteLength.toLocaleString("en-US")} bytes · 1 MiB maximum</small>
+                  </label>
+                  <div className="region-document-actions">
+                    <button
+                      type="button"
+                      disabled={!effectiveRegionDocumentCategoryId || !regionDocumentTitle.trim() || !regionDocumentContent.trim() || regionDocumentByteLength > 1_048_576 || busyAction !== null}
+                      onClick={() => onSaveRegionDocument({
+                        categoryId: effectiveRegionDocumentCategoryId,
+                        kind: regionDocumentKind,
+                        format: regionDocumentFormat,
+                        title: regionDocumentTitle.trim(),
+                        content: regionDocumentContent,
+                      })}
+                    >
+                      {busyAction === "memory-document" ? "Saving…" : "Add to black hole"}
+                    </button>
+                    <button
+                      type="button"
+                      className="is-secondary"
+                      disabled={!effectiveRegionDocumentCategoryId || busyAction !== null}
+                      onClick={() => onImportRegionDocument({
+                        categoryId: effectiveRegionDocumentCategoryId,
+                        kind: regionDocumentKind,
+                      })}
+                    >
+                      Import .md or .txt
+                    </button>
+                  </div>
+                  <p className="settings-boundary">Imported files are read once and stored as project memory; only the basename and content hash are retained. User documents are never marked as scientifically verified paper evidence.</p>
+                </>
+              ) : (
+                <div className="settings-empty is-compact">
+                  <span>●</span><b>No nebula regions yet</b>
+                  <p>Organize the first literature Refresh before assigning a personal document to a black hole.</p>
+                </div>
+              )}
+            </section>
+
             <section className="memory-status-card settings-card">
               <div>
                 <span className={`memory-state ${research.status}`} />
@@ -946,7 +1188,7 @@ export function SettingsDrawer({
               {research.formal.text && (
                 <details>
                   <summary>View current curated memory</summary>
-                  <pre>{research.formal.text}</pre>
+                  <ScientificText as="pre">{research.formal.text}</ScientificText>
                 </details>
               )}
             </section>
@@ -965,12 +1207,12 @@ export function SettingsDrawer({
                   return (
                     <article key={id} className={`memory-card state-${item.state} evidence-${item.evidenceState}`}>
                       <header>
-                        <span>{item.type}</span>
+                        <span>{item.presentation?.kind === "knowledge_card" ? "knowledge card" : item.presentation?.kind || item.type}</span>
                         <i>{item.state}</i>
                         <i>{item.evidenceState}</i>
                       </header>
                       <b>{item.title || item.statement || item.content || "Untitled memory"}</b>
-                      {item.title && <p>{item.content || item.statement}</p>}
+                      {item.title && <ScientificText as="p">{item.content || item.statement || ""}</ScientificText>}
                       <footer>
                         <small>{provenance || "unknown provenance"}</small>
                         <small>{updatedLabel(item.updatedAt || item.createdAt || "")}</small>

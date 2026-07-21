@@ -143,6 +143,22 @@ async function createFinalizationFixture({ paperCount = 1, transformCard, pageMa
   return { support, snapshotPath };
 }
 
+test("shared paper finalization does not require a fabricated project role", async () => {
+  const { support, snapshotPath } = await createFinalizationFixture({
+    transformCard: (card) => card.replace(
+      "- Use this as the verified baseline. [E1]",
+      "_No project-specific role has been assigned._",
+    ),
+  });
+  try {
+    await execFileAsync("python3", [script, "--support-dir", support, "--snapshot", snapshotPath]);
+    const snapshot = JSON.parse(await readFile(snapshotPath, "utf8"));
+    assert.match(snapshot.papers[0].projectRole, /No project-specific role has been assigned/);
+  } finally {
+    await rm(support, { recursive: true, force: true });
+  }
+});
+
 test("finalization closes card/fulltext/snapshot metadata without touching current graph", async () => {
   const support = await mkdtemp(path.join(tmpdir(), "liteverse-finalize-"));
   try {

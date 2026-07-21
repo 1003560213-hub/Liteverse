@@ -139,7 +139,10 @@ export async function buildContextPack(support, {
   let used = 0;
   for (const result of search.results) {
     const paper = await readIndexedPaper(support, result.paperId);
-    const verified = await verifyPaperArtifact(support, paper, { requireClaims: true });
+    const verified = await verifyPaperArtifact(support, paper, {
+      requireClaims: true,
+      verifySource: true,
+    });
     const candidateClaims = result.matchingClaims.length
       ? result.matchingClaims
       : (verified.claims.claims ?? []).filter((claim) => claim.type !== "project_role").slice(0, 2);

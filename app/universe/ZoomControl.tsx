@@ -7,7 +7,7 @@ type ZoomControlProps = {
 };
 
 export function ZoomControl({ value, shifted, onChange }: ZoomControlProps) {
-  const setBounded = (next: number) => onChange(Math.max(0.68, Math.min(1.9, next)));
+  const setBounded = (next: number) => onChange(Math.max(0.68, Math.min(3.2, next)));
   const percentage = Math.round(value * 100);
 
   return (
@@ -16,7 +16,7 @@ export function ZoomControl({ value, shifted, onChange }: ZoomControlProps) {
       <input
         type="range"
         min="0.68"
-        max="1.9"
+        max="3.2"
         step="0.01"
         value={value}
         onChange={(event) => setBounded(Number(event.target.value))}

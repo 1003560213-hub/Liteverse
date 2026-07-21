@@ -6,6 +6,16 @@ export type NebulaAsset = {
   enabled: boolean;
 };
 
+export type GalaxyRecord = {
+  id: string;
+  categoryId: string;
+  name: string;
+  description: string;
+  position: Vector3;
+  assetId: string;
+  seedPaperId: string;
+};
+
 export type Category = {
   id: string;
   kind?: "macro" | "system";
@@ -45,10 +55,23 @@ export type PaperIntegrityIssue =
 
 export type PaperSource = {
   kind: "pdf" | "arxiv";
+  storageMode?: "managed" | "linked";
   pdfPath?: string;
+  linkedRootPath?: string;
+  relativePath?: string;
   sha256?: string;
   arxivId?: string;
   doi?: string;
+  catalogMetadata?: {
+    title?: string;
+    authors?: string[];
+    doi?: string;
+  };
+  provenance?: {
+    catalog: "zotero";
+    itemKey: string;
+    attachmentKey: string;
+  };
 };
 
 export type PaperArtifacts = {
@@ -80,6 +103,7 @@ export type Paper = {
   year: number;
   primaryCategory: string;
   categoryIds: string[];
+  galaxyId?: string;
   position: Vector3;
   useCount?: number;
   /** Legacy seed flag. It must never be treated as evidence verification. */
@@ -146,13 +170,21 @@ export type UniverseGraph = {
   updated: string;
   temperaturePolicy?: Record<string, unknown>;
   usagePolicy?: Record<string, unknown>;
+  hierarchy?: {
+    schemaVersion: "liteverse-hierarchy-v1" | string;
+    algorithm: string;
+    assignmentSha256?: string;
+    relationProjection?: string;
+  };
   visuals: {
     nebulaAssignmentVersion?: number;
     nebulaAssetCatalogVersion?: number;
     nebulaAssignmentSeed: string;
     nebulaAssets: NebulaAsset[];
+    galaxyAssignmentSeed?: string;
   };
   categories: Category[];
+  galaxies?: GalaxyRecord[];
   papers: Paper[];
   relations: Relation[];
 };
@@ -220,6 +252,7 @@ export function paperVerificationState(paper: Paper, integrityIssue?: PaperInteg
   const sourceSha256 = paper.source?.sha256 || paper.verificationSummary?.sourceSha256;
   const fulltextPath = paperFulltextPath(paper);
   const cardPath = paperCardPath(paper);
+  const sourceLabel = paper.source?.storageMode === "linked" ? "linked PDF" : "managed PDF";
   const hasVerificationClosure = Boolean(
     status === "evidence_verified" &&
     sourceSha256 &&
@@ -229,13 +262,13 @@ export function paperVerificationState(paper: Paper, integrityIssue?: PaperInteg
   );
 
   if (integrityIssue === "source_missing") {
-    return { status: "needs_attention", tone: "attention" as const, label: "Source missing", detail: "The managed PDF source is unavailable" };
+    return { status: "needs_attention", tone: "attention" as const, label: "Source missing", detail: `The ${sourceLabel} source is unavailable` };
   }
   if (integrityIssue === "source_hash_missing") {
-    return { status: "needs_attention", tone: "attention" as const, label: "Source hash missing", detail: "The graph has no SHA-256 for the managed PDF" };
+    return { status: "needs_attention", tone: "attention" as const, label: "Source hash missing", detail: `The graph has no SHA-256 for the ${sourceLabel}` };
   }
   if (integrityIssue === "source_hash_mismatch") {
-    return { status: "needs_attention", tone: "attention" as const, label: "Source hash mismatch", detail: "The managed PDF SHA-256 does not match the graph record" };
+    return { status: "needs_attention", tone: "attention" as const, label: "Source hash mismatch", detail: `The ${sourceLabel} SHA-256 does not match the graph record` };
   }
   if (integrityIssue === "card_missing") {
     return { status: "needs_attention", tone: "attention" as const, label: "Knowledge card missing", detail: "The knowledge card referenced by the graph is unavailable" };

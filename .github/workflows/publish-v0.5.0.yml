@@ -1,0 +1,148 @@
+name: Publish Liteverse 0.5.0
+
+on:
+  push:
+    tags:
+      - v0.5.0
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: publish-v0.5.0
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    if: github.ref == 'refs/tags/v0.5.0'
+    runs-on: macos-14
+    timeout-minutes: 45
+    steps:
+      - name: Check out reviewed tag
+        uses: actions/checkout@v5
+        with:
+          ref: v0.5.0
+          fetch-depth: 0
+          path: source
+          persist-credentials: false
+
+      - name: Use Node.js 24
+        uses: actions/setup-node@v5
+        with:
+          node-version: 24.13.1
+          cache: npm
+          cache-dependency-path: source/package-lock.json
+
+      - name: Use Python 3.12
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: source/requirements.txt
+
+      - name: Install dependencies
+        working-directory: source
+        run: |
+          python -m pip install --requirement requirements.txt
+          npm ci
+
+      - name: Verify tagged source
+        working-directory: source
+        run: |
+          npm run verify:public
+          npm run lint
+          npm run desktop:package
+          npm test
+
+      - name: Assemble release assets
+        env:
+          RELEASE_TAG: v0.5.0
+          RELEASE_VERSION: 0.5.0
+        run: |
+          set -euo pipefail
+          release_dir="$GITHUB_WORKSPACE/release"
+          bundle_dir="$release_dir/Liteverse-${RELEASE_VERSION}-macos-arm64"
+          mkdir -p "$bundle_dir"
+
+          ditto "$GITHUB_WORKSPACE/source/Liteverse.app" "$bundle_dir/Liteverse.app"
+          cp "$GITHUB_WORKSPACE/source/LICENSE" "$bundle_dir/LICENSE"
+          cp "$GITHUB_WORKSPACE/source/ASSET_LICENSES.md" "$bundle_dir/ASSET_LICENSES.md"
+          cp "$GITHUB_WORKSPACE/source/docs/releases/macos-install.txt" "$bundle_dir/README.txt"
+
+          ditto -c -k --sequesterRsrc --keepParent \
+            "$bundle_dir" \
+            "$release_dir/Liteverse-${RELEASE_VERSION}-macos-arm64.zip"
+
+          git -C "$GITHUB_WORKSPACE/source" archive \
+            --format=zip \
+            --prefix="Liteverse-${RELEASE_VERSION}/" \
+            --output="$release_dir/Liteverse-${RELEASE_VERSION}-source.zip" \
+            "$RELEASE_TAG"
+
+          cd "$release_dir"
+          shasum -a 256 \
+            "Liteverse-${RELEASE_VERSION}-macos-arm64.zip" \
+            "Liteverse-${RELEASE_VERSION}-source.zip" > SHA256SUMS
+
+          commit="$(git -C "$GITHUB_WORKSPACE/source" rev-parse "$RELEASE_TAG^{commit}")"
+          app_version="$(defaults read "$bundle_dir/Liteverse.app/Contents/Info" CFBundleShortVersionString)"
+          app_build="$(defaults read "$bundle_dir/Liteverse.app/Contents/Info" CFBundleVersion)"
+          app_arch="$(file -b "$bundle_dir/Liteverse.app/Contents/MacOS/Liteverse")"
+          worker_arch="$(file -b "$bundle_dir/Liteverse.app/Contents/MacOS/LiteverseLocalWorker")"
+          lipo "$bundle_dir/Liteverse.app/Contents/MacOS/Liteverse" -verify_arch arm64
+          lipo "$bundle_dir/Liteverse.app/Contents/MacOS/LiteverseLocalWorker" -verify_arch arm64
+          node -e 'const fs = require("fs"); const seed = JSON.parse(fs.readFileSync(process.argv[1], "utf8")); for (const key of ["categories", "papers", "relations"]) { if (!Array.isArray(seed[key]) || seed[key].length !== 0) throw new Error(`non-empty public seed: ${key}`); }' \
+            "$bundle_dir/Liteverse.app/Contents/Resources/seed-universe.json"
+          test -d "$bundle_dir/Liteverse.app/Contents/Resources/seed-papers"
+          test -z "$(find "$bundle_dir/Liteverse.app/Contents/Resources/seed-papers" -type f -print -quit)"
+          {
+            printf 'Liteverse %s — Developer Preview\n' "$RELEASE_VERSION"
+            printf 'Tag: %s\n' "$RELEASE_TAG"
+            printf 'Commit: %s\n' "$commit"
+            printf 'App version: %s\n' "$app_version"
+            printf 'App build: %s\n' "$app_build"
+            printf 'Runner: macos-14\n'
+            printf 'Signing: ad-hoc; not notarized\n'
+            printf 'Main executable: %s\n' "$app_arch"
+            printf 'Local Worker: %s\n' "$worker_arch"
+            printf 'Public seed: 0 regions, 0 papers, 0 relations\n'
+            printf 'Checks: privacy, English source, lint, package, full test suite, code signatures\n'
+          } > RELEASE-MANIFEST.txt
+
+          shasum -a 256 -c SHA256SUMS
+          unzip -t "Liteverse-${RELEASE_VERSION}-macos-arm64.zip"
+          unzip -t "Liteverse-${RELEASE_VERSION}-source.zip"
+          codesign --verify --deep --strict "$bundle_dir/Liteverse.app"
+
+      - name: Publish prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          release_dir="$GITHUB_WORKSPACE/release"
+          notes="$GITHUB_WORKSPACE/source/docs/releases/v0.5.0.md"
+          assets=(
+            "$release_dir/Liteverse-0.5.0-macos-arm64.zip"
+            "$release_dir/Liteverse-0.5.0-source.zip"
+            "$release_dir/SHA256SUMS"
+            "$release_dir/RELEASE-MANIFEST.txt"
+          )
+
+          if gh release view v0.5.0 --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload v0.5.0 "${assets[@]}" \
+              --clobber \
+              --repo "$GITHUB_REPOSITORY"
+            gh release edit v0.5.0 \
+              --title "Liteverse 0.5.0 — Developer Preview" \
+              --notes-file "$notes" \
+              --prerelease \
+              --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create v0.5.0 "${assets[@]}" \
+              --verify-tag \
+              --title "Liteverse 0.5.0 — Developer Preview" \
+              --notes-file "$notes" \
+              --prerelease \
+              --repo "$GITHUB_REPOSITORY"
+          fi

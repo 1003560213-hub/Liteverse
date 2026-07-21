@@ -13,6 +13,13 @@ Keep epistemic status separate from origin:
 
 `supported` and `contradicted` require exact paper evidence or a reproducible computation artifact. A paper receipt has `paperId`, `claimId`, `evidenceId`, `artifactHash`, and optional `artifactRevision` and `locator`. The Skill validates the receipt but never opens the referenced paper artifact.
 
+A region document labelled “knowledge card” is still user-authored project
+memory. The label controls presentation only: the App must construct it as
+`user/user_declared`, with no paper receipt or computation artifact, and must
+not expose a control that upgrades it to `supported`. Scientific restructuring
+or verification requires a later append-only Research Memory event following
+the ordinary evidence rules.
+
 For a code or experiment record, store only:
 
 - `kind`: `code` or `experiment`
@@ -32,4 +39,3 @@ Do not store file contents, patches, repository snapshots, configurations, datas
 - Reject unknown relationship targets, self-links, duplicate IDs, attempts to supersede non-active memory, and stale expected revisions.
 
 When an AI result conflicts with a supported item, preserve the result as provisional and link the contradiction. Do not downgrade the supported item without new paper evidence or a reproducible computation artifact.
-

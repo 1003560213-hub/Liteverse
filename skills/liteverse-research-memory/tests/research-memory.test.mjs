@@ -7,6 +7,11 @@ import path from "node:path";
 import { promisify } from "node:util";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
+import {
+  applyEvents,
+  sha256,
+  validateMemoryDraft,
+} from "../scripts/_memory-store.mjs";
 
 const execFileAsync = promisify(execFile);
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -227,4 +232,142 @@ test("multi-project memory remains append-only, revision guarded, and task IDs s
   } finally {
     await rm(support, { recursive: true, force: true });
   }
+});
+
+test("region notes and user knowledge cards remain user-declared, revision-scoped memory", () => {
+  const content = "# Soliton response\n\nUser observation pending scientific review.\n";
+  const regionMemory = {
+    memoryId: "mem-region-doc-first",
+    type: "project_context",
+    title: "Soliton response notes",
+    content,
+    state: "active",
+    evidenceState: "user_declared",
+    provenance: "user",
+    supersedes: [],
+    contradicts: [],
+    paperEvidence: [],
+    scope: {
+      kind: "nebula_region",
+      categoryId: "soliton-dynamics",
+      categoryNameAtAssignment: "Soliton Dynamics",
+      graphRevisionAtAssignment: 12,
+    },
+    presentation: {
+      documentId: "regiondoc-soliton-dynamics",
+      kind: "knowledge_card",
+      format: "markdown",
+    },
+    source: {
+      kind: "app_region_document",
+      input: "file_import",
+      fileName: "soliton-notes.md",
+      byteLength: Buffer.byteLength(content, "utf8"),
+      contentSha256: sha256(content),
+    },
+  };
+
+  const validated = validateMemoryDraft(regionMemory);
+  assert.equal(validated.scope.graphRevisionAtAssignment, 12);
+  assert.equal(validated.presentation.kind, "knowledge_card");
+  assert.equal(validated.source.fileName, "soliton-notes.md");
+
+  assert.throws(
+    () => validateMemoryDraft({ ...regionMemory, evidenceState: "provisional" }),
+    /remain user\/user_declared/,
+  );
+  assert.throws(
+    () => validateMemoryDraft({
+      ...regionMemory,
+      source: { ...regionMemory.source, contentSha256: "a".repeat(64) },
+    }),
+    /contentSha256 does not match/,
+  );
+  assert.throws(
+    () => validateMemoryDraft({
+      ...regionMemory,
+      source: { ...regionMemory.source, fileName: "soliton-notes.txt" },
+    }),
+    /format must match/,
+  );
+
+  const replacement = {
+    ...regionMemory,
+    memoryId: "mem-region-doc-second",
+    content: `${content}\nEdited after checking the simulation setup.\n`,
+    supersedes: [regionMemory.memoryId],
+    source: {
+      kind: "app_region_document",
+      input: "manual",
+      byteLength: Buffer.byteLength(`${content}\nEdited after checking the simulation setup.\n`, "utf8"),
+      contentSha256: sha256(`${content}\nEdited after checking the simulation setup.\n`),
+    },
+  };
+  const timestamp = "2026-07-20T00:00:00.000Z";
+  const state = applyEvents("project-default", [
+    {
+      schemaVersion: 1,
+      eventId: "event-project-init",
+      timestamp,
+      projectId: "project-default",
+      revision: 1,
+      type: "project_initialized",
+      name: "Default project",
+      description: "",
+    },
+    {
+      schemaVersion: 1,
+      eventId: "event-region-first",
+      timestamp,
+      projectId: "project-default",
+      revision: 2,
+      type: "memory_recorded",
+      memory: regionMemory,
+    },
+    {
+      schemaVersion: 1,
+      eventId: "event-region-second",
+      timestamp: "2026-07-20T00:01:00.000Z",
+      projectId: "project-default",
+      revision: 3,
+      type: "memory_recorded",
+      memory: replacement,
+    },
+  ]);
+  assert.equal(state.memories.get(regionMemory.memoryId).state, "superseded");
+  assert.equal(state.memories.get(regionMemory.memoryId).supersededBy, replacement.memoryId);
+  assert.equal(state.memories.get(replacement.memoryId).state, "active");
+  assert.throws(
+    () => applyEvents("project-default", [
+      {
+        schemaVersion: 1,
+        eventId: "event-project-init-two",
+        timestamp,
+        projectId: "project-default",
+        revision: 1,
+        type: "project_initialized",
+        name: "Default project",
+        description: "",
+      },
+      {
+        schemaVersion: 1,
+        eventId: "event-region-first-two",
+        timestamp,
+        projectId: "project-default",
+        revision: 2,
+        type: "memory_recorded",
+        memory: regionMemory,
+      },
+      {
+        schemaVersion: 1,
+        eventId: "event-region-duplicate",
+        timestamp,
+        projectId: "project-default",
+        revision: 3,
+        type: "memory_recorded",
+        memory: { ...replacement, supersedes: [] },
+      },
+    ]),
+    /already has an active version/,
+  );
 });

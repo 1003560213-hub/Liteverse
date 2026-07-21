@@ -50,6 +50,31 @@ Each item has stable `memoryId`, `type`, `title`, `content`, `state`, `evidenceS
 
 Supported types are `project_context`, `goal`, `convention`, `decision`, `assumption`, `finding`, `open_question`, `exclusion`, `next_step`, `code`, and `experiment`.
 
+### Region notes and user knowledge cards
+
+The App stores a nebula-region note or user knowledge card as an ordinary
+`memory_recorded` event with `type: project_context`, `provenance: user`, and
+`evidenceState: user_declared`. It is a project-memory document, not a paper
+knowledge artifact and not scientific verification. Such a memory carries all
+three metadata objects below:
+
+- `scope`: `kind: nebula_region`, the exact `categoryId`, a display-name
+  snapshot, and the non-negative Graph revision at assignment time.
+- `presentation`: stable `documentId`, `kind: note | knowledge_card`, and
+  `format: markdown | plain_text`.
+- `source`: `kind: app_region_document`, `input: manual | file_import`, UTF-8
+  byte length, SHA-256 of the exact stored UTF-8 content, and only for imports a
+  basename ending in `.md` or `.txt`.
+
+The App validates the category against the pinned current Graph revision before
+writing. A later repartition never fuzzy-remaps a missing category ID; the UI
+must show the document as orphaned until the user explicitly reassigns it.
+Editing appends a new memory with the same `documentId` and `supersedes` the
+single active version. Removing a document appends `memory_retired`. Imported
+absolute paths are never persisted, and the App must reject symbolic links,
+non-UTF-8 or NUL-containing files, extensions other than `.md`/`.txt`, and files
+larger than 1 MiB.
+
 ## Task and handoff projection
 
 `tasks.json` and each `Tasks/<taskHash>/task.json` contain only the hash, status, summaries, timestamps, linked memory IDs, and metadata-only outputs. Context Packs remain owned by Retriever. Research Memory writes handoffs only under `Tasks/<taskHash>/handoffs/` and records both artifact paths and hashes in the ledger.

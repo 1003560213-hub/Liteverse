@@ -61,6 +61,10 @@ test("exposes honest evidence states, global search, relation layers, and empty 
   assert.match(component, /relationship-layers/);
   assert.match(component, /Unscored faint lines/);
   assert.match(component, /empty-universe-onboarding/);
+  assert.match(component, /const BENCHMARKED_PAPERS_PER_UNIVERSE = 1_000/);
+  assert.match(component, /One universe can grow from a few foundational papers to hundreds\./);
+  assert.match(component, /Search and context workflows are benchmark-tested with up to \{BENCHMARKED_PAPERS_PER_UNIVERSE\.toLocaleString\("en-US"\)\} papers\./);
+  assert.match(styles, /\.onboarding-capacity-note/);
   assert.match(component, /paperVerificationState\([\s\S]*selectedPaper[\s\S]*paperIntegrityIssue\(selectedPaper\.id, workspace\.health\)/);
   assert.doesNotMatch(component, /● Verified item/);
   assert.match(settings, /library-health/);
@@ -72,7 +76,7 @@ test("exposes honest evidence states, global search, relation layers, and empty 
   assert.match(styles, /\.relation-layer\.unscored > i/);
 });
 
-test("focuses clickable nebula regions and labels their primary papers", async () => {
+test("navigates nebulae to galaxies, then labels the selected galaxy papers", async () => {
   const [component, universeText] = await Promise.all([
     readFile(new URL("../app/universe/LiteratureUniverse.tsx", import.meta.url), "utf8"),
     readFile(new URL("../data/universe.json", import.meta.url), "utf8"),
@@ -94,13 +98,23 @@ test("focuses clickable nebula regions and labels their primary papers", async (
   assert.match(component, /verticalOffsets/);
   assert.match(component, /occupied\.some\(\(existing\) => overlaps/);
   assert.match(component, /label\.paper\.shortTitle/);
-  assert.match(component, /event\.key === "Escape"/);
-  assert.match(component, /Exit region/);
+  assert.match(component, /key === "Escape"/);
+  assert.match(component, /canvasBackAction\(/);
+  assert.match(component, /const focusGalaxy/);
+  assert.match(component, /const focusNotes/);
+  assert.match(component, /universe-breadcrumb/);
+  assert.match(component, /viewLevel === "universe" \? "Reset view" : "Back"/);
 
   const starPriority = component.indexOf("if (nearestStar)");
+  const memoryPriority = component.indexOf("if (nearestMemory)");
+  const galaxyPriority = component.indexOf("if (nearestGalaxy)");
+  const blackHolePriority = component.indexOf("if (nearestBlackHole)");
   const relationPriority = component.indexOf("if (nearestRelation)");
   const regionPriority = component.indexOf("let nearestRegion");
-  assert.ok(starPriority >= 0 && starPriority < relationPriority);
+  assert.ok(starPriority >= 0 && starPriority < memoryPriority);
+  assert.ok(memoryPriority < galaxyPriority);
+  assert.ok(galaxyPriority < blackHolePriority);
+  assert.ok(blackHolePriority < relationPriority);
   assert.ok(relationPriority < regionPriority);
 
   for (const category of universe.categories) {
@@ -122,7 +136,9 @@ test("uses cinematic particle rendering without visible corner instructions", as
   assert.match(component, /suppliedStarSprite/);
   assert.match(component, /liteverse-star-source\.png/);
   assert.match(component, /liteverse-nebula\.png/);
-  assert.match(component, /photonCount/);
+  assert.match(component, /focused && !reducedMotion/);
+  assert.match(component, /galaxySprites/);
+  assert.match(component, /liteverse-black-hole-transparent\.png/);
   assert.match(component, /4_500_000/);
   assert.doesNotMatch(component, /rotationRef\.current\.y \+= 0\.000095/);
   assert.doesNotMatch(component, /motionTime \* 0\.000004/);
@@ -234,11 +250,15 @@ test("provides a persistent settings workspace and synchronized zoom control", a
   assert.match(settings, /Save research memory/);
   assert.match(settings, /No length limit/);
   assert.match(settings, /aria-describedby="research-editor-status"/);
-  assert.doesNotMatch(settings, /maxLength/);
+  const researchEditor = settings.match(/<label className="research-editor">([\s\S]*?)<\/label>/)?.[1] || "";
+  assert.doesNotMatch(researchEditor, /maxLength/);
+  assert.match(settings, /NEBULA NOTES &amp; KNOWLEDGE CARDS/);
+  assert.match(component, /action: "saveRegionDocument"/);
+  assert.match(component, /action: "importRegionDocumentFile"/);
   assert.match(settings, /Awaiting Codex/);
   assert.match(zoom, /type="range"/);
   assert.match(zoom, /min="0\.68"/);
-  assert.match(zoom, /max="1\.9"/);
+  assert.match(zoom, /max="3\.2"/);
   assert.match(styles, /\.settings-drawer/);
   assert.match(styles, /\.zoom-control/);
   assert.match(styles, /\.nebula-backdrop/);
@@ -304,9 +324,9 @@ test("shows three fail-closed partition proposals without applying a graph choic
   assert.doesNotMatch(settings, /onApplyPartition|onSelectPartition/);
 });
 
-test("ships an empty public graph without a default taxonomy", async () => {
+test("ships an empty distributable graph without a default taxonomy", async () => {
   const universe = JSON.parse(
-    await readFile(new URL("../data/universe.json", import.meta.url), "utf8"),
+    await readFile(new URL("../data/empty-universe.json", import.meta.url), "utf8"),
   );
   assert.equal(universe.title, "Liteverse");
   assert.deepEqual(universe.categories, []);
@@ -317,7 +337,7 @@ test("ships an empty public graph without a default taxonomy", async () => {
 test("keeps paper usage Retriever-managed with a zero integer default", async () => {
   const [component, universeText] = await Promise.all([
     readFile(new URL("../app/universe/LiteratureUniverse.tsx", import.meta.url), "utf8"),
-    readFile(new URL("../data/universe.json", import.meta.url), "utf8"),
+    readFile(new URL("../data/empty-universe.json", import.meta.url), "utf8"),
   ]);
   const universe = JSON.parse(universeText);
 

@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { readFile } from "node:fs/promises";
+import { lstat, open, readFile, realpath } from "node:fs/promises";
 import path from "node:path";
 
 const SHA256 = /^[a-f0-9]{64}$/;
@@ -8,11 +8,85 @@ function sha256(text) {
   return createHash("sha256").update(text, "utf8").digest("hex");
 }
 
+async function sha256File(filePath) {
+  const handle = await open(filePath, "r");
+  const hash = createHash("sha256");
+  const buffer = Buffer.allocUnsafe(1024 * 1024);
+  try {
+    while (true) {
+      const { bytesRead } = await handle.read(buffer, 0, buffer.length, null);
+      if (!bytesRead) break;
+      hash.update(buffer.subarray(0, bytesRead));
+    }
+  } finally {
+    await handle.close();
+  }
+  return hash.digest("hex");
+}
+
 function managed(support, configured, fallback) {
   const resolved = path.resolve(path.isAbsolute(configured || fallback) ? (configured || fallback) : path.join(support, configured || fallback));
   const relative = path.relative(support, resolved);
   if (relative.startsWith("..") || path.isAbsolute(relative)) throw new Error(`managed path escapes support directory: ${configured}`);
   return resolved;
+}
+
+async function verifiedSource(support, paperId, paper, integrity) {
+  const storageMode = paper?.source?.storageMode ?? paper?.storageMode ?? "managed";
+  if (storageMode !== "managed" && storageMode !== "linked") {
+    throw new Error(`paper ${paperId} has an invalid source storage mode; usage was not counted`);
+  }
+  let pdfPath;
+  if (storageMode === "linked") {
+    pdfPath = paper?.source?.pdfPath ?? paper?.pdfPath;
+    const linkedRootPath = paper?.source?.linkedRootPath ?? paper?.linkedRootPath;
+    const relativePath = paper?.source?.relativePath ?? paper?.relativePath;
+    if (
+      typeof pdfPath !== "string" || !path.isAbsolute(pdfPath) || path.resolve(pdfPath) !== pdfPath
+      || typeof linkedRootPath !== "string" || !path.isAbsolute(linkedRootPath) || path.resolve(linkedRootPath) !== linkedRootPath
+      || typeof relativePath !== "string" || !relativePath || path.isAbsolute(relativePath)
+    ) {
+      throw new Error(`paper ${paperId} has an unsafe linked source descriptor; usage was not counted`);
+    }
+    const parts = relativePath.split(/[\\/]+/);
+    if (parts.some((part) => !part || part === "." || part === "..")
+        || path.resolve(linkedRootPath, ...parts) !== pdfPath) {
+      throw new Error(`paper ${paperId} linked source escapes its registered root; usage was not counted`);
+    }
+    const rootInfo = await lstat(linkedRootPath);
+    if (rootInfo.isSymbolicLink() || !rootInfo.isDirectory()) {
+      throw new Error(`paper ${paperId} linked root is not a real directory; usage was not counted`);
+    }
+    let cursor = linkedRootPath;
+    for (const [index, part] of parts.entries()) {
+      cursor = path.join(cursor, part);
+      const info = await lstat(cursor);
+      const final = index === parts.length - 1;
+      if (info.isSymbolicLink() || (final ? !info.isFile() : !info.isDirectory())) {
+        throw new Error(`paper ${paperId} linked source path is unsafe; usage was not counted`);
+      }
+    }
+    const [realRoot, realPdf] = await Promise.all([realpath(linkedRootPath), realpath(pdfPath)]);
+    if (realRoot !== linkedRootPath || realPdf !== pdfPath || !realPdf.startsWith(`${realRoot}${path.sep}`)) {
+      throw new Error(`paper ${paperId} linked source traverses a symbolic link; usage was not counted`);
+    }
+    if ((integrity?.sourceStorageMode ?? "managed") !== "linked" || integrity?.sourcePath !== pdfPath) {
+      throw new Error(`paper ${paperId} linked source revision conflicts with its artifact; usage was not counted`);
+    }
+  } else {
+    pdfPath = managed(support, paper?.source?.pdfPath ?? paper?.pdfPath, `Library/PDFs/${paperId}.pdf`);
+    if ((integrity?.sourceStorageMode ?? "managed") !== "managed") {
+      throw new Error(`paper ${paperId} source storage mode conflicts with its artifact; usage was not counted`);
+    }
+  }
+  const expected = paper?.source?.sha256 ?? paper?.sha256 ?? integrity?.sourceSha256;
+  if (!SHA256.test(expected ?? "") || (integrity?.sourceSha256 && integrity.sourceSha256 !== expected)) {
+    throw new Error(`paper ${paperId} has no consistent source SHA-256; usage was not counted`);
+  }
+  if (await sha256File(pdfPath) !== expected) {
+    throw new Error(`source PDF hash mismatch for ${paperId}; usage was not counted`);
+  }
+  return { storageMode, pdfPath, sourceSha256: expected };
 }
 
 async function optionalJson(filePath) {
@@ -40,6 +114,15 @@ export async function readVerifiedArtifact(support, paperId, { fulltext = false,
   if (index && (!integrity || !Number.isInteger(integrity.artifactRevision) || !SHA256.test(integrity.artifactSha256 ?? ""))) {
     throw new Error(`paper ${paperId} has no pinned artifact revision; run liteverse doctor --fix before adoption`);
   }
+  let source = null;
+  if (index) {
+    try {
+      source = await verifiedSource(support, paperId, paper, integrity);
+    } catch (error) {
+      if (error.message?.includes("usage was not counted")) throw error;
+      throw new Error(`source verification failed for ${paperId}: ${error.message}; usage was not counted`);
+    }
+  }
   if (integrity?.cardSha256 && sha256(card) !== integrity.cardSha256) {
     throw new Error(`knowledge card hash mismatch for ${paperId}; usage was not counted`);
   }
@@ -62,7 +145,7 @@ export async function readVerifiedArtifact(support, paperId, { fulltext = false,
       throw new Error(`claims artifact revision conflict for ${paperId}; usage was not counted`);
     }
   }
-  return { paper, integrity, cardPath, fulltextPath, card, fulltext: fulltextContent, claims: claimDocument };
+  return { paper, integrity, source, cardPath, fulltextPath, card, fulltext: fulltextContent, claims: claimDocument };
 }
 
 function slug(value) {

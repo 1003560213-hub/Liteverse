@@ -52,6 +52,7 @@ To repair a selected-but-uncommitted snapshot without creating or altering a dec
 - `current.json` and staged snapshots have a positive integer `revision`.
 - A staged snapshot's revision must be greater than the current base revision.
 - `manifest.json` records `refreshId`, `baseRevision`, `targetRevision`, SHA-256 of the exact staged snapshot bytes, added/changed/removed paper and relation IDs, affected library item IDs/revisions, and animation defaults. Staging changes each listed item from `pending_codex` or `processing` to `ready_to_refresh`, increments its revision once, and puts that updated revision in the manifest.
+- For schema v3, the manifest also records added/changed/removed galaxy IDs plus the validated hierarchy algorithm and assignment SHA-256. These are routing audit fields, not scientific relationship records.
 - `pending-update.json` identifies the same refresh, revision pair, paths, and hash.
 - Refuse to replace an existing pending refresh unless the caller explicitly requests recovery and the base revision still matches.
 - Until Liteverse ships an explicit paper/relation deletion and rollback workflow, staging remains non-destructive for papers and relations. Category removal is allowed only by the partition decision gate above; otherwise every current category remains required.
@@ -69,7 +70,14 @@ Stage a complete replacement graph, never a partial patch. Preserve existing opt
   "title": "Liteverse",
   "updated": "ISO-8601 timestamp",
   "visuals": {},
+  "hierarchy": {
+    "schemaVersion": "liteverse-hierarchy-v1",
+    "algorithm": "deterministic-galaxy-routing-v2",
+    "assignmentSha256": "lowercase SHA-256",
+    "relationProjection": "galaxy-lanes-from-paper-relations-v1"
+  },
   "categories": [],
+  "galaxies": [],
   "papers": [],
   "relations": [],
   "usagePolicy": {}
@@ -77,6 +85,12 @@ Stage a complete replacement graph, never a partial patch. Preserve existing opt
 ```
 
 Category records have `kind: "macro" | "system"`. Macro records require `id`, `name`, `description`, `color`, and the App's visual placement/nebula fields when already present. The only system category is `liteverse-staging`; it does not count toward the ten-macro limit. Preserve every current category. Every new macro category requires the creation evidence defined in `taxonomy.md`.
+
+For schema v3, `stage-refresh.mjs` additively materializes `hierarchy.schemaVersion: "liteverse-hierarchy-v1"`, deterministic `galaxies`, and one `paper.galaxyId` per paper after all scientific relation review is complete. Each galaxy has a stable anchor-derived ID, exactly one parent `categoryId`, a finite `position`, a packaged `assetId`, and `seedPaperId`. A paper's galaxy parent must equal its `primaryCategory`; a secondary category never creates a second galaxy membership. A non-empty macro region uses two through twelve galaxies when its paper count permits; one through three papers remain one group. The assignment hash covers galaxy routing, centers, assets, anchors, and paper membership without changing the root `3.0.0` schema.
+
+The v2 layout treats the region center as the knowledge black hole and fills deterministic three-dimensional concentric orbits from the inside outward. The inner ring holds four galaxy centers and must be full before the outer eight-slot ring is used. Ring radii preserve the black-hole exclusion zone, depth offsets preserve camera parallax, and every available slot maintains the contract's minimum center separation. Galaxy artwork is assigned across the complete universe: use every supplied image once before any reuse, then keep global reuse counts within one while preserving compatible prior assignments where the balanced quota permits. A v1 hierarchy is re-derived in memory with v2 positions; only a later staged Refresh may persist it.
+
+Galaxy membership is a deterministic visual/retrieval route, not a scientific classification or a relationship score. `relations[]` remains the only scientific relationship truth. The App may derive parallel galaxy lanes from original paper relations, but Curator must not persist aggregate strengths, confidences, or duplicate relation evidence. Existing valid galaxy records are retained during incremental additions; a full macro repartition may rebuild galaxies beneath affected parent categories. Neither materialization nor validation reads or writes Usage.
 
 The staged manifest keeps `categories.added`, `categories.changed`, and `categories.removed` as the category diff. It also includes `categories.newCategories`, with one `{ categoryId, creationEvidence }` record per newly added category. `creationEvidence.memberIds` must exactly match the category's primary papers; the same validated existing-region scores, cluster consistency, and scope definition are copied from the snapshot so the classification decision remains auditable after staging.
 
@@ -89,8 +103,10 @@ Map each knowledge record to a paper star as follows:
 | `primaryCategory` | classification decision |
 | `categoryIds` | primary plus optional secondary, both existing category IDs |
 | `summary`, `projectRole`, `tags` | completed knowledge card |
-| `source.pdfPath` and compatibility `pdfPath` | `Library/PDFs/<paper-id>.pdf` |
-| `source.sha256` | SHA-256 of the managed PDF |
+| `source.storageMode` | `managed` or `linked`; absent legacy values mean `managed` |
+| `source.pdfPath` and compatibility `pdfPath` | managed `Library/PDFs/<paper-id>.pdf`, or the exact normalized absolute linked path |
+| `source.linkedRootPath`, `source.relativePath` | paired root and safe relative provenance for a linked folder item |
+| `source.sha256` | SHA-256 of the managed or linked original PDF |
 | `markdownPath` | `Knowledge/cards/<paper-id>.md` |
 | `fulltextPath` | `Knowledge/fulltext/<paper-id>.md` |
 | `artifacts` | card/fulltext paths, extraction state, card schema, evidence count, and `integrity` revision/hash pin |
@@ -100,6 +116,10 @@ Map each knowledge record to a paper star as follows:
 If both `secondaryCategory` and `categoryIds` are emitted, the secondary must be the only non-primary member of `categoryIds`. Unknown category references and removal of an existing category are invalid.
 
 For a newly curated or re-curated paper, copy `Knowledge/papers.json`'s `artifacts.integrity` object into the staged graph paper. It pins `artifactRevision`, aggregate `artifactSha256`, source/card/full-text/claim SHA-256 values, immutable paths, and manifest path. A Doctor may repair the paper projection and immutable store, but it never writes the current graph; the next Curator Refresh closes any graph-pin warning.
+
+`stage-refresh.mjs` validates linked source references structurally and re-hashes every linked PDF before it writes staged bytes. It rejects relative, non-normalized, missing, non-file, hash-mismatched, or symlinked paths/ancestors; requires each recorded path to equal its real path; and requires the PDF to remain within the selected root. Managed validation remains support-relative and backward compatible. Neither staging nor immutable artifact creation copies a linked PDF.
+
+Backups include the graph/index source fields and their hashes but omit linked original PDF bytes. Managed PDFs remain governed by the backup's include-PDF option. Import preserves linked absolute references verbatim; missing files do not invalidate the backup archive itself, but workspace health and `liteverse doctor` must report `source.linked_missing` before curation or adoption relies on the original source.
 
 Relations require `id`, `source`, `target`, semantic `type`/`label`, and evidence state. New or re-scored relations use the exact output fields from `score-connection.mjs`. Unscored migrated relations retain null `strength`/`confidence`, `legacyConfidence`, and their pending/legacy marker. Never create percentages by copying legacy values.
 

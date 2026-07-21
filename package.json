@@ -1,6 +1,6 @@
 {
   "name": "liteverse",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "A local-first literature universe and research-memory workspace for people and AI assistants.",
   "license": "MIT",
   "keywords": [
@@ -34,7 +34,7 @@
     "typecheck:app": "tsc -p tsconfig.app.json",
     "validate:data": "node scripts/validate-universe.mjs",
     "verify:public": "node scripts/verify-public-release.mjs",
-    "lint": "eslint . --ignore-pattern dist --ignore-pattern .next --ignore-pattern .vinext --ignore-pattern dist-desktop --ignore-pattern Liteverse.app --ignore-pattern release",
+    "lint": "eslint . --ignore-pattern .gitnexus --ignore-pattern dist --ignore-pattern .next --ignore-pattern .vinext --ignore-pattern dist-desktop --ignore-pattern Liteverse.app --ignore-pattern release",
     "db:generate": "drizzle-kit generate"
   },
   "dependencies": {

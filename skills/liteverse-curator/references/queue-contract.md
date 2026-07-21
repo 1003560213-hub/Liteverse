@@ -7,7 +7,7 @@ All mutable paths are relative to the Liteverse support directory:
 - `library.json`: uploaded literature queue and catalog.
 - `user-annotations.json`: complete current annotation array.
 - `codex-inbox.jsonl`: append-only annotation creation, edit, and Curator audit events.
-- `Library/PDFs/<storedFilename>`: PDF bytes saved by the App before curation.
+- `Library/PDFs/<storedFilename>`: PDF bytes saved by the App before curation for `managed` sources only.
 - `user-notes/<paper-id>.md`: readable mirror of raw annotations; never the authoritative source.
 
 Do not confuse `codex-inbox.jsonl` with `workspace-inbox.jsonl`, which carries separate literature/research-memory events in older App workflows.
@@ -25,7 +25,10 @@ Each item includes:
 - `id`: immutable UUID-like string.
 - `number`: positive catalog number used for `LIT-0001` display.
 - `sourceType`: `pdf` or `arxiv`.
-- `storedFilename` for PDF, or canonical `arxivUrl` for arXiv.
+- `storedFilename` for a managed PDF, or canonical `arxivUrl` for arXiv.
+- `source.storageMode`: `managed` or `linked`; an absent value means legacy `managed`.
+- For `linked`, `source.pdfPath` is the normalized absolute PDF path, `source.linkedRootPath` is the user-selected normalized absolute folder, `source.relativePath` is the safe path below that folder, and `source.sha256` pins the selected bytes. `localPath` may mirror the absolute path for compatibility.
+- A Zotero stored attachment remains an ordinary linked PDF and may add `source.provenance.catalog: "zotero"` plus immutable `itemKey` and `attachmentKey`. These identifiers are provenance only; they do not authorize writes to Zotero or relax linked-path/hash validation.
 - `displayTitle` and `titleStatus`.
 - `status`: `pending_codex`, `processing`, `needs_attention`, `ready_to_refresh`, or `organized`.
 - `revision`: positive optimistic-lock integer.
@@ -38,6 +41,14 @@ Always lock by item ID plus revision. `stage-refresh.mjs` accepts only `pending_
 An App preparation commit also uses item ID plus revision. It may install hash-verified draft artifacts, increment the revision, and set `preparation.state: "ready"`, but it leaves `status: "pending_codex"`. Curator must lock the resulting new revision. A failed or unreadable result sets `preparation.state: "needs_attention"` and the existing queue `status: "needs_attention"`; it must retain the source and diagnostic rather than delete the item.
 
 The sole exception is explicit `--replace-pending` recovery. It must receive the complete library-item set from the old pending manifest and verifies the live items are still `ready_to_refresh`, at the recorded revisions, mapped to the same papers, and owned by the old refresh. It transfers them to the replacement refresh without incrementing their revisions; missing, added, changed, stale, or orphaned items abort recovery.
+
+## Linked local-folder PDFs
+
+Register every discovered PDF as an ordinary `sourceType: "pdf"` item so the queue state machine and catalog numbering remain unchanged. Do not create a synthetic paper whose source type is a folder. The App may retain folder authorization metadata outside the graph, but Curator uses the per-item absolute path, root, relative path, and SHA-256.
+
+Linked sources are references, not managed copies. Local preparation reads the external file and installs only derived Markdown/review artifacts. Curator must require `realpath(root) == linkedRootPath` and `realpath(pdf) == pdfPath`, reject a symbolic-link root, PDF, intermediate component, or ancestor alias, and verify the PDF remains within the selected root before re-hashing it. A missing file, changed hash, unsafe/escaping path, or stale item revision enters `needs_attention`; never reinterpret changed bytes as a new revision of the same paper.
+
+A workspace backup preserves the linked reference and pinned hash but never embeds the external PDF, even when managed-PDF backup is enabled. Restore does not rewrite the path. `liteverse doctor` reports a missing restored link as `source.linked_missing` until the original location is available or the user explicitly relinks the item.
 
 ## user-annotations.json
 

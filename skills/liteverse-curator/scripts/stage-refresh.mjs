@@ -2,8 +2,10 @@
 import { createHash, randomUUID } from "node:crypto";
 import {
   mkdir,
+  lstat,
   open,
   readFile,
+  realpath,
   rename,
   rm,
   stat,
@@ -19,6 +21,29 @@ import {
   isFiniteVector3,
   validateDecisionRecord,
 } from "./partition-contract.mjs";
+
+async function loadGalaxyHierarchyContract() {
+  const candidates = [
+    new URL("../../../scripts/lib/liteverse-galaxy-hierarchy.mjs", import.meta.url),
+    new URL("../../../liteverse-cli/lib/liteverse-galaxy-hierarchy.mjs", import.meta.url),
+    new URL("../../../LiteverseCLI/lib/liteverse-galaxy-hierarchy.mjs", import.meta.url),
+  ];
+  let lastError;
+  for (const candidate of candidates) {
+    try {
+      return await import(candidate.href);
+    } catch (error) {
+      if (error?.code !== "ERR_MODULE_NOT_FOUND") throw error;
+      lastError = error;
+    }
+  }
+  throw new Error(`galaxy hierarchy contract is unavailable: ${lastError?.message ?? "module not found"}`);
+}
+
+const {
+  assertValidGalaxyHierarchy,
+  materializeGalaxyHierarchy,
+} = await loadGalaxyHierarchyContract();
 
 function fail(message) {
   throw new Error(message);
@@ -174,6 +199,90 @@ function safeRelativePath(value, label) {
   return value;
 }
 
+function sourceStorageMode(source, paperId) {
+  const mode = source.storageMode ?? "managed";
+  if (!new Set(["managed", "linked"]).has(mode)) {
+    fail(`paper ${paperId}.source.storageMode must be managed or linked`);
+  }
+  return mode;
+}
+
+function normalizedLinkedPath(value, label) {
+  if (typeof value !== "string" || !value || !path.isAbsolute(value)) {
+    fail(`${label} must be an absolute path`);
+  }
+  const normalized = path.resolve(value);
+  if (value !== normalized) fail(`${label} must be normalized`);
+  return normalized;
+}
+
+async function sha256File(filePath) {
+  const handle = await open(filePath, "r");
+  const hash = createHash("sha256");
+  const buffer = Buffer.allocUnsafe(1024 * 1024);
+  try {
+    while (true) {
+      const { bytesRead } = await handle.read(buffer, 0, buffer.length, null);
+      if (!bytesRead) break;
+      hash.update(buffer.subarray(0, bytesRead));
+    }
+  } finally {
+    await handle.close();
+  }
+  return hash.digest("hex");
+}
+
+async function validateLinkedSourceHashes(snapshot) {
+  if (snapshot.schemaVersion !== "3.0.0") return;
+  for (const paper of snapshot.papers) {
+    const source = paper.source;
+    if ((source?.storageMode ?? "managed") !== "linked") continue;
+    const pdfPath = normalizedLinkedPath(source.pdfPath, `paper ${paper.id}.source.pdfPath`);
+    const linkedRootPath = normalizedLinkedPath(source.linkedRootPath, `paper ${paper.id}.source.linkedRootPath`);
+    const relativePath = safeRelativePath(source.relativePath, `paper ${paper.id}.source.relativePath`);
+    const parts = relativePath.split(/[\\/]+/);
+    let cursor = linkedRootPath;
+    try {
+      const rootInfo = await lstat(linkedRootPath);
+      if (rootInfo.isSymbolicLink() || !rootInfo.isDirectory()) {
+        fail(`paper ${paper.id} linked root must be a real directory, not a symbolic link`);
+      }
+      for (const [index, part] of parts.entries()) {
+        cursor = path.join(cursor, part);
+        const info = await lstat(cursor);
+        if (info.isSymbolicLink()) fail(`paper ${paper.id} linked source path contains a symbolic link: ${cursor}`);
+        const final = index === parts.length - 1;
+        if (final ? !info.isFile() : !info.isDirectory()) {
+          fail(`paper ${paper.id} linked source path component has the wrong type: ${cursor}`);
+        }
+      }
+      const [rootRealPath, pdfRealPath] = await Promise.all([realpath(linkedRootPath), realpath(pdfPath)]);
+      if (rootRealPath !== linkedRootPath) {
+        fail(`paper ${paper.id} linked root path traverses a symbolic-link ancestor`);
+      }
+      if (pdfRealPath !== pdfPath) {
+        fail(`paper ${paper.id} linked PDF path traverses a symbolic-link ancestor`);
+      }
+      const relativeRealPath = path.relative(rootRealPath, pdfRealPath);
+      if (!relativeRealPath || relativeRealPath.startsWith("..") || path.isAbsolute(relativeRealPath)) {
+        fail(`paper ${paper.id} linked PDF real path escapes its selected root`);
+      }
+    } catch (error) {
+      if (error.message?.startsWith("paper ")) throw error;
+      fail(`paper ${paper.id} linked PDF is unavailable at ${pdfPath}: ${error.message}`);
+    }
+    let actual;
+    try {
+      actual = await sha256File(pdfPath);
+    } catch (error) {
+      fail(`paper ${paper.id} linked PDF cannot be hashed at ${pdfPath}: ${error.message}`);
+    }
+    if (actual !== source.sha256) {
+      fail(`paper ${paper.id} linked PDF SHA-256 does not match source.sha256`);
+    }
+  }
+}
+
 function validateV3Paper(paper) {
   if (Object.hasOwn(paper, "verified")) fail(`paper ${paper.id} must not keep legacy verified in schema v3`);
   if (!verificationStates.has(paper.verificationStatus)) {
@@ -183,8 +292,18 @@ function validateV3Paper(paper) {
   const source = object(paper.source, `paper ${paper.id}.source`);
   if (!["pdf", "arxiv"].includes(source.kind)) fail(`paper ${paper.id}.source.kind must be pdf or arxiv`);
   const expectedPdf = `Library/PDFs/${paper.id}.pdf`;
-  if (safeRelativePath(source.pdfPath, `paper ${paper.id}.source.pdfPath`) !== expectedPdf) {
-    fail(`paper ${paper.id}.source.pdfPath must be ${expectedPdf}`);
+  const storageMode = sourceStorageMode(source, paper.id);
+  let canonicalPdf;
+  if (storageMode === "linked") {
+    canonicalPdf = normalizedLinkedPath(source.pdfPath, `paper ${paper.id}.source.pdfPath`);
+    const linkedRoot = normalizedLinkedPath(source.linkedRootPath, `paper ${paper.id}.source.linkedRootPath`);
+    const relative = safeRelativePath(source.relativePath, `paper ${paper.id}.source.relativePath`);
+    if (path.resolve(linkedRoot, ...relative.split(/[\\/]+/)) !== canonicalPdf) {
+      fail(`paper ${paper.id} linked root and relative path do not resolve to source.pdfPath`);
+    }
+  } else {
+    canonicalPdf = safeRelativePath(source.pdfPath, `paper ${paper.id}.source.pdfPath`);
+    if (canonicalPdf !== expectedPdf) fail(`paper ${paper.id}.source.pdfPath must be ${expectedPdf}`);
   }
   if (!/^[a-f0-9]{64}$/.test(source.sha256 ?? "")) fail(`paper ${paper.id}.source.sha256 must be lowercase SHA-256`);
   const artifacts = object(paper.artifacts, `paper ${paper.id}.artifacts`);
@@ -205,7 +324,7 @@ function validateV3Paper(paper) {
   if (!Number.isInteger(artifacts.evidenceCount) || artifacts.evidenceCount < 0) {
     fail(`paper ${paper.id}.artifacts.evidenceCount must be a non-negative integer`);
   }
-  if (paper.pdfPath !== expectedPdf || paper.markdownPath !== expectedCard || paper.fulltextPath !== expectedFulltext) {
+  if (paper.pdfPath !== canonicalPdf || paper.markdownPath !== expectedCard || paper.fulltextPath !== expectedFulltext) {
     fail(`paper ${paper.id} legacy compatibility paths must match schema-v3 source/artifacts paths`);
   }
   if (paper.verificationStatus === "needs_ocr" && artifacts.extractionStatus !== "needs_ocr") {
@@ -726,7 +845,7 @@ async function main() {
   const graphRoot = path.join(support, "Graph");
   const currentPath = path.join(graphRoot, "current.json");
   const pendingPath = path.join(graphRoot, "pending-update.json");
-  const snapshot = await readJson(path.resolve(snapshotInput), "snapshot");
+  const sourceSnapshot = await readJson(path.resolve(snapshotInput), "snapshot");
   const libraryItemsPath = argument("--library-items");
   const libraryItems = await loadLibraryItems(libraryItemsPath);
   const staggerMs = integer(argument("--stagger-ms") ?? 500, "--stagger-ms", 0);
@@ -734,7 +853,15 @@ async function main() {
 
   await withLock(path.join(support, ".locks", "stage-refresh.lock"), async () => {
     const current = await readJson(currentPath, "Graph/current.json");
+    // Relation review is complete before stage-refresh is invoked. Materialize
+    // the routing-only galaxy hierarchy now, against the locked current graph,
+    // so neither Curator nor this script ever rewrites Graph/current.json.
+    const snapshot = materializeGalaxyHierarchy(sourceSnapshot, { previousGraph: current });
+    const hierarchyValidation = snapshot.schemaVersion === "3.0.0"
+      ? assertValidGalaxyHierarchy(snapshot)
+      : null;
     const { baseRevision, targetRevision, newCategoryEvidence, removedCategoryIds } = validateGraph(current, snapshot);
+    await validateLinkedSourceHashes(snapshot);
     const partitionDecision = await validatePartitionReplacement(support, current, snapshot, removedCategoryIds);
     let replacementContext = null;
     if (await exists(pendingPath)) {
@@ -757,6 +884,7 @@ async function main() {
     const paperDiff = diffItems(current.papers, snapshot.papers);
     const relationDiff = diffItems(current.relations, snapshot.relations);
     const categoryDiff = diffItems(current.categories, snapshot.categories);
+    const galaxyDiff = diffItems(current.galaxies ?? [], snapshot.galaxies ?? []);
     for (const item of libraryItems) {
       if (!snapshot.papers.some((paper) => paper.id === item.paperId)) {
         fail(`library item ${item.itemId} maps to missing staged paper ${item.paperId}`);
@@ -774,6 +902,12 @@ async function main() {
       createdAt: new Date().toISOString(),
       papers: paperDiff,
       relations: relationDiff,
+      galaxies: galaxyDiff,
+      hierarchy: hierarchyValidation ? {
+        schemaVersion: snapshot.hierarchy.schemaVersion,
+        algorithm: snapshot.hierarchy.algorithm,
+        assignmentSha256: hierarchyValidation.assignmentSha256,
+      } : null,
       categories: {
         ...categoryDiff,
         newCategories: newCategoryEvidence,
@@ -793,7 +927,8 @@ async function main() {
       manifestPath: path.relative(support, path.join(stagePath, "manifest.json")),
       addedPaperIds: paperDiff.added,
       addedRelationIds: relationDiff.added,
-      diff: { papers: paperDiff, relations: relationDiff, categories: categoryDiff },
+      diff: { papers: paperDiff, relations: relationDiff, categories: categoryDiff, galaxies: galaxyDiff },
+      hierarchy: manifest.hierarchy,
       partitionDecision,
       libraryItems: readyLibraryItems,
       animation: manifest.animation,

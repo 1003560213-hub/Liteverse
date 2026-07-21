@@ -54,6 +54,37 @@ materializer. Local preparation, review packets, and candidate scores are never
 scientific evidence and never promote a card, relationship, classification, or
 Usage count.
 
+For a queue larger than one or two papers, keep mechanical work out of the
+model context. Build deterministic 3–5-paper Review Batches, reopen only the
+source-pinned original pages selected for scientific review, apply decisions,
+and continue until the preparation wave is drained. Adopt every committed
+result from that wave in one transaction so `Knowledge/papers.json` advances
+once and already extracted PDFs are never reprocessed merely because the
+catalog changed:
+
+```bash
+node scripts/liteverse-cli.mjs curation batch build
+node scripts/liteverse-cli.mjs curation batch apply --batch <batch.json> --decisions <decisions.json>
+node scripts/liteverse-cli.mjs curation batch adopt --result <manifest.json> [--result <manifest.json> ...]
+```
+
+The Review Batch must balance research-question, method, result, limitation,
+assumption, and equation candidates under its character budget. Section,
+figure, table, and citation anchors are navigation only and need no model
+decision. Use one explicit default rejection reason for omitted candidates
+instead of generating repetitive output. Reuse the App's at-most-24
+artifact-pinned relationship shortlist; do not ask Codex to search all paper
+pairs. Exact SHA-256, arXiv, and DOI duplicates are closed locally when the
+identity is unambiguous. Identity conflicts, OCR failures, and scientific
+ambiguities remain visible as `needs_attention`.
+
+For ordinary additions to an already selected taxonomy, run incremental
+classification against the existing macro regions. Do not regenerate three
+full-corpus schemes unless this is the first taxonomy, the user requested a
+repartition, or at least four low-fit papers pass the stable-new-cluster gate.
+Project role is project memory, not shared paper truth, and must not force an
+otherwise reusable paper through extra scientific review.
+
 Do not split these responsibilities into per-feature Skills. The CLI is the
 provider-neutral interface; Codex is the first adapter. Liteverse has no
 background daemon, bundled Node/Python runtime, local model, automatic online
@@ -168,16 +199,20 @@ Never replace a newer project ledger with the legacy file.
 
 ## Literature upload queue
 
-When the workspace queue returns pending PDF or arXiv entries:
+When the workspace queue returns pending PDF, linked-folder, Zotero, or arXiv
+entries:
 
-1. Inspect each entry separately. For PDFs, read the saved copy under
-   `~/Library/Application Support/Liteverse/Library/PDFs/`; for arXiv entries,
-   verify title, authors, identifier, version, and content against the original
-   arXiv paper page before use. Network access is explicit for this requested
-   source only; do not run automatic related-literature discovery.
-2. Use `$liteverse-curator`; preserve the canonical source, create both a
-   page-marked full-text file and structured knowledge card, generate stable
-   claims, and publish an immutable artifact revision.
+1. Lock every selected item ID and revision, then reuse a valid App preparation
+   manifest. Do not sequentially read whole PDFs or rerun extraction in Codex.
+   For arXiv entries, verify title, authors, identifier, version, and content
+   against the original arXiv paper page before use. Network access is explicit
+   for this requested source only; do not run automatic related-literature
+   discovery. Linked-folder and Zotero PDFs remain in place and are never copied.
+2. Use `$liteverse-curator`; build and apply bounded Review Batches, then adopt
+   the complete preparation wave once. Preserve the canonical source, create
+   both page-marked full text and a structured knowledge card, generate stable
+   claims, and publish an immutable artifact revision only after source-page
+   review and deterministic finalization succeed.
 3. Search related library papers only after identifying the source. Add a stellar
    relation only when both original papers have evidence locations. `no-link` is
    valid; never invent a connection to make the graph denser. Preserve old

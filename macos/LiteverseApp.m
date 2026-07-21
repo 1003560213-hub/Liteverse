@@ -588,6 +588,119 @@
   return [@"Library/PDFs" stringByAppendingPathComponent:filename];
 }
 
+- (BOOL)isLinkedPDFSource:(NSDictionary *)source {
+  return [source isKindOfClass:NSDictionary.class] &&
+      [source[@"kind"] isEqualToString:@"pdf"] &&
+      [source[@"storageMode"] isEqualToString:@"linked"];
+}
+
+// A linked source is trusted only through the complete descriptor registered
+// in Library/Graph.  The absolute path must be the exact root + relative path,
+// and no selected root, intermediate component, or PDF may be a symbolic link.
+- (NSURL *)linkedPDFURLForSource:(NSDictionary *)source
+                 requireExisting:(BOOL)requireExisting
+                      verifyHash:(BOOL)verifyHash
+                           error:(NSError **)error {
+  if (![self isLinkedPDFSource:source]) {
+    if (error) *error = [self storageError:@"The source is not a registered linked PDF." code:640];
+    return nil;
+  }
+  NSString *rawPath = [source[@"pdfPath"] isKindOfClass:NSString.class] ? source[@"pdfPath"] : nil;
+  NSString *rawRoot = [source[@"linkedRootPath"] isKindOfClass:NSString.class] ? source[@"linkedRootPath"] : nil;
+  NSString *relativePath = [source[@"relativePath"] isKindOfClass:NSString.class] ? source[@"relativePath"] : nil;
+  if (!rawPath.isAbsolutePath || !rawRoot.isAbsolutePath || relativePath.length == 0 ||
+      relativePath.isAbsolutePath || ![self isSafeWorkspaceRelativePath:relativePath] ||
+      ![relativePath isEqualToString:relativePath.stringByStandardizingPath] ||
+      ![relativePath.pathExtension.lowercaseString isEqualToString:@"pdf"]) {
+    if (error) *error = [self storageError:@"The linked PDF descriptor contains an unsafe root, path, or relative path." code:641];
+    return nil;
+  }
+  NSURL *rootURL = [NSURL fileURLWithPath:rawRoot isDirectory:YES].URLByStandardizingPath;
+  NSURL *fileURL = [NSURL fileURLWithPath:rawPath isDirectory:NO].URLByStandardizingPath;
+  NSURL *expectedURL = [rootURL URLByAppendingPathComponent:relativePath isDirectory:NO].URLByStandardizingPath;
+  NSString *rootPrefix = [rootURL.path stringByAppendingString:@"/"];
+  if (![rawRoot isEqualToString:rootURL.path] || ![rawPath isEqualToString:fileURL.path] ||
+      ![fileURL.path isEqualToString:expectedURL.path] || ![fileURL.path hasPrefix:rootPrefix]) {
+    if (error) *error = [self storageError:@"The linked PDF path escapes its registered literature root." code:642];
+    return nil;
+  }
+  if (!requireExisting && !verifyHash) return fileURL;
+
+  NSNumber *rootIsDirectory = nil;
+  NSNumber *rootIsSymbolicLink = nil;
+  NSNumber *fileIsRegular = nil;
+  NSNumber *fileIsSymbolicLink = nil;
+  if (![rootURL getResourceValue:&rootIsDirectory forKey:NSURLIsDirectoryKey error:error] ||
+      ![rootURL getResourceValue:&rootIsSymbolicLink forKey:NSURLIsSymbolicLinkKey error:error] ||
+      ![fileURL getResourceValue:&fileIsRegular forKey:NSURLIsRegularFileKey error:error] ||
+      ![fileURL getResourceValue:&fileIsSymbolicLink forKey:NSURLIsSymbolicLinkKey error:error] ||
+      !rootIsDirectory.boolValue || rootIsSymbolicLink.boolValue ||
+      !fileIsRegular.boolValue || fileIsSymbolicLink.boolValue) {
+    if (error && !*error) *error = [self storageError:@"The linked literature root or PDF is missing, has the wrong type, or is a symbolic link." code:643];
+    return nil;
+  }
+  NSURL *resolvedRoot = rootURL.URLByResolvingSymlinksInPath;
+  NSURL *resolvedFile = fileURL.URLByResolvingSymlinksInPath;
+  NSString *resolvedPrefix = [resolvedRoot.path stringByAppendingString:@"/"];
+  if (![resolvedRoot.path isEqualToString:rootURL.path] ||
+      ![resolvedFile.path isEqualToString:fileURL.path] ||
+      ![resolvedFile.path hasPrefix:resolvedPrefix]) {
+    if (error) *error = [self storageError:@"The linked PDF traverses a symbolic link or leaves its registered literature root." code:644];
+    return nil;
+  }
+  if (verifyHash) {
+    NSString *expectedHash = [source[@"sha256"] isKindOfClass:NSString.class]
+        ? [source[@"sha256"] lowercaseString] : nil;
+    NSString *actualHash = expectedHash.length == 64 ? [self sha256ForFileAtURL:fileURL error:error] : nil;
+    if (expectedHash.length != 64 || ![actualHash isEqualToString:expectedHash]) {
+      if (error && !*error) *error = [self storageError:@"The linked PDF changed after it was registered. Re-link the folder before using this source." code:645];
+      return nil;
+    }
+  }
+  return fileURL;
+}
+
+- (NSURL *)managedPDFURLForSource:(NSDictionary *)source
+                   requireExisting:(BOOL)requireExisting
+                        verifyHash:(BOOL)verifyHash
+                             error:(NSError **)error {
+  NSString *path = [source[@"pdfPath"] isKindOfClass:NSString.class] ? source[@"pdfPath"] : nil;
+  if (path.length == 0 || path.isAbsolutePath || ![self isSafeWorkspaceRelativePath:path] ||
+      ![path isEqualToString:path.stringByStandardizingPath] || ![path hasPrefix:@"Library/PDFs/"] ||
+      ![path.pathExtension.lowercaseString isEqualToString:@"pdf"]) {
+    if (error) *error = [self storageError:@"The managed PDF path is unsafe." code:646];
+    return nil;
+  }
+  NSURL *fileURL = [self URLForWorkspaceRelativePath:path error:error];
+  NSURL *rootURL = [self pdfDirectoryURL].URLByStandardizingPath.URLByResolvingSymlinksInPath;
+  NSURL *resolvedFile = fileURL.URLByStandardizingPath.URLByResolvingSymlinksInPath;
+  if (!fileURL || ![resolvedFile.path hasPrefix:[rootURL.path stringByAppendingString:@"/"]]) {
+    if (error && !*error) *error = [self storageError:@"The managed PDF escaped Library/PDFs." code:647];
+    return nil;
+  }
+  if (requireExisting && ![self localPreparationFileAtURL:fileURL isConfinedToRoot:rootURL error:error]) return nil;
+  if (verifyHash) {
+    NSString *expectedHash = [source[@"sha256"] isKindOfClass:NSString.class]
+        ? [source[@"sha256"] lowercaseString] : nil;
+    NSString *actualHash = expectedHash.length == 64 ? [self sha256ForFileAtURL:fileURL error:error] : nil;
+    if (expectedHash.length != 64 || ![actualHash isEqualToString:expectedHash]) {
+      if (error && !*error) *error = [self storageError:@"The managed PDF no longer matches its registered SHA-256." code:648];
+      return nil;
+    }
+  }
+  return fileURL;
+}
+
+- (NSURL *)registeredPDFURLForSource:(NSDictionary *)source
+                      requireExisting:(BOOL)requireExisting
+                           verifyHash:(BOOL)verifyHash
+                                error:(NSError **)error {
+  if ([self isLinkedPDFSource:source]) {
+    return [self linkedPDFURLForSource:source requireExisting:requireExisting verifyHash:verifyHash error:error];
+  }
+  return [self managedPDFURLForSource:source requireExisting:requireExisting verifyHash:verifyHash error:error];
+}
+
 - (BOOL)migrateLegacyGraphSourcesIfSafe:(NSError **)error {
   NSFileManager *manager = NSFileManager.defaultManager;
   NSURL *currentURL = [self currentGraphURL];
@@ -618,9 +731,13 @@
         ? source[@"pdfPath"]
         : ([paper[@"pdfPath"] isKindOfClass:NSString.class] ? paper[@"pdfPath"] : nil);
     NSString *managedPath = nil;
+    NSString *linkedPath = nil;
     NSString *pdfHash = [source[@"sha256"] isKindOfClass:NSString.class] ? source[@"sha256"] : nil;
     if ([rawPDFPath isKindOfClass:NSString.class] && rawPDFPath.length > 0) {
-      if (!rawPDFPath.isAbsolutePath && [self isSafeWorkspaceRelativePath:rawPDFPath] &&
+      if ([self isLinkedPDFSource:source]) {
+        linkedPath = [self linkedPDFURLForSource:source requireExisting:NO verifyHash:NO error:nil].path;
+        if (linkedPath.length == 0) [unmanagedPaperIDs addObject:paperID];
+      } else if (!rawPDFPath.isAbsolutePath && [self isSafeWorkspaceRelativePath:rawPDFPath] &&
           [rawPDFPath.stringByStandardizingPath hasPrefix:@"Library/PDFs/"]) {
         managedPath = rawPDFPath.stringByStandardizingPath;
         NSURL *managedURL = [self URLForWorkspaceRelativePath:managedPath error:nil];
@@ -642,9 +759,15 @@
     }
     if (managedPath.length > 0) {
       source[@"kind"] = source[@"kind"] ?: @"pdf";
+      source[@"storageMode"] = @"managed";
       source[@"pdfPath"] = managedPath;
       if (pdfHash.length == 64) source[@"sha256"] = pdfHash;
       normalized[@"pdfPath"] = managedPath; // transitional v2 reader compatibility
+    } else if (linkedPath.length > 0) {
+      source[@"kind"] = @"pdf";
+      source[@"storageMode"] = @"linked";
+      source[@"pdfPath"] = linkedPath;
+      normalized[@"pdfPath"] = linkedPath;
     }
 
     NSMutableDictionary *artifacts = [paper[@"artifacts"] isKindOfClass:NSDictionary.class]
@@ -668,8 +791,10 @@
       artifacts[@"extractionStatus"] = fulltextExists ? @"extracted" : @"pending";
     }
 
-    BOOL sourceExists = managedPath.length > 0 &&
-        [manager fileExistsAtPath:[self URLForWorkspaceRelativePath:managedPath error:nil].path];
+    BOOL sourceExists = managedPath.length > 0
+        ? [manager fileExistsAtPath:[self URLForWorkspaceRelativePath:managedPath error:nil].path]
+        : linkedPath.length > 0 &&
+          [self linkedPDFURLForSource:source requireExisting:YES verifyHash:NO error:nil] != nil;
     NSString *verificationStatus = [paper[@"verificationStatus"] isKindOfClass:NSString.class]
         ? paper[@"verificationStatus"] : nil;
     if (![validStatuses containsObject:verificationStatus]) {
@@ -997,15 +1122,26 @@
     NSString *pdfPath = [source[@"pdfPath"] isKindOfClass:NSString.class]
         ? source[@"pdfPath"]
         : ([sourcePaper[@"pdfPath"] isKindOfClass:NSString.class] ? sourcePaper[@"pdfPath"] : nil);
-    BOOL safePDF = pdfPath.length > 0 && !pdfPath.isAbsolutePath &&
+    BOOL linkedPDF = [self isLinkedPDFSource:source];
+    BOOL safeManagedPDF = !linkedPDF && pdfPath.length > 0 && !pdfPath.isAbsolutePath &&
         [self isSafeWorkspaceRelativePath:pdfPath] &&
         [pdfPath.stringByStandardizingPath hasPrefix:@"Library/PDFs/"];
-    NSURL *pdfURL = safePDF ? [self URLForWorkspaceRelativePath:pdfPath error:nil] : nil;
-    BOOL pdfExists = pdfURL && [manager fileExistsAtPath:pdfURL.path];
-    if (safePDF) {
+    NSURL *pdfURL = linkedPDF
+        ? [self linkedPDFURLForSource:source requireExisting:NO verifyHash:NO error:nil]
+        : (safeManagedPDF ? [self URLForWorkspaceRelativePath:pdfPath error:nil] : nil);
+    BOOL safePDF = pdfURL != nil;
+    BOOL pdfExists = linkedPDF
+        ? [self linkedPDFURLForSource:source requireExisting:YES verifyHash:NO error:nil] != nil
+        : pdfURL && [manager fileExistsAtPath:pdfURL.path];
+    if (safeManagedPDF) {
       pdfPath = pdfPath.stringByStandardizingPath;
+      source[@"storageMode"] = @"managed";
       source[@"pdfPath"] = pdfPath;
       paper[@"pdfPath"] = pdfPath;
+    } else if (linkedPDF && safePDF) {
+      source[@"storageMode"] = @"linked";
+      source[@"pdfPath"] = pdfURL.path;
+      paper[@"pdfPath"] = pdfURL.path;
     } else {
       [source removeObjectForKey:@"pdfPath"];
       paper[@"pdfPath"] = @"";
@@ -1263,15 +1399,15 @@
         ? [source[@"sha256"] lowercaseString] : nil;
     NSString *cardPath = [artifacts[@"cardPath"] isKindOfClass:NSString.class] ? artifacts[@"cardPath"] : nil;
     NSString *fulltextPath = [artifacts[@"fulltextPath"] isKindOfClass:NSString.class] ? artifacts[@"fulltextPath"] : nil;
-    BOOL pdfExists = pdfPath.length > 0 &&
-        [NSFileManager.defaultManager fileExistsAtPath:[self URLForWorkspaceRelativePath:pdfPath error:nil].path];
+    NSURL *pdfURL = pdfPath.length > 0
+        ? [self registeredPDFURLForSource:source requireExisting:YES verifyHash:NO error:nil]
+        : nil;
+    BOOL pdfExists = pdfURL != nil;
     BOOL cardExists = cardPath.length > 0 &&
         [NSFileManager.defaultManager fileExistsAtPath:[self URLForWorkspaceRelativePath:cardPath error:nil].path];
     BOOL fulltextExists = fulltextPath.length > 0 &&
         [NSFileManager.defaultManager fileExistsAtPath:[self URLForWorkspaceRelativePath:fulltextPath error:nil].path];
-    NSString *actualHash = pdfExists
-        ? [self cachedSHA256ForFileAtURL:[self URLForWorkspaceRelativePath:pdfPath error:nil] error:nil]
-        : nil;
+    NSString *actualHash = pdfExists ? [self cachedSHA256ForFileAtURL:pdfURL error:nil] : nil;
     BOOL sourceHashRecorded = expectedHash.length == CC_SHA256_DIGEST_LENGTH * 2;
     BOOL sourceHashReadable = actualHash.length == CC_SHA256_DIGEST_LENGTH * 2;
     BOOL sourceHashMatches = sourceHashRecorded && sourceHashReadable &&
@@ -1820,7 +1956,8 @@
             ? source[@"pdfPath"] : ([paper[@"pdfPath"] isKindOfClass:NSString.class] ? paper[@"pdfPath"] : nil);
         if (pdfPath.length > 0) {
           updated[@"localPath"] = pdfPath;
-          updated[@"storedFilename"] = pdfPath.lastPathComponent;
+          if ([self isLinkedPDFSource:source]) [updated removeObjectForKey:@"storedFilename"];
+          else updated[@"storedFilename"] = pdfPath.lastPathComponent;
         }
         if ([source[@"arxivId"] isKindOfClass:NSString.class]) {
           updated[@"arxivId"] = source[@"arxivId"];
@@ -1854,6 +1991,25 @@
                          inContentWorld:WKContentWorld.pageWorld
                       completionHandler:nil];
   });
+}
+
+- (BOOL)validateLinkedSourcesInGraph:(NSDictionary *)graph error:(NSError **)error {
+  for (id rawPaper in [graph[@"papers"] isKindOfClass:NSArray.class] ? graph[@"papers"] : @[]) {
+    if (![rawPaper isKindOfClass:NSDictionary.class]) continue;
+    NSDictionary *paper = rawPaper;
+    NSDictionary *source = [paper[@"source"] isKindOfClass:NSDictionary.class] ? paper[@"source"] : @{};
+    if (![self isLinkedPDFSource:source]) continue;
+    if (![self linkedPDFURLForSource:source requireExisting:YES verifyHash:YES error:error]) {
+      if (error && !*error) {
+        NSString *paperID = [paper[@"id"] isKindOfClass:NSString.class] ? paper[@"id"] : @"unknown";
+        *error = [self storageError:
+            [NSString stringWithFormat:@"The linked source for paper %@ is missing, changed, or outside its registered root.", paperID]
+                              code:653];
+      }
+      return NO;
+    }
+  }
+  return YES;
 }
 
 - (void)commitRefreshPayload:(NSDictionary *)request {
@@ -1930,6 +2086,10 @@
       ![actualHash isEqualToString:requestedHash]) {
     [self sendWorkspaceErrorForAction:@"commitRefresh"
                                 error:[self storageError:@"Refresh validation failed: revision or snapshot SHA-256 mismatch." code:410]];
+    return;
+  }
+  if (![self validateLinkedSourcesInGraph:snapshot error:&error]) {
+    [self sendWorkspaceErrorForAction:@"commitRefresh" error:error];
     return;
   }
 
@@ -3590,6 +3750,130 @@
   };
 }
 
+- (NSString *)normalizedLocalPreparationDOI:(id)value {
+  if (![value isKindOfClass:NSString.class]) return nil;
+  NSString *candidate = [(NSString *)value
+      stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet].lowercaseString;
+  candidate = [candidate stringByReplacingOccurrencesOfString:@"^https?://(?:dx\\.)?doi\\.org/"
+                                                    withString:@""
+                                                       options:NSRegularExpressionSearch
+                                                         range:NSMakeRange(0, candidate.length)];
+  NSRegularExpression *expression = [NSRegularExpression
+      regularExpressionWithPattern:@"^10\\.[0-9]{4,9}/\\S+$" options:0 error:nil];
+  return [expression firstMatchInString:candidate options:0 range:NSMakeRange(0, candidate.length)]
+      ? candidate : nil;
+}
+
+- (NSDictionary *)validatedStrictDuplicateResolutionForManifest:(NSDictionary *)manifest
+                                                            error:(NSError **)error {
+  if (![manifest[@"state"] isEqualToString:@"duplicate"]) return nil;
+  NSDictionary *duplicate = [manifest[@"duplicateOf"] isKindOfClass:NSDictionary.class]
+      ? manifest[@"duplicateOf"] : nil;
+  NSDictionary *deduplication = [manifest[@"deduplication"] isKindOfClass:NSDictionary.class]
+      ? manifest[@"deduplication"] : nil;
+  NSDictionary *strictKeys = [deduplication[@"strictKeys"] isKindOfClass:NSDictionary.class]
+      ? deduplication[@"strictKeys"] : nil;
+  NSArray *matchedBy = [deduplication[@"matchedBy"] isKindOfClass:NSArray.class]
+      ? deduplication[@"matchedBy"] : nil;
+  NSString *paperID = [duplicate[@"paperId"] isKindOfClass:NSString.class]
+      ? [duplicate[@"paperId"] stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet]
+      : nil;
+  NSSet *allowedKeys = [NSSet setWithArray:@[ @"sha256", @"arxiv_id", @"doi" ]];
+  NSMutableSet *uniqueKeys = [NSMutableSet set];
+  for (id rawKey in matchedBy ?: @[]) {
+    if (![rawKey isKindOfClass:NSString.class] || ![allowedKeys containsObject:rawKey] ||
+        [uniqueKeys containsObject:rawKey]) {
+      if (error) *error = [self storageError:
+          @"The local duplicate result contains an invalid or repeated strict identity key."
+                                               code:636];
+      return nil;
+    }
+    [uniqueKeys addObject:rawKey];
+  }
+  NSArray *conflicts = [deduplication[@"conflicts"] isKindOfClass:NSArray.class]
+      ? deduplication[@"conflicts"] : @[];
+  if (!duplicate || !strictKeys || paperID.length == 0 || paperID.length > 256 ||
+      uniqueKeys.count == 0 || conflicts.count > 0) {
+    if (error) *error = [self storageError:
+        @"The local duplicate result is incomplete or contains conflicting identifiers."
+                                             code:637];
+    return nil;
+  }
+
+  NSError *catalogError = nil;
+  NSDictionary *catalog = [self readDictionaryAtURL:[self papersIndexURL]
+                                        defaultValue:nil error:&catalogError];
+  NSArray *papers = [catalog[@"papers"] isKindOfClass:NSArray.class] ? catalog[@"papers"] : nil;
+  NSDictionary *target = nil;
+  NSUInteger targetCount = 0;
+  for (id rawPaper in papers ?: @[]) {
+    if (![rawPaper isKindOfClass:NSDictionary.class]) continue;
+    NSString *candidateID = [rawPaper[@"paperId"] isKindOfClass:NSString.class]
+        ? rawPaper[@"paperId"] : ([rawPaper[@"id"] isKindOfClass:NSString.class] ? rawPaper[@"id"] : nil);
+    if ([candidateID isEqualToString:paperID]) {
+      target = rawPaper;
+      targetCount += 1;
+    }
+  }
+  if (!catalog || !papers || targetCount != 1) {
+    if (error) *error = catalogError ?: [self storageError:
+        @"The strict duplicate target is missing or duplicated in Knowledge/papers.json."
+                                                    code:638];
+    return nil;
+  }
+
+  NSDictionary *targetSource = [target[@"source"] isKindOfClass:NSDictionary.class]
+      ? target[@"source"] : @{};
+  NSString *targetSHA = [target[@"sha256"] isKindOfClass:NSString.class]
+      ? [target[@"sha256"] lowercaseString]
+      : ([targetSource[@"sha256"] isKindOfClass:NSString.class]
+          ? [targetSource[@"sha256"] lowercaseString] : nil);
+  NSString *targetArxiv = [self arxivBaseIdentifier:
+      ([target[@"arxivBase"] isKindOfClass:NSString.class] ? target[@"arxivBase"]
+       : ([target[@"arxivId"] isKindOfClass:NSString.class] ? target[@"arxivId"]
+          : targetSource[@"arxivId"]))];
+  NSString *targetDOI = [self normalizedLocalPreparationDOI:
+      ([target[@"doi"] isKindOfClass:NSString.class] ? target[@"doi"] : targetSource[@"doi"])];
+  NSString *sourceSHA = [manifest[@"sourceSha256"] isKindOfClass:NSString.class]
+      ? manifest[@"sourceSha256"] : nil;
+  NSString *incomingSHA = [strictKeys[@"sha256"] isKindOfClass:NSString.class]
+      ? strictKeys[@"sha256"] : nil;
+  NSString *incomingArxiv = [self arxivBaseIdentifier:
+      ([strictKeys[@"arxivBase"] isKindOfClass:NSString.class] ? strictKeys[@"arxivBase"] : nil)];
+  NSString *incomingDOI = [self normalizedLocalPreparationDOI:strictKeys[@"doi"]];
+  NSDictionary *canonical = [manifest[@"canonicalMetadata"] isKindOfClass:NSDictionary.class]
+      ? manifest[@"canonicalMetadata"] : @{};
+  NSString *canonicalArxiv = [self arxivBaseIdentifier:canonical[@"arxivId"]];
+  NSString *canonicalDOI = [self normalizedLocalPreparationDOI:canonical[@"doi"]];
+
+  BOOL valid = sourceSHA.length == 64 && [incomingSHA isEqualToString:sourceSHA];
+  if (incomingArxiv.length > 0) valid = valid && [canonicalArxiv isEqualToString:incomingArxiv];
+  if (incomingDOI.length > 0) valid = valid && [canonicalDOI isEqualToString:incomingDOI];
+  if ([uniqueKeys containsObject:@"sha256"]) valid = valid && [targetSHA isEqualToString:sourceSHA];
+  if ([uniqueKeys containsObject:@"arxiv_id"]) {
+    valid = valid && incomingArxiv.length > 0 && [targetArxiv isEqualToString:incomingArxiv];
+  }
+  if ([uniqueKeys containsObject:@"doi"]) {
+    valid = valid && incomingDOI.length > 0 && [targetDOI isEqualToString:incomingDOI];
+  }
+  // A matching key must not mask a contradictory bibliographic identifier on
+  // the same catalog paper. Missing identifiers are allowed; differing known
+  // DOI or arXiv identities require manual review.
+  if (incomingArxiv.length > 0 && targetArxiv.length > 0 && ![incomingArxiv isEqualToString:targetArxiv]) valid = NO;
+  if (incomingDOI.length > 0 && targetDOI.length > 0 && ![incomingDOI isEqualToString:targetDOI]) valid = NO;
+  if (!valid) {
+    if (error) *error = [self storageError:
+        @"The strict duplicate result does not close against the current catalog identifiers."
+                                             code:639];
+    return nil;
+  }
+  return @{
+    @"paperId": paperID,
+    @"matchedBy": [[uniqueKeys allObjects] sortedArrayUsingSelector:@selector(compare:)],
+    @"strictKeys": strictKeys
+  };
+}
+
 - (BOOL)localPreparationFileAtURL:(NSURL *)fileURL
                 isConfinedToRoot:(NSURL *)rootURL
                            error:(NSError **)error {
@@ -3678,10 +3962,16 @@
   }
   if ([sourceType isEqualToString:@"pdf"]) {
     NSDictionary *source = [item[@"source"] isKindOfClass:NSDictionary.class] ? item[@"source"] : @{};
+    BOOL linkedSource = [self isLinkedPDFSource:source];
     NSString *expectedSourceHash = [source[@"sha256"] isKindOfClass:NSString.class]
         ? source[@"sha256"] : item[@"sha256"];
-    if (![manifest[@"sourceSha256"] isEqualToString:expectedSourceHash]) {
-      if (error) *error = [self storageError:@"The prepared PDF does not match the managed source SHA-256." code:609];
+    NSString *canonicalStorageMode = [canonical[@"storageMode"] isKindOfClass:NSString.class]
+        ? canonical[@"storageMode"] : @"managed";
+    if (![manifest[@"sourceSha256"] isEqualToString:expectedSourceHash] ||
+        ![canonicalStorageMode isEqualToString:(linkedSource ? @"linked" : @"managed")] ||
+        (linkedSource && (![canonical[@"linkedRootPath"] isEqualToString:source[@"linkedRootPath"]] ||
+            ![canonical[@"relativePath"] isEqualToString:source[@"relativePath"]]))) {
+      if (error) *error = [self storageError:@"The prepared PDF does not match the registered source mode or SHA-256." code:609];
       return nil;
     }
   } else if ([sourceType isEqualToString:@"arxiv"]) {
@@ -3775,8 +4065,15 @@
       NSDictionary *packet = [rawPacket isKindOfClass:NSDictionary.class] ? rawPacket : nil;
       NSDictionary *packetGuardrails = [packet[@"guardrails"] isKindOfClass:NSDictionary.class]
           ? packet[@"guardrails"] : nil;
+      NSString *packetSchema = [packet[@"schemaVersion"] isKindOfClass:NSString.class]
+          ? packet[@"schemaVersion"] : nil;
+      NSArray *compatibility = [packet[@"compatibility"] isKindOfClass:NSArray.class]
+          ? packet[@"compatibility"] : @[];
+      BOOL supportedPacketSchema = [packetSchema isEqualToString:@"liteverse-review-packet-v1"] ||
+          ([packetSchema isEqualToString:@"liteverse-review-packet-v2"] &&
+           [compatibility containsObject:@"liteverse-review-packet-v1-fields"]);
       BOOL routingOnly = packet &&
-          [packet[@"schemaVersion"] isEqualToString:@"liteverse-review-packet-v1"] &&
+          supportedPacketSchema &&
           [packet[@"itemId"] isEqualToString:itemID] &&
           [self revision:packet[@"itemRevision"] matches:@(expectedRevision)] &&
           [packet[@"sourceSha256"] isEqualToString:manifest[@"sourceSha256"]] &&
@@ -3801,20 +4098,106 @@
     }
   }
   NSString *state = manifest[@"state"];
-  if (([state isEqualToString:@"ready"] && ![roles isEqualToSet:[NSSet setWithArray:@[ @"pdf", @"fulltext", @"card", @"review_packet" ]]]) ||
+  NSDictionary *queuedSource = [item[@"source"] isKindOfClass:NSDictionary.class] ? item[@"source"] : @{};
+  BOOL linkedReady = [self isLinkedPDFSource:queuedSource];
+  NSDictionary *suggestedDestinations = [manifest[@"suggestedDestinations"] isKindOfClass:NSDictionary.class]
+      ? manifest[@"suggestedDestinations"] : @{};
+  if (linkedReady && ([roles containsObject:@"pdf"] || [paths containsObject:@"source.pdf"] ||
+      suggestedDestinations[@"source.pdf"] != nil)) {
+    if (error) *error = [self storageError:@"A linked-source result may never contain or suggest a copied source.pdf." code:635];
+    return nil;
+  }
+  NSSet *readyRoles = [NSSet setWithArray:linkedReady
+      ? @[ @"fulltext", @"card", @"review_packet" ]
+      : @[ @"pdf", @"fulltext", @"card", @"review_packet" ]];
+  if (([state isEqualToString:@"ready"] && ![roles isEqualToSet:readyRoles]) ||
       ([state isEqualToString:@"duplicate"] && outputs.count != 0)) {
     if (error) *error = [self storageError:@"The local preparation state and output closure do not agree." code:619];
     return nil;
   }
+  if ([state isEqualToString:@"duplicate"] &&
+      ![self validatedStrictDuplicateResolutionForManifest:manifest error:error]) {
+    return nil;
+  }
   NSDictionary *paper = [manifest[@"paper"] isKindOfClass:NSDictionary.class] ? manifest[@"paper"] : nil;
   if (paper && (![paper[@"libraryItemId"] isEqualToString:itemID] ||
-                ![self revision:paper[@"libraryItemRevision"] matches:@(expectedRevision)])) {
+                ![self revision:paper[@"libraryItemRevision"] matches:@(expectedRevision)] ||
+                (linkedReady && (![paper[@"storageMode"] isEqualToString:@"linked"] ||
+                    ![paper[@"pdfPath"] isEqualToString:(queuedSource[@"pdfPath"] ?: @"")] ||
+                    ![paper[@"linkedRootPath"] isEqualToString:queuedSource[@"linkedRootPath"]] ||
+                    ![paper[@"relativePath"] isEqualToString:queuedSource[@"relativePath"]])))) {
     if (error) *error = [self storageError:@"The prepared paper metadata points to a different Library revision." code:620];
     return nil;
   }
   if (manifestSHA256) *manifestSHA256 = [self sha256ForData:storedManifest];
   if (manifestPath) *manifestPath = [NSString stringWithFormat:@"Work/LocalPipeline/%@/manifest.json", jobID];
   return manifest;
+}
+
+- (NSDictionary *)routingScreeningInputForManifest:(NSDictionary *)manifest
+                                              jobID:(NSString *)jobID {
+  NSDictionary *canonical = [manifest[@"canonicalMetadata"] isKindOfClass:NSDictionary.class]
+      ? manifest[@"canonicalMetadata"] : @{};
+  NSString *title = [canonical[@"title"] isKindOfClass:NSString.class]
+      ? [canonical[@"title"] stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet]
+      : @"";
+  NSMutableArray<NSString *> *fragments = [NSMutableArray array];
+  if (title.length > 0 && title.length <= 1000) [fragments addObject:title];
+  NSMutableArray<NSString *> *anchorIDs = [NSMutableArray array];
+  NSString *method = @"fts5_bm25_title_v1";
+
+  NSDictionary *packet = nil;
+  for (NSDictionary *output in [manifest[@"outputs"] isKindOfClass:NSArray.class] ? manifest[@"outputs"] : @[]) {
+    if (![output[@"role"] isEqualToString:@"review_packet"] ||
+        ![output[@"path"] isKindOfClass:NSString.class]) continue;
+    NSURL *packetURL = [[[self localPreparationPipelineURL]
+        URLByAppendingPathComponent:jobID isDirectory:YES]
+        URLByAppendingPathComponent:output[@"path"] isDirectory:NO];
+    NSData *packetData = [NSData dataWithContentsOfURL:packetURL options:NSDataReadingMappedIfSafe error:nil];
+    id parsed = packetData ? [NSJSONSerialization JSONObjectWithData:packetData options:0 error:nil] : nil;
+    if ([parsed isKindOfClass:NSDictionary.class]) packet = parsed;
+    break;
+  }
+  BOOL packetV2 = [packet[@"schemaVersion"] isEqualToString:@"liteverse-review-packet-v2"] &&
+      [packet[@"purpose"] isEqualToString:@"routing_only"] &&
+      [packet[@"status"] isEqualToString:@"provisional"];
+  NSDictionary *candidateSets = packetV2 && [packet[@"candidateSets"] isKindOfClass:NSDictionary.class]
+      ? packet[@"candidateSets"] : @{};
+  if (packetV2) {
+    method = @"fts5_bm25_review_packet_v2";
+    for (NSString *setName in @[ @"researchQuestions", @"methods", @"results" ]) {
+      NSArray *candidates = [candidateSets[setName] isKindOfClass:NSArray.class]
+          ? candidateSets[setName] : @[];
+      NSUInteger retained = 0;
+      for (NSDictionary *candidate in candidates) {
+        if (![candidate isKindOfClass:NSDictionary.class] || retained >= 2) break;
+        NSString *text = [candidate[@"text"] isKindOfClass:NSString.class]
+            ? [candidate[@"text"] stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet]
+            : @"";
+        if (text.length == 0) continue;
+        if (text.length > 220) {
+          NSRange safeRange = [text rangeOfComposedCharacterSequencesForRange:NSMakeRange(0, 220)];
+          text = [text substringWithRange:safeRange];
+        }
+        [fragments addObject:text];
+        NSString *anchorID = [candidate[@"id"] isKindOfClass:NSString.class]
+            ? candidate[@"id"] : ([candidate[@"candidateId"] isKindOfClass:NSString.class]
+                ? candidate[@"candidateId"] : nil);
+        if (anchorID.length > 0 && anchorID.length <= 160) [anchorIDs addObject:anchorID];
+        retained += 1;
+      }
+    }
+  }
+  NSString *query = [fragments componentsJoinedByString:@" "];
+  if (query.length > 2000) {
+    NSRange safeRange = [query rangeOfComposedCharacterSequencesForRange:NSMakeRange(0, 2000)];
+    query = [query substringWithRange:safeRange];
+  }
+  return @{
+    @"query": query,
+    @"method": method,
+    @"anchorIds": anchorIDs
+  };
 }
 
 - (void)finishLocalPreparationForItemID:(NSString *)itemID
@@ -3860,7 +4243,19 @@
     return;
   }
 
-  BOOL ready = manifest && !failureReason && ![manifest[@"state"] isEqualToString:@"needs_attention"];
+  NSString *resolvedFailureReason = failureReason;
+  NSDictionary *strictDuplicateResolution = nil;
+  if (manifest && !resolvedFailureReason && [manifest[@"state"] isEqualToString:@"duplicate"]) {
+    NSError *duplicateError = nil;
+    strictDuplicateResolution = [self validatedStrictDuplicateResolutionForManifest:manifest
+                                                                                error:&duplicateError];
+    if (!strictDuplicateResolution) {
+      resolvedFailureReason = duplicateError.localizedDescription ?:
+          @"Strict duplicate validation failed closed against the current catalog.";
+    }
+  }
+  BOOL autoResolvedDuplicate = strictDuplicateResolution != nil;
+  BOOL ready = manifest && !resolvedFailureReason && ![manifest[@"state"] isEqualToString:@"needs_attention"];
   NSMutableDictionary *nextPreparation = [@{
     @"schemaVersion": @1,
     @"state": ready ? @"ready" : @"needs_attention",
@@ -3879,6 +4274,14 @@
       ? manifestPreparation[@"reason"] : nil;
   if (manifestState) nextPreparation[@"resultState"] = manifestState;
   if (extractionStatus) nextPreparation[@"extractionStatus"] = extractionStatus;
+  if (autoResolvedDuplicate) {
+    nextPreparation[@"duplicateOf"] = @{ @"paperId": strictDuplicateResolution[@"paperId"] };
+    nextPreparation[@"deduplication"] = @{
+      @"method": @"strict_identity_v1",
+      @"matchedBy": strictDuplicateResolution[@"matchedBy"],
+      @"strictKeys": strictDuplicateResolution[@"strictKeys"]
+    };
+  }
   for (NSDictionary *output in [manifest[@"outputs"] isKindOfClass:NSArray.class] ? manifest[@"outputs"] : @[]) {
     if ([output[@"role"] isEqualToString:@"review_packet"] && [output[@"path"] isKindOfClass:NSString.class]) {
       nextPreparation[@"reviewPacketPath"] = [NSString stringWithFormat:@"Work/LocalPipeline/%@/%@", jobID, output[@"path"]];
@@ -3886,35 +4289,107 @@
     }
   }
   if (ready && [manifestState isEqualToString:@"ready"]) {
-    NSDictionary *canonical = [manifest[@"canonicalMetadata"] isKindOfClass:NSDictionary.class]
-        ? manifest[@"canonicalMetadata"] : nil;
-    NSString *canonicalTitle = [canonical[@"title"] isKindOfClass:NSString.class]
-        ? [canonical[@"title"] stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet]
-        : @"";
+    NSDictionary *screeningInput = [self routingScreeningInputForManifest:manifest jobID:jobID];
+    NSString *screeningQuery = [screeningInput[@"query"] isKindOfClass:NSString.class]
+        ? screeningInput[@"query"] : @"";
     NSMutableArray *candidates = [NSMutableArray array];
-    if (canonicalTitle.length > 0 && canonicalTitle.length <= 2000) {
+    if (screeningQuery.length > 0 && screeningQuery.length <= 2000) {
       NSError *searchError = nil;
-      NSDictionary *searchResult = [self searchLiteratureAtIndexForQuery:canonicalTitle limit:12 error:&searchError];
+      NSDictionary *searchResult = nil;
+      if ([screeningInput[@"method"] isEqualToString:@"fts5_bm25_review_packet_v2"]) {
+        searchResult = [self searchLiteratureAtIndexForQuery:screeningQuery limit:24 error:&searchError];
+      } else {
+        NSString *canonicalTitle = screeningQuery;
+        searchResult = [self searchLiteratureAtIndexForQuery:canonicalTitle limit:12 error:&searchError];
+      }
       for (NSDictionary *candidate in [searchResult[@"results"] isKindOfClass:NSArray.class]
                ? searchResult[@"results"] : @[]) {
         NSString *paperID = [candidate[@"paperId"] isKindOfClass:NSString.class] ? candidate[@"paperId"] : nil;
         NSNumber *rank = [candidate[@"rank"] isKindOfClass:NSNumber.class] ? candidate[@"rank"] : nil;
-        if (paperID.length > 0 && rank) [candidates addObject:@{ @"paperId": paperID, @"rank": rank }];
+        if (paperID.length == 0 || !rank) continue;
+        NSMutableDictionary *route = [@{
+          @"paperId": paperID,
+          @"rank": rank,
+          @"routingOnly": @YES
+        } mutableCopy];
+        for (NSString *key in @[ @"title", @"verificationStatus", @"primaryCategory",
+                                 @"secondaryCategory", @"artifactRevision", @"artifactSha256" ]) {
+          if (candidate[key] && candidate[key] != NSNull.null) route[key] = candidate[key];
+        }
+        NSString *snippet = [candidate[@"snippet"] isKindOfClass:NSString.class]
+            ? [self contextPreviewText:candidate[@"snippet"] limitedTo:480] : @"";
+        if (snippet.length > 0) route[@"snippet"] = snippet;
+        NSMutableArray *claimRoutes = [NSMutableArray array];
+        NSArray *matchingClaims = [candidate[@"matchingClaims"] isKindOfClass:NSArray.class]
+            ? candidate[@"matchingClaims"] : @[];
+        for (NSDictionary *claim in matchingClaims) {
+          if (![claim isKindOfClass:NSDictionary.class] || claimRoutes.count >= 2) break;
+          NSString *claimID = [claim[@"claimId"] isKindOfClass:NSString.class] ? claim[@"claimId"] : nil;
+          NSString *claimText = [claim[@"text"] isKindOfClass:NSString.class]
+              ? [self contextPreviewText:claim[@"text"] limitedTo:480] : @"";
+          if (claimID.length == 0 || claimText.length == 0) continue;
+          NSMutableDictionary *claimRoute = [@{
+            @"claimId": claimID,
+            @"text": claimText,
+            @"routingOnly": @YES
+          } mutableCopy];
+          for (NSString *key in @[ @"type", @"section", @"verificationStatus",
+                                   @"artifactRevision", @"artifactSha256", @"rank" ]) {
+            if (claim[key] && claim[key] != NSNull.null) claimRoute[key] = claim[key];
+          }
+          NSArray *evidence = [claim[@"evidence"] isKindOfClass:NSArray.class] ? claim[@"evidence"] : @[];
+          if (evidence.count > 0) {
+            claimRoute[@"evidence"] = evidence.count > 2
+                ? [evidence subarrayWithRange:NSMakeRange(0, 2)] : evidence;
+          }
+          [claimRoutes addObject:claimRoute];
+        }
+        if (claimRoutes.count > 0) route[@"matchingClaims"] = claimRoutes;
+        [candidates addObject:route];
+      }
+      if ([searchResult[@"indexFingerprint"] isKindOfClass:NSString.class]) {
+        nextPreparation[@"screeningIndexFingerprint"] = searchResult[@"indexFingerprint"];
       }
       // Search is a rebuildable convenience. A missing, stale, or unhealthy
       // FTS index never downgrades otherwise valid local preparation.
       (void)searchError;
     }
     nextPreparation[@"screeningCandidates"] = candidates;
-    nextPreparation[@"screeningMethod"] = @"fts5_bm25_title_v1";
+    nextPreparation[@"screeningMethod"] = screeningInput[@"method"] ?: @"fts5_bm25_title_v1";
+    nextPreparation[@"screeningAnchorIds"] = screeningInput[@"anchorIds"] ?: @[];
   }
-  if (!ready) nextPreparation[@"reason"] = [self boundedLocalPreparationReason:failureReason ?: manifestReason];
+  if (!ready) nextPreparation[@"reason"] = [self boundedLocalPreparationReason:resolvedFailureReason ?: manifestReason];
 
   NSMutableDictionary *updated = [current mutableCopy];
   updated[@"preparation"] = nextPreparation;
   updated[@"revision"] = @(expectedRevision + 1);
-  updated[@"updatedAt"] = [self isoTimestamp];
-  updated[@"status"] = ready ? @"pending_codex" : @"needs_attention";
+  NSString *completedAt = [self isoTimestamp];
+  updated[@"updatedAt"] = completedAt;
+  if (autoResolvedDuplicate) {
+    updated[@"status"] = @"organized";
+    updated[@"disposition"] = @"duplicate";
+    updated[@"duplicateOfPaperId"] = strictDuplicateResolution[@"paperId"];
+    updated[@"organizedAt"] = completedAt;
+    updated[@"autoResolution"] = @{
+      @"schemaVersion": @1,
+      @"method": @"strict_identity_v1",
+      @"sourceRevision": @(expectedRevision),
+      @"resolvedRevision": @(expectedRevision + 1),
+      @"jobId": jobID,
+      @"resultSha256": manifestSHA256 ?: @"",
+      @"manifestPath": manifestPath ?: @"",
+      @"duplicateOfPaperId": strictDuplicateResolution[@"paperId"],
+      @"matchedBy": strictDuplicateResolution[@"matchedBy"],
+      @"resolvedAt": completedAt
+    };
+    // A duplicate item records its target without becoming a second catalog
+    // owner for that Graph paper.
+    [updated removeObjectForKey:@"graphPaperId"];
+    [updated removeObjectForKey:@"refreshId"];
+    [updated removeObjectForKey:@"readyToRefreshAt"];
+  } else {
+    updated[@"status"] = ready ? @"pending_codex" : @"needs_attention";
+  }
   items[matchingIndex] = updated;
   NSMutableDictionary *library = [storedLibrary mutableCopy];
   library[@"items"] = items;
@@ -3922,9 +4397,29 @@
     [self sendWorkspaceErrorForAction:@"localPreparation" error:error];
     return;
   }
-  NSString *notice = ready
-      ? @"Local preparation finished. The paper remains pending until Codex verifies its scientific content."
-      : @"Local preparation needs attention. Review the status in Library and retry when ready.";
+  if (autoResolvedDuplicate && ![self appendJSONObject:@{
+        @"eventId": NSUUID.UUID.UUIDString,
+        @"action": @"literature_duplicate_auto_resolved",
+        @"timestamp": completedAt,
+        @"itemId": itemID,
+        @"sourceRevision": @(expectedRevision),
+        @"resolvedRevision": @(expectedRevision + 1),
+        @"jobId": jobID,
+        @"resultSha256": manifestSHA256 ?: @"",
+        @"manifestPath": manifestPath ?: @"",
+        @"disposition": @"duplicate",
+        @"duplicateOfPaperId": strictDuplicateResolution[@"paperId"],
+        @"matchedBy": strictDuplicateResolution[@"matchedBy"]
+      } toURL:[self workspaceInboxURL] error:&error]) {
+    [self writeJSONObject:storedLibrary toURL:[self libraryURL] error:nil];
+    [self sendWorkspaceErrorForAction:@"localPreparation" error:error];
+    return;
+  }
+  NSString *notice = autoResolvedDuplicate
+      ? @"A strict duplicate was verified locally and organized automatically. No scientific content, Graph, or Usage data changed."
+      : (ready
+          ? @"Local preparation finished. Scientific evidence can now be reviewed in a bounded batch; only accepted source pages require Codex judgment."
+          : @"Local preparation needs attention. Review the status in Library and retry when ready.");
   [self sendWorkspaceWithNotice:notice];
 }
 
@@ -3951,18 +4446,40 @@
   NSMutableDictionary *source = [NSMutableDictionary dictionary];
   NSString *sourceType = item[@"sourceType"];
   if ([sourceType isEqualToString:@"pdf"]) {
-    NSString *relativePath = [item[@"localPath"] isKindOfClass:NSString.class]
-        ? item[@"localPath"] : [item[@"source"] isKindOfClass:NSDictionary.class] ? item[@"source"][@"pdfPath"] : nil;
-    NSURL *managedURL = [self URLForWorkspaceRelativePath:relativePath error:&error];
-    NSURL *managedRoot = [self pdfDirectoryURL].URLByStandardizingPath.URLByResolvingSymlinksInPath;
-    NSURL *resolvedManagedURL = managedURL.URLByStandardizingPath.URLByResolvingSymlinksInPath;
-    NSString *managedPrefix = [managedRoot.path stringByAppendingString:@"/"];
-    if (!managedURL || ![resolvedManagedURL.path hasPrefix:managedPrefix] ||
-        ![self localPreparationFileAtURL:resolvedManagedURL isConfinedToRoot:managedRoot error:&error]) {
-      if (!error) error = [self storageError:@"The queued PDF is outside the managed Library/PDFs directory." code:623];
+    NSDictionary *registeredSource = [item[@"source"] isKindOfClass:NSDictionary.class]
+        ? item[@"source"] : @{};
+    BOOL linkedSource = [self isLinkedPDFSource:registeredSource];
+    NSURL *registeredURL = [self registeredPDFURLForSource:registeredSource
+                                            requireExisting:YES
+                                                 verifyHash:YES
+                                                      error:&error];
+    if (!registeredURL) {
+      if (!error) error = [self storageError:@"The queued PDF no longer matches its registered source descriptor." code:623];
     } else {
       source[@"kind"] = @"pdf";
-      source[@"pdfPath"] = resolvedManagedURL.path;
+      source[@"storageMode"] = linkedSource ? @"linked" : @"managed";
+      source[@"pdfPath"] = registeredURL.path;
+      source[@"expectedSha256"] = registeredSource[@"sha256"];
+      if (linkedSource) {
+        source[@"linkedRootPath"] = registeredSource[@"linkedRootPath"];
+        source[@"relativePath"] = registeredSource[@"relativePath"];
+      }
+      // Catalog metadata is an identity hint only. The Worker keeps local PDF
+      // metadata provisional and never turns Zotero fields into scientific
+      // claims or evidence.
+      NSDictionary *catalogMetadata = [registeredSource[@"catalogMetadata"] isKindOfClass:NSDictionary.class]
+          ? registeredSource[@"catalogMetadata"] : @{};
+      NSString *catalogTitle = [catalogMetadata[@"title"] isKindOfClass:NSString.class]
+          ? [catalogMetadata[@"title"] stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet]
+          : @"";
+      NSArray *catalogAuthors = [catalogMetadata[@"authors"] isKindOfClass:NSArray.class]
+          ? catalogMetadata[@"authors"] : @[];
+      NSString *catalogDOI = [catalogMetadata[@"doi"] isKindOfClass:NSString.class]
+          ? [catalogMetadata[@"doi"] stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet]
+          : @"";
+      if (catalogTitle.length > 0) source[@"title"] = catalogTitle;
+      if (catalogAuthors.count > 0) source[@"authors"] = catalogAuthors;
+      if (catalogDOI.length > 0) source[@"doi"] = catalogDOI;
     }
   } else if ([sourceType isEqualToString:@"arxiv"]) {
     NSString *arxivID = [self normalizedArxivIDFromValue:item[@"arxivId"]];
@@ -4199,7 +4716,7 @@
       [self sendWorkspaceErrorForAction:@"saveArxiv" error:error];
       return;
     }
-    [self sendWorkspaceWithNotice:@"The arXiv link was saved locally. Deterministic preparation is running before Codex scientific review."];
+    [self sendWorkspaceWithNotice:@"The arXiv link was saved locally. Deterministic preparation is running; scientific evidence will be reviewed in a bounded batch."];
     [self scheduleLocalPreparationForItem:item];
   });
 }
@@ -4277,6 +4794,7 @@
       @"localPath": relativePath,
       @"source": @{
         @"kind": @"pdf",
+        @"storageMode": @"managed",
         @"pdfPath": relativePath,
         @"sha256": managedHash ?: sourceHash
       },
@@ -4323,7 +4841,7 @@
     [self sendWorkspaceErrorForAction:@"pickLiteraturePDF" error:error];
     return;
   }
-  [self sendWorkspaceWithNotice:[NSString stringWithFormat:@"Saved %lu PDF files. Deterministic local preparation is running before Codex scientific review.", (unsigned long)createdItems.count]];
+  [self sendWorkspaceWithNotice:[NSString stringWithFormat:@"Saved %lu PDF files. Deterministic local preparation is running; scientific evidence will be reviewed in bounded batches.", (unsigned long)createdItems.count]];
   for (NSDictionary *item in createdItems) [self scheduleLocalPreparationForItem:item];
 }
 
@@ -4346,6 +4864,787 @@
     dispatch_async(self->_persistenceQueue, ^{
       [self importPDFURLs:URLs];
     });
+  }];
+}
+
+- (NSArray<NSDictionary *> *)linkedPDFDescriptorsUnderRootURL:(NSURL *)selectedRoot
+                                                        error:(NSError **)error {
+  NSFileManager *manager = NSFileManager.defaultManager;
+  NSURL *rootURL = selectedRoot.URLByStandardizingPath;
+  NSURL *resolvedRoot = rootURL.URLByResolvingSymlinksInPath;
+  NSNumber *isDirectory = nil;
+  NSNumber *isSymbolicLink = nil;
+  if (![rootURL getResourceValue:&isDirectory forKey:NSURLIsDirectoryKey error:error] ||
+      ![rootURL getResourceValue:&isSymbolicLink forKey:NSURLIsSymbolicLinkKey error:error] ||
+      !isDirectory.boolValue || isSymbolicLink.boolValue ||
+      ![rootURL.path isEqualToString:resolvedRoot.path]) {
+    if (error && !*error) *error = [self storageError:@"Choose a real local directory that is not a symbolic link." code:649];
+    return nil;
+  }
+  NSURL *supportURL = [self applicationSupportURL].URLByStandardizingPath.URLByResolvingSymlinksInPath;
+  NSString *rootPrefix = [rootURL.path stringByAppendingString:@"/"];
+  NSString *supportPrefix = [supportURL.path stringByAppendingString:@"/"];
+  if ([rootURL.path isEqualToString:supportURL.path] ||
+      [rootURL.path hasPrefix:supportPrefix] || [supportURL.path hasPrefix:rootPrefix]) {
+    if (error) *error = [self storageError:@"The linked literature folder must be separate from Liteverse Application Support." code:650];
+    return nil;
+  }
+
+  __block NSError *enumerationError = nil;
+  NSDirectoryEnumerator<NSURL *> *enumerator = [manager enumeratorAtURL:rootURL
+                                              includingPropertiesForKeys:@[
+                                                NSURLIsRegularFileKey,
+                                                NSURLIsSymbolicLinkKey,
+                                                NSURLIsHiddenKey
+                                              ]
+                                                                 options:(NSDirectoryEnumerationSkipsHiddenFiles |
+                                                                          NSDirectoryEnumerationSkipsPackageDescendants)
+                                                            errorHandler:^BOOL(NSURL *url, NSError *failure) {
+    enumerationError = failure;
+    return NO;
+  }];
+  NSMutableArray<NSDictionary *> *descriptors = [NSMutableArray array];
+  for (NSURL *candidateURL in enumerator) {
+    if (![candidateURL.pathExtension.lowercaseString isEqualToString:@"pdf"]) continue;
+    if (descriptors.count >= 10000) {
+      if (error) *error = [self storageError:@"The selected folder contains more than 10,000 PDFs. Choose a narrower literature folder." code:651];
+      return nil;
+    }
+    NSNumber *isRegular = nil;
+    NSNumber *isLink = nil;
+    NSNumber *isHidden = nil;
+    if (![candidateURL getResourceValue:&isRegular forKey:NSURLIsRegularFileKey error:error] ||
+        ![candidateURL getResourceValue:&isLink forKey:NSURLIsSymbolicLinkKey error:error] ||
+        ![candidateURL getResourceValue:&isHidden forKey:NSURLIsHiddenKey error:error]) return nil;
+    if (!isRegular.boolValue || isLink.boolValue || isHidden.boolValue) continue;
+    NSURL *standardizedFile = candidateURL.URLByStandardizingPath;
+    NSURL *resolvedFile = standardizedFile.URLByResolvingSymlinksInPath;
+    if (![standardizedFile.path isEqualToString:resolvedFile.path] ||
+        ![standardizedFile.path hasPrefix:rootPrefix]) continue;
+    NSString *relativePath = [standardizedFile.path substringFromIndex:rootPrefix.length];
+    if (relativePath.length == 0 || ![self isSafeWorkspaceRelativePath:relativePath] ||
+        ![relativePath isEqualToString:relativePath.stringByStandardizingPath]) continue;
+    [descriptors addObject:@{
+      @"pdfPath": standardizedFile.path,
+      @"linkedRootPath": rootURL.path,
+      @"relativePath": relativePath
+    }];
+  }
+  if (enumerationError) {
+    if (error) *error = enumerationError;
+    return nil;
+  }
+  [descriptors sortUsingComparator:^NSComparisonResult(NSDictionary *left, NSDictionary *right) {
+    return [left[@"relativePath"] localizedStandardCompare:right[@"relativePath"]];
+  }];
+  return descriptors;
+}
+
+- (void)linkLiteratureFolderURL:(NSURL *)selectedRoot {
+  BOOL scopedAccess = [selectedRoot startAccessingSecurityScopedResource];
+  NSError *error = nil;
+  NSArray<NSDictionary *> *descriptors = [self linkedPDFDescriptorsUnderRootURL:selectedRoot error:&error];
+  if (!descriptors) {
+    if (scopedAccess) [selectedRoot stopAccessingSecurityScopedResource];
+    [self sendWorkspaceErrorForAction:@"pickLiteratureFolder" error:error];
+    return;
+  }
+  NSDictionary *storedLibrary = [self readDictionaryAtURL:[self libraryURL]
+                                              defaultValue:[self defaultLibrary]
+                                                     error:&error];
+  if (!storedLibrary) {
+    if (scopedAccess) [selectedRoot stopAccessingSecurityScopedResource];
+    [self sendWorkspaceErrorForAction:@"pickLiteratureFolder" error:error];
+    return;
+  }
+  NSMutableDictionary *library = [storedLibrary mutableCopy];
+  NSMutableArray *items = [library[@"items"] isKindOfClass:NSArray.class]
+      ? [library[@"items"] mutableCopy] : [NSMutableArray array];
+  NSMutableSet<NSString *> *knownHashes = [NSMutableSet set];
+  NSMutableDictionary<NSString *, NSDictionary *> *knownPaths = [NSMutableDictionary dictionary];
+  void (^recordLinkedSource)(NSDictionary *, NSNumber *) = ^(NSDictionary *source, NSNumber *itemIndex) {
+    if (![self isLinkedPDFSource:source]) return;
+    NSString *path = [source[@"pdfPath"] isKindOfClass:NSString.class]
+        ? [source[@"pdfPath"] stringByStandardizingPath] : nil;
+    NSString *hash = [source[@"sha256"] isKindOfClass:NSString.class] ? [source[@"sha256"] lowercaseString] : nil;
+    if (hash.length == 64) [knownHashes addObject:hash];
+    if (path.length == 0 || !path.isAbsolutePath) return;
+    NSDictionary *previous = knownPaths[path];
+    if (!previous) {
+      NSMutableDictionary *record = [@{ @"hash": hash ?: @"", @"conflict": @NO } mutableCopy];
+      if (itemIndex) record[@"itemIndex"] = itemIndex;
+      knownPaths[path] = record;
+      return;
+    }
+    NSMutableDictionary *record = [previous mutableCopy];
+    NSString *previousHash = [previous[@"hash"] isKindOfClass:NSString.class] ? previous[@"hash"] : @"";
+    if (hash.length != 64 || previousHash.length != 64 || ![previousHash isEqualToString:hash]) {
+      record[@"conflict"] = @YES;
+    }
+    if (!record[@"itemIndex"] && itemIndex) record[@"itemIndex"] = itemIndex;
+    knownPaths[path] = record;
+  };
+  for (NSUInteger index = 0; index < items.count; index += 1) {
+    NSDictionary *item = [items[index] isKindOfClass:NSDictionary.class] ? items[index] : @{};
+    NSDictionary *source = [item[@"source"] isKindOfClass:NSDictionary.class] ? item[@"source"] : @{};
+    recordLinkedSource(source, @(index));
+  }
+  NSDictionary *currentGraph = [self readDictionaryAtURL:[self currentGraphURL]
+                                              defaultValue:@{}
+                                                     error:&error];
+  if (!currentGraph) {
+    if (scopedAccess) [selectedRoot stopAccessingSecurityScopedResource];
+    [self sendWorkspaceErrorForAction:@"pickLiteratureFolder" error:error];
+    return;
+  }
+  for (NSDictionary *paper in [currentGraph[@"papers"] isKindOfClass:NSArray.class]
+           ? currentGraph[@"papers"] : @[]) {
+    NSDictionary *source = [paper[@"source"] isKindOfClass:NSDictionary.class] ? paper[@"source"] : @{};
+    recordLinkedSource(source, nil);
+  }
+  NSInteger nextNumber = MAX(1, [library[@"nextNumber"] integerValue]);
+  NSMutableArray<NSDictionary *> *createdItems = [NSMutableArray array];
+  NSMutableArray<NSDictionary *> *changedItems = [NSMutableArray array];
+  NSUInteger duplicateCount = 0;
+  NSUInteger changedCount = 0;
+  for (NSDictionary *descriptor in descriptors) {
+    NSURL *fileURL = [NSURL fileURLWithPath:descriptor[@"pdfPath"] isDirectory:NO];
+    NSDictionary *structuralSource = @{
+      @"kind": @"pdf",
+      @"storageMode": @"linked",
+      @"pdfPath": descriptor[@"pdfPath"],
+      @"linkedRootPath": descriptor[@"linkedRootPath"],
+      @"relativePath": descriptor[@"relativePath"]
+    };
+    fileURL = [self linkedPDFURLForSource:structuralSource requireExisting:YES verifyHash:NO error:&error];
+    if (!fileURL) {
+      if (scopedAccess) [selectedRoot stopAccessingSecurityScopedResource];
+      [self sendWorkspaceErrorForAction:@"pickLiteratureFolder" error:error];
+      return;
+    }
+    NSString *sourceHash = [self sha256ForFileAtURL:fileURL error:&error];
+    if (sourceHash.length != 64) {
+      if (scopedAccess) [selectedRoot stopAccessingSecurityScopedResource];
+      [self sendWorkspaceErrorForAction:@"pickLiteratureFolder" error:error];
+      return;
+    }
+    NSDictionary *knownPath = knownPaths[descriptor[@"pdfPath"]];
+    if (knownPath) {
+      NSString *knownHash = [knownPath[@"hash"] isKindOfClass:NSString.class] ? knownPath[@"hash"] : @"";
+      BOOL sameRegisteredSource = ![knownPath[@"conflict"] boolValue] && knownHash.length == 64 &&
+          [knownHash isEqualToString:sourceHash];
+      if (sameRegisteredSource) {
+        duplicateCount += 1;
+        continue;
+      }
+      changedCount += 1;
+      NSNumber *itemIndex = [knownPath[@"itemIndex"] isKindOfClass:NSNumber.class]
+          ? knownPath[@"itemIndex"] : nil;
+      if (itemIndex && itemIndex.unsignedIntegerValue < items.count) {
+        NSUInteger index = itemIndex.unsignedIntegerValue;
+        NSDictionary *current = [items[index] isKindOfClass:NSDictionary.class] ? items[index] : @{};
+        NSInteger nextRevision = MAX(1, [current[@"revision"] integerValue]) + 1;
+        NSString *timestamp = [self isoTimestamp];
+        NSDictionary *previousPreparation = [current[@"preparation"] isKindOfClass:NSDictionary.class]
+            ? current[@"preparation"] : @{};
+        NSMutableDictionary *nextPreparation = [previousPreparation mutableCopy];
+        nextPreparation[@"schemaVersion"] = @1;
+        nextPreparation[@"state"] = @"needs_attention";
+        nextPreparation[@"jobId"] = [self isSafeLocalPreparationJobID:previousPreparation[@"jobId"]]
+            ? previousPreparation[@"jobId"] : [self localPreparationJobID];
+        nextPreparation[@"sourceRevision"] = @(nextRevision);
+        nextPreparation[@"reason"] = @"The linked PDF changed after registration. Liteverse kept the original reference and hash; scientific review is required before adopting a replacement.";
+        nextPreparation[@"completedAt"] = timestamp;
+        for (NSString *key in @[ @"resultSha256", @"manifestPath", @"resultState", @"reviewPacketPath",
+                                  @"screeningCandidates", @"screeningMethod", @"screeningAnchorIds", @"screeningIndexFingerprint",
+                                  @"duplicateOf", @"deduplication" ]) {
+          [nextPreparation removeObjectForKey:key];
+        }
+        NSMutableDictionary *updated = [current mutableCopy];
+        updated[@"verificationStatus"] = @"needs_attention";
+        updated[@"preparation"] = nextPreparation;
+        updated[@"revision"] = @(nextRevision);
+        updated[@"updatedAt"] = timestamp;
+        BOOL wasAutoResolvedDuplicate = [current[@"disposition"] isEqualToString:@"duplicate"] &&
+            [current[@"autoResolution"] isKindOfClass:NSDictionary.class];
+        if (wasAutoResolvedDuplicate) {
+          // The append-only audit retains the old decision, but it must not
+          // remain the active disposition for a newly changed source revision.
+          updated[@"status"] = @"needs_attention";
+          for (NSString *key in @[ @"disposition", @"duplicateOfPaperId", @"autoResolution", @"organizedAt" ]) {
+            [updated removeObjectForKey:key];
+          }
+        } else if (![current[@"status"] isEqualToString:@"organized"]) {
+          updated[@"status"] = @"needs_attention";
+        }
+        items[index] = updated;
+        [changedItems addObject:@{
+          @"item": updated,
+          @"observedSha256": sourceHash
+        }];
+      }
+      continue;
+    }
+    if ([knownHashes containsObject:sourceHash]) {
+      duplicateCount += 1;
+      continue;
+    }
+    [knownHashes addObject:sourceHash];
+    knownPaths[descriptor[@"pdfPath"]] = @{ @"hash": sourceHash, @"conflict": @NO };
+    NSString *timestamp = [self isoTimestamp];
+    NSString *itemID = [NSString stringWithFormat:@"lit-%@", NSUUID.UUID.UUIDString.lowercaseString];
+    NSString *jobID = [self localPreparationJobID];
+    NSDictionary *source = @{
+      @"kind": @"pdf",
+      @"storageMode": @"linked",
+      @"pdfPath": descriptor[@"pdfPath"],
+      @"linkedRootPath": descriptor[@"linkedRootPath"],
+      @"relativePath": descriptor[@"relativePath"],
+      @"sha256": sourceHash
+    };
+    NSDictionary *item = @{
+      @"id": itemID,
+      @"number": @(nextNumber),
+      @"sourceType": @"pdf",
+      @"displayTitle": fileURL.lastPathComponent.stringByDeletingPathExtension,
+      @"titleStatus": @"filename_guess",
+      @"originalFilename": fileURL.lastPathComponent,
+      @"localPath": descriptor[@"pdfPath"],
+      @"source": source,
+      @"verificationStatus": @"imported",
+      @"status": @"pending_codex",
+      @"revision": @1,
+      @"preparation": [self queuedPreparationWithJobID:jobID sourceRevision:1],
+      @"createdAt": timestamp,
+      @"updatedAt": timestamp
+    };
+    [items addObject:item];
+    [createdItems addObject:item];
+    nextNumber += 1;
+  }
+  if (scopedAccess) [selectedRoot stopAccessingSecurityScopedResource];
+  if (createdItems.count == 0 && changedCount == 0) {
+    NSString *notice = descriptors.count == 0
+        ? @"No ordinary, non-hidden PDF files were found in the selected folder."
+        : @"Every discovered PDF is already registered in this Liteverse library.";
+    [self sendWorkspaceWithNotice:notice];
+    return;
+  }
+  library[@"items"] = items;
+  library[@"nextNumber"] = @(nextNumber);
+  library[@"schemaVersion"] = @1;
+  if (![self writeJSONObject:library toURL:[self libraryURL] error:&error]) {
+    [self sendWorkspaceErrorForAction:@"pickLiteratureFolder" error:error];
+    return;
+  }
+  NSMutableArray<NSDictionary *> *events = [NSMutableArray arrayWithCapacity:createdItems.count];
+  for (NSDictionary *item in createdItems) {
+    [events addObject:@{
+      @"eventId": NSUUID.UUID.UUIDString,
+      @"action": @"literature_pdf_linked",
+      @"timestamp": item[@"createdAt"],
+      @"item": item
+    }];
+  }
+  for (NSDictionary *change in changedItems) {
+    NSDictionary *item = change[@"item"];
+    [events addObject:@{
+      @"eventId": NSUUID.UUID.UUIDString,
+      @"action": @"literature_pdf_link_changed",
+      @"timestamp": item[@"updatedAt"] ?: [self isoTimestamp],
+      @"item": item,
+      @"observedSha256": change[@"observedSha256"]
+    }];
+  }
+  if (events.count > 0 && ![self appendJSONObjects:events toURL:[self workspaceInboxURL] error:&error]) {
+    [self writeJSONObject:storedLibrary toURL:[self libraryURL] error:nil];
+    [self sendWorkspaceErrorForAction:@"pickLiteratureFolder" error:error];
+    return;
+  }
+  NSString *duplicateSuffix = duplicateCount > 0
+      ? [NSString stringWithFormat:@" %lu duplicate%@ %@ skipped.", (unsigned long)duplicateCount,
+          duplicateCount == 1 ? @"" : @"s", duplicateCount == 1 ? @"was" : @"were"]
+      : @"";
+  NSString *changedSuffix = changedCount > 0
+      ? [NSString stringWithFormat:@" %lu registered PDF%@ changed and %@ marked for review without replacing the recorded source hash.",
+          (unsigned long)changedCount, changedCount == 1 ? @"" : @"s", changedCount == 1 ? @"was" : @"were"]
+      : @"";
+  NSString *notice = createdItems.count > 0
+      ? [NSString stringWithFormat:
+          @"Linked %lu PDFs in place without copying the source files.%@%@ Deterministic local preparation is running; scientific evidence will be reviewed in bounded batches.",
+          (unsigned long)createdItems.count, duplicateSuffix, changedSuffix]
+      : [NSString stringWithFormat:@"No new PDFs were linked.%@%@", duplicateSuffix, changedSuffix];
+  [self sendWorkspaceWithNotice:notice];
+  for (NSDictionary *item in createdItems) [self scheduleLocalPreparationForItem:item];
+}
+
+- (void)presentLiteratureFolderImporter {
+  NSOpenPanel *panel = [NSOpenPanel openPanel];
+  panel.title = @"Link a Local Literature Folder";
+  panel.prompt = @"Link Folder";
+  panel.canChooseFiles = NO;
+  panel.canChooseDirectories = YES;
+  panel.allowsMultipleSelection = NO;
+  [panel beginSheetModalForWindow:self.window completionHandler:^(NSModalResponse result) {
+    if (result != NSModalResponseOK || !panel.URL) {
+      dispatch_async(self->_persistenceQueue, ^{
+        [self sendWorkspaceWithNotice:@"Linked-folder import was canceled."];
+      });
+      return;
+    }
+    NSURL *folderURL = panel.URL;
+    dispatch_async(self->_persistenceQueue, ^{ [self linkLiteratureFolderURL:folderURL]; });
+  }];
+}
+
+- (BOOL)isSafeZoteroKey:(NSString *)key {
+  if (![key isKindOfClass:NSString.class] || key.length != 8) return NO;
+  NSCharacterSet *allowed = [NSCharacterSet characterSetWithCharactersInString:@"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"];
+  return [key rangeOfCharacterFromSet:allowed.invertedSet].location == NSNotFound;
+}
+
+- (NSDictionary *)zoteroDiscoveryForSelectionURL:(NSURL *)selectionURL
+                                            error:(NSError **)error {
+  NSURL *selected = selectionURL.URLByStandardizingPath;
+  NSURL *resolved = selected.URLByResolvingSymlinksInPath;
+  NSNumber *isDirectory = nil;
+  NSNumber *isRegular = nil;
+  NSNumber *isSymbolicLink = nil;
+  if (![selected getResourceValue:&isDirectory forKey:NSURLIsDirectoryKey error:error] ||
+      ![selected getResourceValue:&isRegular forKey:NSURLIsRegularFileKey error:error] ||
+      ![selected getResourceValue:&isSymbolicLink forKey:NSURLIsSymbolicLinkKey error:error] ||
+      isSymbolicLink.boolValue || ![selected.path isEqualToString:resolved.path]) {
+    if (error && !*error) *error = [self storageError:@"Choose a real Zotero data directory or zotero.sqlite file that is not a symbolic link." code:740];
+    return nil;
+  }
+  NSURL *dataRoot = nil;
+  NSURL *databaseURL = nil;
+  if (isDirectory.boolValue) {
+    dataRoot = selected;
+    databaseURL = [selected URLByAppendingPathComponent:@"zotero.sqlite" isDirectory:NO];
+  } else if (isRegular.boolValue && [selected.lastPathComponent.lowercaseString isEqualToString:@"zotero.sqlite"]) {
+    databaseURL = selected;
+    dataRoot = selected.URLByDeletingLastPathComponent;
+  } else {
+    if (error) *error = [self storageError:@"Choose a Zotero data directory or its zotero.sqlite file." code:741];
+    return nil;
+  }
+  dataRoot = dataRoot.URLByStandardizingPath;
+  databaseURL = databaseURL.URLByStandardizingPath;
+  NSURL *supportURL = [self applicationSupportURL].URLByStandardizingPath.URLByResolvingSymlinksInPath;
+  NSString *rootPrefix = [dataRoot.path stringByAppendingString:@"/"];
+  NSString *supportPrefix = [supportURL.path stringByAppendingString:@"/"];
+  if ([dataRoot.path isEqualToString:supportURL.path] || [dataRoot.path hasPrefix:supportPrefix] ||
+      [supportURL.path hasPrefix:rootPrefix]) {
+    if (error) *error = [self storageError:@"The Zotero data directory must be separate from Liteverse Application Support." code:742];
+    return nil;
+  }
+  NSURL *storageURL = [dataRoot URLByAppendingPathComponent:@"storage" isDirectory:YES];
+  NSNumber *databaseRegular = nil;
+  NSNumber *databaseLink = nil;
+  NSNumber *storageDirectory = nil;
+  NSNumber *storageLink = nil;
+  if (![databaseURL getResourceValue:&databaseRegular forKey:NSURLIsRegularFileKey error:error] ||
+      ![databaseURL getResourceValue:&databaseLink forKey:NSURLIsSymbolicLinkKey error:error] ||
+      !databaseRegular.boolValue || databaseLink.boolValue ||
+      ![databaseURL.path isEqualToString:databaseURL.URLByResolvingSymlinksInPath.path] ||
+      ![storageURL getResourceValue:&storageDirectory forKey:NSURLIsDirectoryKey error:error] ||
+      ![storageURL getResourceValue:&storageLink forKey:NSURLIsSymbolicLinkKey error:error] ||
+      !storageDirectory.boolValue || storageLink.boolValue ||
+      ![storageURL.path isEqualToString:storageURL.URLByResolvingSymlinksInPath.path]) {
+    if (error && !*error) *error = [self storageError:@"The selected Zotero library must contain a real zotero.sqlite file and a non-symbolic storage directory." code:743];
+    return nil;
+  }
+
+  sqlite3 *database = NULL;
+  int openStatus = sqlite3_open_v2(databaseURL.path.fileSystemRepresentation,
+                                   &database,
+                                   SQLITE_OPEN_READONLY | SQLITE_OPEN_FULLMUTEX,
+                                   NULL);
+  if (openStatus != SQLITE_OK || !database) {
+    NSString *detail = database ? [NSString stringWithUTF8String:sqlite3_errmsg(database)] : @"open failed";
+    if (database) sqlite3_close(database);
+    if (error) *error = [self storageError:[NSString stringWithFormat:@"Zotero could not be opened read-only (%@).", detail ?: @"unknown error"] code:744];
+    return nil;
+  }
+  sqlite3_busy_timeout(database, 3000);
+  if (sqlite3_db_readonly(database, "main") != 1) {
+    sqlite3_close(database);
+    if (error) *error = [self storageError:@"Liteverse refused a Zotero connection that was not read-only." code:745];
+    return nil;
+  }
+  sqlite3_exec(database, "PRAGMA query_only=ON", NULL, NULL, NULL);
+  sqlite3_exec(database, "BEGIN DEFERRED TRANSACTION", NULL, NULL, NULL);
+  const char *richSQL =
+      "SELECT attachment.key, COALESCE(parent.key, attachment.key), ia.path, "
+      "COALESCE(titleValue.value, ''), COALESCE(authorList.authors, ''), "
+      "COALESCE(doiValue.value, '') "
+      "FROM itemAttachments ia "
+      "JOIN items attachment ON attachment.itemID = ia.itemID "
+      "LEFT JOIN items parent ON parent.itemID = ia.parentItemID "
+      "LEFT JOIN itemData titleData ON titleData.itemID = COALESCE(ia.parentItemID, ia.itemID) "
+      " AND titleData.fieldID = (SELECT fieldID FROM fields WHERE lower(fieldName) = 'title' LIMIT 1) "
+      "LEFT JOIN itemDataValues titleValue ON titleValue.valueID = titleData.valueID "
+      "LEFT JOIN itemData doiData ON doiData.itemID = COALESCE(ia.parentItemID, ia.itemID) "
+      " AND doiData.fieldID = (SELECT fieldID FROM fields WHERE lower(fieldName) = 'doi' LIMIT 1) "
+      "LEFT JOIN itemDataValues doiValue ON doiValue.valueID = doiData.valueID "
+      "LEFT JOIN ("
+      " SELECT orderedCreators.itemID, GROUP_CONCAT(orderedCreators.authorName, char(31)) authors "
+      " FROM ("
+      "  SELECT ic.itemID, TRIM(COALESCE(c.firstName, '') || ' ' || COALESCE(c.lastName, '')) authorName "
+      "  FROM itemCreators ic "
+      "  JOIN creators c ON c.creatorID = ic.creatorID "
+      "  JOIN creatorTypes ct ON ct.creatorTypeID = ic.creatorTypeID "
+      "  WHERE lower(ct.creatorType) IN ('author', 'bookauthor') "
+      "  ORDER BY ic.itemID, ic.orderIndex"
+      " ) orderedCreators GROUP BY orderedCreators.itemID"
+      ") authorList ON authorList.itemID = COALESCE(ia.parentItemID, ia.itemID) "
+      "LEFT JOIN deletedItems deletedAttachment ON deletedAttachment.itemID = ia.itemID "
+      "LEFT JOIN deletedItems deletedParent ON deletedParent.itemID = ia.parentItemID "
+      "WHERE deletedAttachment.itemID IS NULL AND deletedParent.itemID IS NULL "
+      " AND (lower(COALESCE(ia.contentType, '')) = 'application/pdf' OR lower(ia.path) LIKE '%.pdf') "
+      "ORDER BY attachment.key ASC LIMIT 10001";
+  const char *fallbackSQL =
+      "SELECT attachment.key, COALESCE(parent.key, attachment.key), ia.path, "
+      "COALESCE(titleValue.value, '') "
+      "FROM itemAttachments ia "
+      "JOIN items attachment ON attachment.itemID = ia.itemID "
+      "LEFT JOIN items parent ON parent.itemID = ia.parentItemID "
+      "LEFT JOIN itemData titleData ON titleData.itemID = COALESCE(ia.parentItemID, ia.itemID) "
+      " AND titleData.fieldID = (SELECT fieldID FROM fields WHERE lower(fieldName) = 'title' LIMIT 1) "
+      "LEFT JOIN itemDataValues titleValue ON titleValue.valueID = titleData.valueID "
+      "LEFT JOIN deletedItems deletedAttachment ON deletedAttachment.itemID = ia.itemID "
+      "LEFT JOIN deletedItems deletedParent ON deletedParent.itemID = ia.parentItemID "
+      "WHERE deletedAttachment.itemID IS NULL AND deletedParent.itemID IS NULL "
+      " AND (lower(COALESCE(ia.contentType, '')) = 'application/pdf' OR lower(ia.path) LIKE '%.pdf') "
+      "ORDER BY attachment.key ASC LIMIT 10001";
+  sqlite3_stmt *statement = NULL;
+  BOOL hasRichCatalogMetadata = YES;
+  int prepareStatus = sqlite3_prepare_v2(database, richSQL, -1, &statement, NULL);
+  if (prepareStatus != SQLITE_OK || !statement) {
+    if (statement) sqlite3_finalize(statement);
+    statement = NULL;
+    hasRichCatalogMetadata = NO;
+    prepareStatus = sqlite3_prepare_v2(database, fallbackSQL, -1, &statement, NULL);
+  }
+  if (prepareStatus != SQLITE_OK || !statement) {
+    NSString *detail = [NSString stringWithUTF8String:sqlite3_errmsg(database)] ?: @"schema query failed";
+    sqlite3_exec(database, "ROLLBACK", NULL, NULL, NULL);
+    sqlite3_close(database);
+    if (error) *error = [self storageError:[NSString stringWithFormat:@"This Zotero database schema could not be read (%@).", detail] code:746];
+    return nil;
+  }
+  NSMutableArray<NSDictionary *> *descriptors = [NSMutableArray array];
+  NSUInteger unsupportedCount = 0;
+  NSUInteger unavailableCount = 0;
+  int stepStatus = SQLITE_ROW;
+  while ((stepStatus = sqlite3_step(statement)) == SQLITE_ROW) {
+    if (descriptors.count >= 10000) {
+      sqlite3_finalize(statement);
+      sqlite3_exec(database, "ROLLBACK", NULL, NULL, NULL);
+      sqlite3_close(database);
+      if (error) *error = [self storageError:@"The Zotero library contains more than 10,000 stored PDF attachments. Import a narrower local folder instead." code:747];
+      return nil;
+    }
+    NSString *attachmentKey = [self sqliteTextFromStatement:statement column:0];
+    NSString *itemKey = [self sqliteTextFromStatement:statement column:1];
+    NSString *storedPath = [self sqliteTextFromStatement:statement column:2];
+    NSString *title = [[self sqliteTextFromStatement:statement column:3]
+        stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+    if (title.length > 1024) title = [title substringToIndex:1024];
+    NSString *authorText = hasRichCatalogMetadata
+        ? [self sqliteTextFromStatement:statement column:4] : @"";
+    NSMutableArray<NSString *> *authors = [NSMutableArray array];
+    for (NSString *candidate in [authorText componentsSeparatedByString:[NSString stringWithFormat:@"%C", (unichar)31]]) {
+      NSString *author = [candidate stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+      if (author.length > 256) author = [author substringToIndex:256];
+      if (author.length > 0 && authors.count < 128 && ![authors containsObject:author]) [authors addObject:author];
+    }
+    NSString *doi = hasRichCatalogMetadata
+        ? [[self sqliteTextFromStatement:statement column:5]
+            stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet]
+        : @"";
+    if (doi.length > 512) doi = @"";
+    if (![self isSafeZoteroKey:attachmentKey] || ![self isSafeZoteroKey:itemKey] ||
+        ![storedPath hasPrefix:@"storage:"]) {
+      unsupportedCount += 1;
+      continue;
+    }
+    NSString *fileName = [storedPath substringFromIndex:@"storage:".length];
+    if (fileName.length == 0 || fileName.length > 1024 ||
+        ![fileName.lastPathComponent isEqualToString:fileName] ||
+        [fileName containsString:@"/"] || [fileName containsString:@"\\"] ||
+        ![fileName.pathExtension.lowercaseString isEqualToString:@"pdf"]) {
+      unsupportedCount += 1;
+      continue;
+    }
+    NSString *relativePath = [NSString stringWithFormat:@"storage/%@/%@", attachmentKey, fileName];
+    NSURL *pdfURL = [dataRoot URLByAppendingPathComponent:relativePath isDirectory:NO].URLByStandardizingPath;
+    NSDictionary *source = @{
+      @"kind": @"pdf",
+      @"storageMode": @"linked",
+      @"pdfPath": pdfURL.path,
+      @"linkedRootPath": dataRoot.path,
+      @"relativePath": relativePath
+    };
+    NSError *sourceError = nil;
+    if (![self linkedPDFURLForSource:source requireExisting:YES verifyHash:NO error:&sourceError]) {
+      unavailableCount += 1;
+      continue;
+    }
+    NSMutableDictionary *catalogMetadata = [NSMutableDictionary dictionary];
+    if (title.length > 0) catalogMetadata[@"title"] = title;
+    if (authors.count > 0) catalogMetadata[@"authors"] = authors;
+    if (doi.length > 0) catalogMetadata[@"doi"] = doi;
+    [descriptors addObject:@{
+      @"pdfPath": pdfURL.path,
+      @"linkedRootPath": dataRoot.path,
+      @"relativePath": relativePath,
+      @"displayTitle": title.length > 0 ? title : fileName.stringByDeletingPathExtension,
+      @"titleStatus": title.length > 0 ? @"pending" : @"filename_guess",
+      @"catalogMetadata": catalogMetadata,
+      @"provenance": @{
+        @"catalog": @"zotero",
+        @"itemKey": itemKey,
+        @"attachmentKey": attachmentKey
+      }
+    }];
+  }
+  sqlite3_finalize(statement);
+  if (stepStatus != SQLITE_DONE) {
+    NSString *detail = [NSString stringWithUTF8String:sqlite3_errmsg(database)] ?: @"read failed";
+    sqlite3_exec(database, "ROLLBACK", NULL, NULL, NULL);
+    sqlite3_close(database);
+    if (error) *error = [self storageError:[NSString stringWithFormat:@"Zotero changed or became unavailable during discovery (%@). Retry the import.", detail] code:748];
+    return nil;
+  }
+  sqlite3_exec(database, "COMMIT", NULL, NULL, NULL);
+  sqlite3_close(database);
+  return @{
+    @"rootURL": dataRoot,
+    @"descriptors": descriptors,
+    @"unsupportedCount": @(unsupportedCount),
+    @"unavailableCount": @(unavailableCount)
+  };
+}
+
+- (void)linkZoteroSelectionURL:(NSURL *)selectionURL {
+  BOOL scopedAccess = [selectionURL startAccessingSecurityScopedResource];
+  NSError *error = nil;
+  NSDictionary *discovery = [self zoteroDiscoveryForSelectionURL:selectionURL error:&error];
+  if (!discovery) {
+    if (scopedAccess) [selectionURL stopAccessingSecurityScopedResource];
+    [self sendWorkspaceErrorForAction:@"pickZoteroLibrary" error:error];
+    return;
+  }
+  NSArray<NSDictionary *> *descriptors = discovery[@"descriptors"];
+  NSDictionary *storedLibrary = [self readDictionaryAtURL:[self libraryURL]
+                                              defaultValue:[self defaultLibrary]
+                                                     error:&error];
+  NSDictionary *currentGraph = storedLibrary ? [self readDictionaryAtURL:[self currentGraphURL]
+                                                                  defaultValue:@{}
+                                                                         error:&error] : nil;
+  if (!storedLibrary || !currentGraph) {
+    if (scopedAccess) [selectionURL stopAccessingSecurityScopedResource];
+    [self sendWorkspaceErrorForAction:@"pickZoteroLibrary" error:error];
+    return;
+  }
+  NSMutableDictionary *library = [storedLibrary mutableCopy];
+  NSMutableArray *items = [library[@"items"] isKindOfClass:NSArray.class]
+      ? [library[@"items"] mutableCopy] : [NSMutableArray array];
+  NSMutableSet<NSString *> *knownHashes = [NSMutableSet set];
+  NSMutableDictionary<NSString *, NSDictionary *> *knownSourcesByPath = [NSMutableDictionary dictionary];
+  void (^recordKnownSource)(NSDictionary *, NSNumber *) = ^(NSDictionary *source, NSNumber *itemIndex) {
+    if (![self isLinkedPDFSource:source]) return;
+    NSString *path = [source[@"pdfPath"] isKindOfClass:NSString.class]
+        ? [source[@"pdfPath"] stringByStandardizingPath] : @"";
+    NSString *hash = [source[@"sha256"] isKindOfClass:NSString.class]
+        ? [source[@"sha256"] lowercaseString] : @"";
+    if (hash.length == 64) [knownHashes addObject:hash];
+    if (path.length == 0 || !path.isAbsolutePath) return;
+    NSDictionary *previous = knownSourcesByPath[path];
+    NSMutableDictionary *record = previous ? [previous mutableCopy]
+        : [@{ @"hash": hash, @"conflict": @NO } mutableCopy];
+    NSString *previousHash = [record[@"hash"] isKindOfClass:NSString.class] ? record[@"hash"] : @"";
+    if (previous && (hash.length != 64 || previousHash.length != 64 ||
+                     ![previousHash isEqualToString:hash])) record[@"conflict"] = @YES;
+    if (!record[@"itemIndex"] && itemIndex) record[@"itemIndex"] = itemIndex;
+    knownSourcesByPath[path] = record;
+  };
+  for (NSUInteger index = 0; index < items.count; index += 1) {
+    NSDictionary *item = [items[index] isKindOfClass:NSDictionary.class] ? items[index] : @{};
+    NSDictionary *source = [item[@"source"] isKindOfClass:NSDictionary.class] ? item[@"source"] : @{};
+    recordKnownSource(source, @(index));
+  }
+  for (NSDictionary *paper in [currentGraph[@"papers"] isKindOfClass:NSArray.class] ? currentGraph[@"papers"] : @[]) {
+    NSDictionary *source = [paper[@"source"] isKindOfClass:NSDictionary.class] ? paper[@"source"] : @{};
+    recordKnownSource(source, nil);
+  }
+  NSInteger nextNumber = MAX(1, [library[@"nextNumber"] integerValue]);
+  NSMutableArray<NSDictionary *> *createdItems = [NSMutableArray array];
+  NSMutableArray<NSDictionary *> *events = [NSMutableArray array];
+  NSUInteger duplicateCount = 0;
+  NSUInteger changedCount = 0;
+  for (NSDictionary *descriptor in descriptors) {
+    NSDictionary *structuralSource = @{
+      @"kind": @"pdf",
+      @"storageMode": @"linked",
+      @"pdfPath": descriptor[@"pdfPath"],
+      @"linkedRootPath": descriptor[@"linkedRootPath"],
+      @"relativePath": descriptor[@"relativePath"]
+    };
+    NSURL *fileURL = [self linkedPDFURLForSource:structuralSource requireExisting:YES verifyHash:NO error:&error];
+    NSString *sourceHash = fileURL ? [self sha256ForFileAtURL:fileURL error:&error] : nil;
+    if (!fileURL || sourceHash.length != 64) {
+      if (scopedAccess) [selectionURL stopAccessingSecurityScopedResource];
+      [self sendWorkspaceErrorForAction:@"pickZoteroLibrary" error:error];
+      return;
+    }
+    NSDictionary *knownSource = knownSourcesByPath[descriptor[@"pdfPath"]];
+    if (knownSource) {
+      NSString *knownHash = [knownSource[@"hash"] isKindOfClass:NSString.class]
+          ? knownSource[@"hash"] : @"";
+      if (![knownSource[@"conflict"] boolValue] && knownHash.length == 64 &&
+          [knownHash isEqualToString:sourceHash]) {
+        duplicateCount += 1;
+        continue;
+      }
+      changedCount += 1;
+      NSNumber *knownIndex = [knownSource[@"itemIndex"] isKindOfClass:NSNumber.class]
+          ? knownSource[@"itemIndex"] : nil;
+      if (!knownIndex || knownIndex.unsignedIntegerValue >= items.count) continue;
+      NSUInteger index = knownIndex.unsignedIntegerValue;
+      NSDictionary *current = [items[index] isKindOfClass:NSDictionary.class] ? items[index] : @{};
+      NSInteger nextRevision = MAX(1, [current[@"revision"] integerValue]) + 1;
+      NSMutableDictionary *preparation = [current[@"preparation"] isKindOfClass:NSDictionary.class]
+          ? [current[@"preparation"] mutableCopy] : [NSMutableDictionary dictionary];
+      preparation[@"schemaVersion"] = @1;
+      preparation[@"state"] = @"needs_attention";
+      preparation[@"jobId"] = [self isSafeLocalPreparationJobID:preparation[@"jobId"]]
+          ? preparation[@"jobId"] : [self localPreparationJobID];
+      preparation[@"sourceRevision"] = @(nextRevision);
+      preparation[@"reason"] = @"The Zotero PDF changed after registration. Liteverse preserved the pinned source hash and requires review before adopting a replacement.";
+      preparation[@"completedAt"] = [self isoTimestamp];
+      for (NSString *key in @[ @"resultSha256", @"manifestPath", @"resultState", @"reviewPacketPath",
+                                @"screeningCandidates", @"screeningMethod", @"screeningAnchorIds", @"screeningIndexFingerprint",
+                                @"duplicateOf", @"deduplication" ]) {
+        [preparation removeObjectForKey:key];
+      }
+      NSMutableDictionary *updated = [current mutableCopy];
+      updated[@"verificationStatus"] = @"needs_attention";
+      updated[@"preparation"] = preparation;
+      updated[@"revision"] = @(nextRevision);
+      updated[@"updatedAt"] = [self isoTimestamp];
+      BOOL wasAutoResolvedDuplicate = [current[@"disposition"] isEqualToString:@"duplicate"] &&
+          [current[@"autoResolution"] isKindOfClass:NSDictionary.class];
+      if (wasAutoResolvedDuplicate) {
+        updated[@"status"] = @"needs_attention";
+        for (NSString *key in @[ @"disposition", @"duplicateOfPaperId", @"autoResolution", @"organizedAt" ]) {
+          [updated removeObjectForKey:key];
+        }
+      } else if (![current[@"status"] isEqualToString:@"organized"]) {
+        updated[@"status"] = @"needs_attention";
+      }
+      items[index] = updated;
+      [events addObject:@{
+        @"eventId": NSUUID.UUID.UUIDString,
+        @"action": @"literature_zotero_link_changed",
+        @"timestamp": updated[@"updatedAt"],
+        @"item": updated,
+        @"observedSha256": sourceHash
+      }];
+      continue;
+    }
+    if ([knownHashes containsObject:sourceHash]) {
+      duplicateCount += 1;
+      continue;
+    }
+    [knownHashes addObject:sourceHash];
+    NSString *timestamp = [self isoTimestamp];
+    NSString *itemID = [NSString stringWithFormat:@"lit-%@", NSUUID.UUID.UUIDString.lowercaseString];
+    NSMutableDictionary *source = [structuralSource mutableCopy];
+    source[@"sha256"] = sourceHash;
+    source[@"provenance"] = descriptor[@"provenance"];
+    NSDictionary *catalogMetadata = [descriptor[@"catalogMetadata"] isKindOfClass:NSDictionary.class]
+        ? descriptor[@"catalogMetadata"] : @{};
+    if (catalogMetadata.count > 0) source[@"catalogMetadata"] = catalogMetadata;
+    NSDictionary *item = @{
+      @"id": itemID,
+      @"number": @(nextNumber),
+      @"sourceType": @"pdf",
+      @"displayTitle": descriptor[@"displayTitle"],
+      @"titleStatus": descriptor[@"titleStatus"],
+      @"originalFilename": fileURL.lastPathComponent,
+      @"localPath": descriptor[@"pdfPath"],
+      @"source": source,
+      @"verificationStatus": @"imported",
+      @"status": @"pending_codex",
+      @"revision": @1,
+      @"preparation": [self queuedPreparationWithJobID:[self localPreparationJobID] sourceRevision:1],
+      @"createdAt": timestamp,
+      @"updatedAt": timestamp
+    };
+    [items addObject:item];
+    [createdItems addObject:item];
+    [events addObject:@{
+      @"eventId": NSUUID.UUID.UUIDString,
+      @"action": @"literature_zotero_pdf_linked",
+      @"timestamp": timestamp,
+      @"item": item
+    }];
+    knownSourcesByPath[descriptor[@"pdfPath"]] = @{
+      @"hash": sourceHash,
+      @"conflict": @NO,
+      @"itemIndex": @(items.count - 1)
+    };
+    nextNumber += 1;
+  }
+  if (scopedAccess) [selectionURL stopAccessingSecurityScopedResource];
+  NSUInteger unsupportedCount = [discovery[@"unsupportedCount"] unsignedIntegerValue];
+  NSUInteger unavailableCount = [discovery[@"unavailableCount"] unsignedIntegerValue];
+  if (createdItems.count == 0 && changedCount == 0) {
+    [self sendWorkspaceWithNotice:[NSString stringWithFormat:
+        @"No new stored Zotero PDFs were linked. %lu duplicate%@ skipped; %lu linked-file or unsupported attachment%@ and %lu unavailable attachment%@ were left unchanged.",
+        (unsigned long)duplicateCount, duplicateCount == 1 ? @" was" : @"s were",
+        (unsigned long)unsupportedCount, unsupportedCount == 1 ? @"" : @"s",
+        (unsigned long)unavailableCount, unavailableCount == 1 ? @"" : @"s"]];
+    return;
+  }
+  library[@"items"] = items;
+  library[@"nextNumber"] = @(nextNumber);
+  library[@"schemaVersion"] = @1;
+  if (![self writeJSONObject:library toURL:[self libraryURL] error:&error]) {
+    [self sendWorkspaceErrorForAction:@"pickZoteroLibrary" error:error];
+    return;
+  }
+  if (events.count > 0 && ![self appendJSONObjects:events toURL:[self workspaceInboxURL] error:&error]) {
+    [self writeJSONObject:storedLibrary toURL:[self libraryURL] error:nil];
+    [self sendWorkspaceErrorForAction:@"pickZoteroLibrary" error:error];
+    return;
+  }
+  [self sendWorkspaceWithNotice:[NSString stringWithFormat:
+      @"Linked %lu Zotero PDFs in place without copying originals. %lu duplicate%@ skipped; %lu unsupported and %lu unavailable attachment%@ were left unchanged. Local preparation runs sequentially for bounded memory use; scientific review is batched.",
+      (unsigned long)createdItems.count, (unsigned long)duplicateCount,
+      duplicateCount == 1 ? @" was" : @"s were", (unsigned long)unsupportedCount,
+      (unsigned long)unavailableCount, (unsupportedCount + unavailableCount) == 1 ? @"" : @"s"]];
+  for (NSDictionary *item in createdItems) [self scheduleLocalPreparationForItem:item];
+}
+
+- (void)presentZoteroImporter {
+  NSOpenPanel *panel = [NSOpenPanel openPanel];
+  panel.title = @"Connect a Zotero Library Read-Only";
+  panel.prompt = @"Connect Zotero";
+  panel.message = @"Choose the Zotero data directory or zotero.sqlite. Stored PDF attachments are linked in place; Liteverse never writes to Zotero or copies the originals.";
+  panel.canChooseFiles = YES;
+  panel.canChooseDirectories = YES;
+  panel.allowsMultipleSelection = NO;
+  [panel beginSheetModalForWindow:self.window completionHandler:^(NSModalResponse result) {
+    if (result != NSModalResponseOK || !panel.URL) {
+      dispatch_async(self->_persistenceQueue, ^{ [self sendWorkspaceWithNotice:@"Zotero connection was canceled."]; });
+      return;
+    }
+    NSURL *selectionURL = panel.URL;
+    dispatch_async(self->_persistenceQueue, ^{ [self linkZoteroSelectionURL:selectionURL]; });
   }];
 }
 
@@ -4389,21 +5688,43 @@
       NSString *sourcePDFPath = [rawSource[@"pdfPath"] isKindOfClass:NSString.class]
           ? rawSource[@"pdfPath"] : localPath;
       NSString *managedPath = nil;
+      NSString *catalogPDFPath = nil;
       NSString *pdfHash = [rawSource[@"sha256"] isKindOfClass:NSString.class] ? rawSource[@"sha256"] : nil;
-      if (sourcePDFPath.length > 0 && !sourcePDFPath.isAbsolutePath &&
+      BOOL linkedSource = [self isLinkedPDFSource:rawSource];
+      BOOL linkedAvailable = NO;
+      BOOL linkedHashMatches = NO;
+      if (linkedSource) {
+        NSURL *structuralURL = [self linkedPDFURLForSource:rawSource requireExisting:NO verifyHash:NO error:nil];
+        if (structuralURL) {
+          catalogPDFPath = structuralURL.path;
+          NSURL *existingURL = [self linkedPDFURLForSource:rawSource requireExisting:YES verifyHash:NO error:nil];
+          linkedAvailable = existingURL != nil;
+          if (linkedAvailable && pdfHash.length == 64) {
+            linkedHashMatches = [[[self cachedSHA256ForFileAtURL:existingURL error:nil] lowercaseString]
+                isEqualToString:[pdfHash lowercaseString]];
+          }
+        }
+      } else if (sourcePDFPath.length > 0 && !sourcePDFPath.isAbsolutePath &&
           [self isSafeWorkspaceRelativePath:sourcePDFPath] &&
           [sourcePDFPath.stringByStandardizingPath hasPrefix:@"Library/PDFs/"]) {
         managedPath = sourcePDFPath.stringByStandardizingPath;
-      } else if (sourcePDFPath.isAbsolutePath &&
-                 [NSFileManager.defaultManager fileExistsAtPath:sourcePDFPath]) {
-        managedPath = [self managedPDFRelativePathForSourceURL:[NSURL fileURLWithPath:sourcePDFPath]
-                                                       paperID:paperID
-                                                        sha256:&pdfHash
-                                                         error:nil];
+        catalogPDFPath = managedPath;
       }
       NSDictionary *rawArtifacts = [item[@"artifacts"] isKindOfClass:NSDictionary.class] ? item[@"artifacts"] : @{};
       NSString *verificationStatus = [item[@"verificationStatus"] isKindOfClass:NSString.class]
-          ? item[@"verificationStatus"] : (managedPath ? @"card_draft" : @"source_missing");
+          ? item[@"verificationStatus"] : (catalogPDFPath ? @"card_draft" : @"source_missing");
+      if (linkedSource && !linkedAvailable) verificationStatus = @"source_missing";
+      else if (linkedSource && !linkedHashMatches) verificationStatus = @"needs_attention";
+      NSMutableDictionary *catalogSource = [rawSource mutableCopy];
+      catalogSource[@"kind"] = [rawSource[@"kind"] isKindOfClass:NSString.class] ? rawSource[@"kind"] : @"pdf";
+      if (linkedSource) {
+        catalogSource[@"storageMode"] = @"linked";
+        if (catalogPDFPath) catalogSource[@"pdfPath"] = catalogPDFPath;
+      } else {
+        catalogSource[@"storageMode"] = @"managed";
+        catalogSource[@"pdfPath"] = managedPath ?: @"";
+      }
+      catalogSource[@"sha256"] = pdfHash ?: @"";
       NSMutableDictionary *catalogItem = [@{
         @"id": itemID,
         @"number": [item[@"number"] isKindOfClass:NSNumber.class] ? item[@"number"] : @([catalogItems count] + 1),
@@ -4417,13 +5738,9 @@
         @"organizedAt": [item[@"organizedAt"] isKindOfClass:NSString.class] ? item[@"organizedAt"] : @"",
         @"graphPaperId": paperID,
         @"catalogSource": @"universe",
-        @"localPath": managedPath ?: @"",
+        @"localPath": catalogPDFPath ?: @"",
         @"verificationStatus": verificationStatus,
-        @"source": @{
-          @"kind": [rawSource[@"kind"] isKindOfClass:NSString.class] ? rawSource[@"kind"] : @"pdf",
-          @"pdfPath": managedPath ?: @"",
-          @"sha256": pdfHash ?: @""
-        },
+        @"source": catalogSource,
         @"artifacts": rawArtifacts,
         @"citekey": [item[@"citekey"] isKindOfClass:NSString.class] ? item[@"citekey"] : paperID
       } mutableCopy];
@@ -4438,6 +5755,7 @@
         if (storedID.length > 0) [consumedStoredIDs addObject:storedID];
       }
       if (managedPath.length > 0) catalogItem[@"storedFilename"] = managedPath.lastPathComponent;
+      else [catalogItem removeObjectForKey:@"storedFilename"];
       NSString *arxivID = [item[@"arxivId"] isKindOfClass:NSString.class]
           ? item[@"arxivId"] : ([storedMatch[@"arxivId"] isKindOfClass:NSString.class] ? storedMatch[@"arxivId"] : nil);
       NSString *arxivURL = [item[@"arxivUrl"] isKindOfClass:NSString.class]
@@ -4665,6 +5983,567 @@
   registry[@"items"] = registryItems;
   registry[@"generatedAt"] = [self isoTimestamp];
   return [self writeJSONObject:registry toURL:[self projectsRegistryURL] error:error];
+}
+
+- (BOOL)isRegionDocumentID:(NSString *)documentID {
+  if (![documentID isKindOfClass:NSString.class] || documentID.length == 0 ||
+      documentID.length > 256) return NO;
+  NSRegularExpression *expression = [NSRegularExpression
+      regularExpressionWithPattern:@"^regiondoc-[a-z0-9]+(?:-[a-z0-9]+)*$"
+                           options:0 error:nil];
+  return [expression firstMatchInString:documentID options:0
+                                  range:NSMakeRange(0, documentID.length)] != nil;
+}
+
+- (BOOL)isRegionDocumentMemory:(NSDictionary *)item {
+  NSDictionary *scope = [item[@"scope"] isKindOfClass:NSDictionary.class] ? item[@"scope"] : nil;
+  NSDictionary *presentation = [item[@"presentation"] isKindOfClass:NSDictionary.class]
+      ? item[@"presentation"] : nil;
+  NSDictionary *source = [item[@"source"] isKindOfClass:NSDictionary.class] ? item[@"source"] : nil;
+  return [item[@"type"] isEqualToString:@"project_context"] &&
+      [item[@"provenance"] isEqualToString:@"user"] &&
+      [item[@"evidenceState"] isEqualToString:@"user_declared"] &&
+      [scope[@"kind"] isEqualToString:@"nebula_region"] &&
+      [self isRegionDocumentID:presentation[@"documentId"]] &&
+      [source[@"kind"] isEqualToString:@"app_region_document"];
+}
+
+- (NSDictionary *)regionCategoryForID:(NSString *)categoryID
+                                 graph:(NSDictionary *)graph
+                                 error:(NSError **)error {
+  if (![categoryID isKindOfClass:NSString.class] || categoryID.length == 0 || categoryID.length > 256) {
+    if (error) *error = [self storageError:@"The region category ID is invalid." code:680];
+    return nil;
+  }
+  for (id rawCategory in [graph[@"categories"] isKindOfClass:NSArray.class] ? graph[@"categories"] : @[]) {
+    if (![rawCategory isKindOfClass:NSDictionary.class]) continue;
+    NSDictionary *category = rawCategory;
+    if ([category[@"id"] isEqualToString:categoryID]) {
+      NSString *name = [category[@"name"] isKindOfClass:NSString.class] ? category[@"name"] : nil;
+      if (name.length == 0) break;
+      return category;
+    }
+  }
+  if (error) *error = [self storageError:
+      @"This nebula region no longer exists in the pinned Graph revision. Reopen the region and explicitly reassign the document."
+                                  code:681];
+  return nil;
+}
+
+- (NSDictionary *)registryItemForProjectID:(NSString *)projectID
+                                    registry:(NSDictionary *)registry {
+  for (NSDictionary *item in [registry[@"items"] isKindOfClass:NSArray.class] ? registry[@"items"] : @[]) {
+    NSString *itemID = [item[@"projectId"] isKindOfClass:NSString.class] ? item[@"projectId"] : item[@"id"];
+    if ([itemID isEqualToString:projectID]) return item;
+  }
+  return nil;
+}
+
+- (NSDictionary *)commitRegionMemoryEvents:(NSArray<NSDictionary *> *)events
+                             projectedItems:(NSArray<NSDictionary *> *)projectedItems
+                                      state:(NSDictionary *)state
+                                  projectID:(NSString *)projectID
+                                   registry:(NSDictionary *)registry
+                               registryItem:(NSDictionary *)registryItem
+                                  timestamp:(NSString *)timestamp
+                                      error:(NSError **)error {
+  if (events.count == 0) return nil;
+  NSData *priorLedgerData = [state[@"ledgerData"] isKindOfClass:NSData.class]
+      ? state[@"ledgerData"] : NSData.data;
+  NSMutableData *delta = [NSMutableData data];
+  if (priorLedgerData.length > 0) {
+    const unsigned char *bytes = priorLedgerData.bytes;
+    if (bytes[priorLedgerData.length - 1] != '\n') [delta appendBytes:"\n" length:1];
+  }
+  for (NSDictionary *event in events) {
+    NSData *eventData = [NSJSONSerialization dataWithJSONObject:event
+        options:NSJSONWritingSortedKeys error:error];
+    if (!eventData) return nil;
+    [delta appendData:eventData];
+    [delta appendBytes:"\n" length:1];
+  }
+  NSMutableData *nextLedgerData = [priorLedgerData mutableCopy];
+  [nextLedgerData appendData:delta];
+  NSString *ledgerHash = [self sha256ForData:nextLedgerData];
+  NSNumber *revision = events.lastObject[@"revision"];
+
+  NSDictionary *projectProjection = [state[@"project"] isKindOfClass:NSDictionary.class]
+      ? state[@"project"] : @{};
+  NSDictionary *tasksProjection = [state[@"tasks"] isKindOfClass:NSDictionary.class]
+      ? state[@"tasks"] : @{};
+  NSString *projectName = [projectProjection[@"name"] isKindOfClass:NSString.class]
+      ? projectProjection[@"name"] : registryItem[@"name"];
+  NSString *projectDescription = [projectProjection[@"description"] isKindOfClass:NSString.class]
+      ? projectProjection[@"description"] : (registryItem[@"description"] ?: @"");
+  NSString *createdAt = [projectProjection[@"createdAt"] isKindOfClass:NSString.class]
+      ? projectProjection[@"createdAt"] : timestamp;
+  NSDictionary *nextProject = @{
+    @"schemaVersion": @1, @"projectId": projectID,
+    @"name": projectName ?: projectID, @"description": projectDescription ?: @"",
+    @"createdAt": createdAt, @"updatedAt": timestamp,
+    @"revision": revision, @"ledgerHash": ledgerHash
+  };
+  NSDictionary *nextMemory = @{
+    @"schemaVersion": @1, @"projectId": projectID,
+    @"revision": revision, @"ledgerHash": ledgerHash,
+    @"generatedAt": timestamp, @"items": projectedItems
+  };
+  NSDictionary *nextTasks = @{
+    @"schemaVersion": @1, @"projectId": projectID,
+    @"revision": revision, @"ledgerHash": ledgerHash,
+    @"generatedAt": timestamp,
+    @"tasks": [tasksProjection[@"tasks"] isKindOfClass:NSArray.class] ? tasksProjection[@"tasks"] : @[],
+    @"handoffs": [tasksProjection[@"handoffs"] isKindOfClass:NSArray.class] ? tasksProjection[@"handoffs"] : @[]
+  };
+  if (![self appendJSONObjects:events toURL:state[@"ledgerURL"] error:error] ||
+      ![self writeResearchMemoryProjectionsForProjectID:projectID
+          project:nextProject memory:nextMemory tasks:nextTasks registry:registry error:error]) {
+    return nil;
+  }
+  return @{ @"revision": revision, @"ledgerHash": ledgerHash };
+}
+
+- (BOOL)validateRegionDocumentContext:(NSDictionary *)payload
+                              project:(NSString **)projectIDOut
+                                graph:(NSDictionary **)graphOut
+                             category:(NSDictionary **)categoryOut
+                             registry:(NSDictionary **)registryOut
+                                state:(NSDictionary **)stateOut
+                         registryItem:(NSDictionary **)registryItemOut
+                                error:(NSError **)error {
+  NSString *projectID = [payload[@"projectId"] isKindOfClass:NSString.class] ? payload[@"projectId"] : nil;
+  NSNumber *expectedMemoryRevision = [payload[@"expectedMemoryRevision"] isKindOfClass:NSNumber.class]
+      ? payload[@"expectedMemoryRevision"] : nil;
+  NSNumber *expectedGraphRevision = [payload[@"expectedGraphRevision"] isKindOfClass:NSNumber.class]
+      ? payload[@"expectedGraphRevision"] : nil;
+  NSString *categoryID = [payload[@"categoryId"] isKindOfClass:NSString.class] ? payload[@"categoryId"] : nil;
+  if (![self isResearchMemoryProjectID:projectID] || !expectedMemoryRevision || !expectedGraphRevision) {
+    if (error) *error = [self storageError:
+        @"Region documents require a valid project plus expected memory and Graph revisions." code:682];
+    return NO;
+  }
+  if (![self ensureProjectStorage:error]) return NO;
+  NSDictionary *registry = [self readDictionaryAtURL:[self projectsRegistryURL]
+                                      defaultValue:nil error:error];
+  if (!registry || ![[self activeProjectIDFromRegistry:registry] isEqualToString:projectID]) {
+    if (error && !*error) *error = [self storageError:
+        @"The active project changed. Reopen the region document before continuing." code:683];
+    return NO;
+  }
+  NSDictionary *registryItem = [self registryItemForProjectID:projectID registry:registry];
+  if (!registryItem) {
+    if (error) *error = [self storageError:@"The active project is missing from the registry." code:684];
+    return NO;
+  }
+  NSDictionary *graph = [self readDictionaryAtURL:[self currentGraphURL] defaultValue:nil error:error];
+  if (!graph) return NO;
+  NSNumber *graphRevision = [graph[@"revision"] isKindOfClass:NSNumber.class] ? graph[@"revision"] : @0;
+  if (![graphRevision isEqualToNumber:expectedGraphRevision]) {
+    if (error) *error = [self storageError:
+        @"The literature universe changed revision. Reopen the region before saving." code:685];
+    return NO;
+  }
+  NSDictionary *category = [self regionCategoryForID:categoryID graph:graph error:error];
+  if (!category) return NO;
+  NSDictionary *state = [self validatedResearchMemoryStateForProjectID:projectID error:error];
+  if (!state) return NO;
+  if ([state[@"revision"] integerValue] != expectedMemoryRevision.integerValue) {
+    if (error) *error = [self storageError:
+        @"Project memory changed revision. Reopen the region document before saving." code:686];
+    return NO;
+  }
+  if (projectIDOut) *projectIDOut = projectID;
+  if (graphOut) *graphOut = graph;
+  if (categoryOut) *categoryOut = category;
+  if (registryOut) *registryOut = registry;
+  if (stateOut) *stateOut = state;
+  if (registryItemOut) *registryItemOut = registryItem;
+  return YES;
+}
+
+- (void)performRegionDocumentSave:(NSDictionary *)payload
+                           content:(NSString *)content
+                          fileName:(NSString *)fileName
+                             input:(NSString *)input
+                            action:(NSString *)action {
+  NSError *error = nil;
+  NSURL *stageLockURL = [self stageRefreshLockURL];
+  NSString *stageToken = [self acquireDirectoryLockAtURL:stageLockURL
+      operation:@"Region document update" timeout:15.0 error:&error];
+  if (!stageToken) { [self sendWorkspaceErrorForAction:action error:error]; return; }
+  NSURL *memoryLockURL = [self researchMemoryLockURL];
+  NSString *memoryToken = [self acquireDirectoryLockAtURL:memoryLockURL
+      operation:@"Region document update" timeout:15.0 error:&error];
+  if (!memoryToken) {
+    [self releaseDirectoryLockAtURL:stageLockURL token:stageToken];
+    [self sendWorkspaceErrorForAction:action error:error];
+    return;
+  }
+  @try {
+    NSString *projectID = nil;
+    NSDictionary *graph = nil;
+    NSDictionary *category = nil;
+    NSDictionary *registry = nil;
+    NSDictionary *state = nil;
+    NSDictionary *registryItem = nil;
+    if (![self validateRegionDocumentContext:payload project:&projectID graph:&graph
+        category:&category registry:&registry state:&state registryItem:&registryItem error:&error]) {
+      [self sendWorkspaceErrorForAction:action error:error];
+      return;
+    }
+    if (![content isKindOfClass:NSString.class] ||
+        [content stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet].length == 0 ||
+        [content rangeOfString:@"\0"].location != NSNotFound) {
+      [self sendWorkspaceErrorForAction:action
+          error:[self storageError:@"Region document content must be non-empty UTF-8 text without NUL characters." code:687]];
+      return;
+    }
+    NSData *contentData = [content dataUsingEncoding:NSUTF8StringEncoding];
+    if (!contentData || contentData.length == 0 || contentData.length > 1024 * 1024) {
+      [self sendWorkspaceErrorForAction:action
+          error:[self storageError:@"Region document content must not exceed 1 MiB of UTF-8 text." code:688]];
+      return;
+    }
+    NSString *kind = [payload[@"kind"] isKindOfClass:NSString.class] ? payload[@"kind"] : payload[@"documentKind"];
+    NSString *format = [payload[@"format"] isKindOfClass:NSString.class] ? payload[@"format"] : nil;
+    if (!([kind isEqualToString:@"note"] || [kind isEqualToString:@"knowledge_card"]) ||
+        !([format isEqualToString:@"markdown"] || [format isEqualToString:@"plain_text"])) {
+      [self sendWorkspaceErrorForAction:action
+          error:[self storageError:@"Region document kind or text format is invalid." code:689]];
+      return;
+    }
+    if ([input isEqualToString:@"file_import"]) {
+      NSString *extension = fileName.pathExtension.lowercaseString;
+      NSString *expectedFormat = [extension isEqualToString:@"md"] ? @"markdown"
+          : ([extension isEqualToString:@"txt"] ? @"plain_text" : nil);
+      if (!expectedFormat || ![format isEqualToString:expectedFormat]) {
+        [self sendWorkspaceErrorForAction:action
+            error:[self storageError:@"Imported region documents must be .md/markdown or .txt/plain text." code:690]];
+        return;
+      }
+    }
+    NSString *title = [payload[@"title"] isKindOfClass:NSString.class]
+        ? [payload[@"title"] stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet]
+        : @"";
+    if (title.length == 0 && fileName.length > 0) title = fileName.stringByDeletingPathExtension;
+    if (title.length == 0 || title.length > 1000) {
+      [self sendWorkspaceErrorForAction:action
+          error:[self storageError:@"Region document title must contain from 1 through 1,000 characters." code:691]];
+      return;
+    }
+
+    NSArray *existingItems = [state[@"memory"][@"items"] isKindOfClass:NSArray.class]
+        ? state[@"memory"][@"items"] : @[];
+    NSString *supersedesMemoryID = [payload[@"supersedesMemoryId"] isKindOfClass:NSString.class]
+        ? payload[@"supersedesMemoryId"] : nil;
+    NSDictionary *supersededItem = nil;
+    if (supersedesMemoryID.length > 0) {
+      for (NSDictionary *item in existingItems) {
+        if ([item[@"memoryId"] isEqualToString:supersedesMemoryID]) { supersededItem = item; break; }
+      }
+      if (![self isRegionDocumentMemory:supersededItem] || ![supersededItem[@"state"] isEqualToString:@"active"]) {
+        [self sendWorkspaceErrorForAction:action
+            error:[self storageError:@"Only the active version of a region document can be superseded." code:692]];
+        return;
+      }
+    }
+    NSString *requestedDocumentID = [payload[@"documentId"] isKindOfClass:NSString.class]
+        ? payload[@"documentId"] : nil;
+    NSString *documentID = supersededItem[@"presentation"][@"documentId"];
+    if (!documentID) documentID = [self isRegionDocumentID:requestedDocumentID]
+        ? requestedDocumentID
+        : [NSString stringWithFormat:@"regiondoc-%@",
+            [NSUUID.UUID.UUIDString.lowercaseString stringByReplacingOccurrencesOfString:@"-" withString:@""]];
+    if (requestedDocumentID.length > 0 && ![requestedDocumentID isEqualToString:documentID]) {
+      [self sendWorkspaceErrorForAction:action
+          error:[self storageError:@"The logical region-document ID changed while it was being edited." code:693]];
+      return;
+    }
+    for (NSDictionary *item in existingItems) {
+      if ([item[@"state"] isEqualToString:@"active"] &&
+          [item[@"presentation"][@"documentId"] isEqualToString:documentID] &&
+          ![item[@"memoryId"] isEqualToString:supersedesMemoryID]) {
+        [self sendWorkspaceErrorForAction:action
+            error:[self storageError:@"This region document already has another active version." code:694]];
+        return;
+      }
+    }
+
+    NSInteger baseRevision = [state[@"revision"] integerValue];
+    NSString *timestamp = [self isoTimestamp];
+    NSMutableArray<NSDictionary *> *events = [NSMutableArray array];
+    if (![state[@"initialized"] boolValue]) {
+      [events addObject:@{
+        @"schemaVersion": @1, @"eventId": NSUUID.UUID.UUIDString,
+        @"timestamp": timestamp, @"projectId": projectID, @"revision": @1,
+        @"type": @"project_initialized", @"name": registryItem[@"name"] ?: projectID,
+        @"description": registryItem[@"description"] ?: @""
+      }];
+      baseRevision = 1;
+    }
+    NSInteger memoryRevision = baseRevision + 1;
+    NSString *memoryID = [NSString stringWithFormat:@"mem-region-doc-%@",
+        [NSUUID.UUID.UUIDString.lowercaseString stringByReplacingOccurrencesOfString:@"-" withString:@""]];
+    NSString *contentHash = [self sha256ForData:contentData];
+    NSDictionary *scope = @{
+      @"kind": @"nebula_region", @"categoryId": category[@"id"],
+      @"categoryNameAtAssignment": category[@"name"],
+      @"graphRevisionAtAssignment": graph[@"revision"] ?: @0
+    };
+    NSDictionary *presentation = @{
+      @"documentId": documentID, @"kind": kind, @"format": format
+    };
+    NSMutableDictionary *source = [@{
+      @"kind": @"app_region_document", @"input": input,
+      @"byteLength": @(contentData.length), @"contentSha256": contentHash
+    } mutableCopy];
+    if ([input isEqualToString:@"file_import"]) source[@"fileName"] = fileName.lastPathComponent;
+    NSDictionary *memoryDraft = @{
+      @"memoryId": memoryID, @"type": @"project_context", @"title": title,
+      @"content": content, @"state": @"active", @"evidenceState": @"user_declared",
+      @"provenance": @"user", @"supersedes": supersedesMemoryID ? @[supersedesMemoryID] : @[],
+      @"contradicts": @[], @"paperEvidence": @[], @"source": source,
+      @"scope": scope, @"presentation": presentation
+    };
+    [events addObject:@{
+      @"schemaVersion": @1, @"eventId": NSUUID.UUID.UUIDString,
+      @"timestamp": timestamp, @"projectId": projectID, @"revision": @(memoryRevision),
+      @"type": @"memory_recorded", @"memory": memoryDraft
+    }];
+
+    NSMutableArray *projectedItems = [NSMutableArray arrayWithCapacity:existingItems.count + 1];
+    for (NSDictionary *item in existingItems) {
+      if ([item[@"memoryId"] isEqualToString:supersedesMemoryID]) {
+        NSMutableDictionary *updated = [item mutableCopy];
+        updated[@"state"] = @"superseded";
+        updated[@"supersededBy"] = memoryID;
+        updated[@"updatedAt"] = timestamp;
+        updated[@"updatedRevision"] = @(memoryRevision);
+        [projectedItems addObject:updated];
+      } else {
+        [projectedItems addObject:item];
+      }
+    }
+    NSMutableDictionary *projectedMemory = [memoryDraft mutableCopy];
+    projectedMemory[@"createdAt"] = timestamp;
+    projectedMemory[@"updatedAt"] = timestamp;
+    projectedMemory[@"createdRevision"] = @(memoryRevision);
+    projectedMemory[@"updatedRevision"] = @(memoryRevision);
+    projectedMemory[@"contradictedBy"] = @[];
+    [projectedItems addObject:projectedMemory];
+
+    NSDictionary *commit = [self commitRegionMemoryEvents:events projectedItems:projectedItems
+        state:state projectID:projectID registry:registry registryItem:registryItem
+        timestamp:timestamp error:&error];
+    if (!commit) { [self sendWorkspaceErrorForAction:action error:error]; return; }
+    NSString *noun = [kind isEqualToString:@"knowledge_card"] ? @"User knowledge card" : @"Region note";
+    [self sendWorkspaceWithNotice:[NSString stringWithFormat:
+        @"%@ was appended to project memory as user-declared content. It was not scientifically verified.", noun]];
+  } @finally {
+    [self releaseDirectoryLockAtURL:memoryLockURL token:memoryToken];
+    [self releaseDirectoryLockAtURL:stageLockURL token:stageToken];
+  }
+}
+
+- (void)saveRegionDocumentPayload:(NSDictionary *)payload {
+  NSString *content = [payload[@"content"] isKindOfClass:NSString.class] ? payload[@"content"] : nil;
+  [self performRegionDocumentSave:payload content:content fileName:nil input:@"manual"
+                           action:@"saveRegionDocument"];
+}
+
+- (void)loadRegionDocumentPayload:(NSDictionary *)payload {
+  NSError *error = nil;
+  NSURL *stageLockURL = [self stageRefreshLockURL];
+  NSString *stageToken = [self acquireDirectoryLockAtURL:stageLockURL
+      operation:@"Region document read" timeout:15.0 error:&error];
+  if (!stageToken) { [self sendWorkspaceErrorForAction:@"loadRegionDocument" error:error]; return; }
+  NSURL *memoryLockURL = [self researchMemoryLockURL];
+  NSString *memoryToken = [self acquireDirectoryLockAtURL:memoryLockURL
+      operation:@"Region document read" timeout:15.0 error:&error];
+  if (!memoryToken) {
+    [self releaseDirectoryLockAtURL:stageLockURL token:stageToken];
+    [self sendWorkspaceErrorForAction:@"loadRegionDocument" error:error];
+    return;
+  }
+  @try {
+    NSString *projectID = nil;
+    NSDictionary *graph = nil;
+    NSDictionary *category = nil;
+    NSDictionary *registry = nil;
+    NSDictionary *state = nil;
+    NSDictionary *registryItem = nil;
+    if (![self validateRegionDocumentContext:payload project:&projectID graph:&graph
+        category:&category registry:&registry state:&state registryItem:&registryItem error:&error]) {
+      [self sendWorkspaceErrorForAction:@"loadRegionDocument" error:error];
+      return;
+    }
+    NSString *memoryID = [payload[@"memoryId"] isKindOfClass:NSString.class] ? payload[@"memoryId"] : nil;
+    NSDictionary *found = nil;
+    for (NSDictionary *item in [state[@"memory"][@"items"] isKindOfClass:NSArray.class]
+        ? state[@"memory"][@"items"] : @[]) {
+      if ([item[@"memoryId"] isEqualToString:memoryID]) { found = item; break; }
+    }
+    if (![self isRegionDocumentMemory:found] ||
+        ![found[@"scope"][@"categoryId"] isEqualToString:category[@"id"]]) {
+      [self sendWorkspaceErrorForAction:@"loadRegionDocument"
+          error:[self storageError:@"The requested region document is missing or belongs to another region." code:695]];
+      return;
+    }
+    NSDictionary *response = @{
+      @"projectId": projectID, @"memoryRevision": state[@"revision"],
+      @"graphRevision": graph[@"revision"] ?: @0, @"document": found
+    };
+    dispatch_async(dispatch_get_main_queue(), ^{
+      [self.webView callAsyncJavaScript:
+          @"window.__liteverseReceiveRegionDocument && window.__liteverseReceiveRegionDocument(regionDocumentPayload);"
+                                arguments:@{ @"regionDocumentPayload": response }
+                                  inFrame:nil inContentWorld:WKContentWorld.pageWorld completionHandler:nil];
+    });
+  } @finally {
+    [self releaseDirectoryLockAtURL:memoryLockURL token:memoryToken];
+    [self releaseDirectoryLockAtURL:stageLockURL token:stageToken];
+  }
+}
+
+- (void)retireRegionDocumentPayload:(NSDictionary *)payload {
+  NSError *error = nil;
+  NSURL *stageLockURL = [self stageRefreshLockURL];
+  NSString *stageToken = [self acquireDirectoryLockAtURL:stageLockURL
+      operation:@"Region document retirement" timeout:15.0 error:&error];
+  if (!stageToken) { [self sendWorkspaceErrorForAction:@"retireRegionDocument" error:error]; return; }
+  NSURL *memoryLockURL = [self researchMemoryLockURL];
+  NSString *memoryToken = [self acquireDirectoryLockAtURL:memoryLockURL
+      operation:@"Region document retirement" timeout:15.0 error:&error];
+  if (!memoryToken) {
+    [self releaseDirectoryLockAtURL:stageLockURL token:stageToken];
+    [self sendWorkspaceErrorForAction:@"retireRegionDocument" error:error];
+    return;
+  }
+  @try {
+    NSString *projectID = nil;
+    NSDictionary *graph = nil;
+    NSDictionary *category = nil;
+    NSDictionary *registry = nil;
+    NSDictionary *state = nil;
+    NSDictionary *registryItem = nil;
+    if (![self validateRegionDocumentContext:payload project:&projectID graph:&graph
+        category:&category registry:&registry state:&state registryItem:&registryItem error:&error]) {
+      [self sendWorkspaceErrorForAction:@"retireRegionDocument" error:error];
+      return;
+    }
+    NSString *memoryID = [payload[@"memoryId"] isKindOfClass:NSString.class] ? payload[@"memoryId"] : nil;
+    NSArray *existingItems = [state[@"memory"][@"items"] isKindOfClass:NSArray.class]
+        ? state[@"memory"][@"items"] : @[];
+    NSDictionary *target = nil;
+    for (NSDictionary *item in existingItems) {
+      if ([item[@"memoryId"] isEqualToString:memoryID]) { target = item; break; }
+    }
+    if (![self isRegionDocumentMemory:target] || ![target[@"state"] isEqualToString:@"active"] ||
+        ![target[@"scope"][@"categoryId"] isEqualToString:category[@"id"]]) {
+      [self sendWorkspaceErrorForAction:@"retireRegionDocument"
+          error:[self storageError:@"Only an active document in the pinned region can be retired." code:696]];
+      return;
+    }
+    NSString *reason = [payload[@"reason"] isKindOfClass:NSString.class]
+        ? [payload[@"reason"] stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet]
+        : @"Retired by the user in Liteverse";
+    if (reason.length == 0 || reason.length > 20000) reason = @"Retired by the user in Liteverse";
+    NSInteger revision = [state[@"revision"] integerValue] + 1;
+    NSString *timestamp = [self isoTimestamp];
+    NSDictionary *event = @{
+      @"schemaVersion": @1, @"eventId": NSUUID.UUID.UUIDString,
+      @"timestamp": timestamp, @"projectId": projectID, @"revision": @(revision),
+      @"type": @"memory_retired", @"memoryId": memoryID, @"reason": reason
+    };
+    NSMutableArray *projectedItems = [NSMutableArray arrayWithCapacity:existingItems.count];
+    for (NSDictionary *item in existingItems) {
+      if ([item[@"memoryId"] isEqualToString:memoryID]) {
+        NSMutableDictionary *updated = [item mutableCopy];
+        updated[@"state"] = @"retired";
+        updated[@"retirementReason"] = reason;
+        updated[@"updatedAt"] = timestamp;
+        updated[@"updatedRevision"] = @(revision);
+        [projectedItems addObject:updated];
+      } else {
+        [projectedItems addObject:item];
+      }
+    }
+    if (![self commitRegionMemoryEvents:@[event] projectedItems:projectedItems state:state
+        projectID:projectID registry:registry registryItem:registryItem timestamp:timestamp error:&error]) {
+      [self sendWorkspaceErrorForAction:@"retireRegionDocument" error:error];
+      return;
+    }
+    [self sendWorkspaceWithNotice:@"The region document was retired. Its append-only history was preserved."];
+  } @finally {
+    [self releaseDirectoryLockAtURL:memoryLockURL token:memoryToken];
+    [self releaseDirectoryLockAtURL:stageLockURL token:stageToken];
+  }
+}
+
+- (void)presentRegionDocumentImporterForPayload:(NSDictionary *)payload {
+  NSOpenPanel *panel = [NSOpenPanel openPanel];
+  panel.title = @"Import a Region Note or Knowledge Card";
+  panel.prompt = @"Import";
+  panel.canChooseFiles = YES;
+  panel.canChooseDirectories = NO;
+  panel.allowsMultipleSelection = NO;
+  NSMutableArray<UTType *> *types = [NSMutableArray arrayWithObject:UTTypePlainText];
+  UTType *markdownType = [UTType typeWithFilenameExtension:@"md"];
+  if (markdownType) [types addObject:markdownType];
+  panel.allowedContentTypes = types;
+  NSDictionary *request = [payload copy];
+  [panel beginSheetModalForWindow:self.window completionHandler:^(NSModalResponse result) {
+    if (result != NSModalResponseOK || !panel.URL) {
+      dispatch_async(self->_persistenceQueue, ^{
+        [self sendWorkspaceWithNotice:@"Region document import was canceled."];
+      });
+      return;
+    }
+    NSURL *fileURL = panel.URL;
+    dispatch_async(self->_persistenceQueue, ^{
+      NSError *error = nil;
+      NSURL *standardized = fileURL.URLByStandardizingPath;
+      NSNumber *isRegular = nil;
+      NSNumber *isSymbolicLink = nil;
+      NSNumber *fileSize = nil;
+      NSString *extension = standardized.pathExtension.lowercaseString;
+      if (!([extension isEqualToString:@"md"] || [extension isEqualToString:@"txt"]) ||
+          ![standardized getResourceValue:&isRegular forKey:NSURLIsRegularFileKey error:&error] ||
+          ![standardized getResourceValue:&isSymbolicLink forKey:NSURLIsSymbolicLinkKey error:&error] ||
+          ![standardized getResourceValue:&fileSize forKey:NSURLFileSizeKey error:&error] ||
+          !isRegular.boolValue || isSymbolicLink.boolValue ||
+          ![standardized.path isEqualToString:standardized.URLByResolvingSymlinksInPath.path] ||
+          fileSize.unsignedLongLongValue == 0 || fileSize.unsignedLongLongValue > 1024 * 1024) {
+        [self sendWorkspaceErrorForAction:@"importRegionDocumentFile"
+            error:error ?: [self storageError:
+                @"Choose a real, non-symbolic-link UTF-8 .md or .txt file no larger than 1 MiB." code:697]];
+        return;
+      }
+      NSData *data = [NSData dataWithContentsOfURL:standardized options:NSDataReadingMappedIfSafe error:&error];
+      unsigned char nulByte = 0;
+      NSData *nulData = [NSData dataWithBytes:&nulByte length:1];
+      if (!data || data.length != fileSize.unsignedLongLongValue ||
+          [data rangeOfData:nulData options:0 range:NSMakeRange(0, data.length)].location != NSNotFound) {
+        [self sendWorkspaceErrorForAction:@"importRegionDocumentFile"
+            error:error ?: [self storageError:@"The selected file changed while reading or contains binary NUL data." code:698]];
+        return;
+      }
+      NSString *content = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+      if (!content) {
+        [self sendWorkspaceErrorForAction:@"importRegionDocumentFile"
+            error:[self storageError:@"The selected document is not valid UTF-8." code:699]];
+        return;
+      }
+      NSMutableDictionary *prepared = [request mutableCopy];
+      prepared[@"format"] = [extension isEqualToString:@"md"] ? @"markdown" : @"plain_text";
+      if (![prepared[@"title"] isKindOfClass:NSString.class] || [prepared[@"title"] length] == 0) {
+        prepared[@"title"] = standardized.lastPathComponent.stringByDeletingPathExtension;
+      }
+      [self performRegionDocumentSave:prepared content:content
+          fileName:standardized.lastPathComponent input:@"file_import"
+          action:@"importRegionDocumentFile"];
+    });
+  }];
 }
 
 - (void)saveResearchText:(NSString *)rawText
@@ -5255,6 +7134,44 @@
   return nil;
 }
 
+- (NSURL *)registeredLinkedPDFURLForPath:(NSString *)path error:(NSError **)error {
+  if (![path isKindOfClass:NSString.class] || !path.isAbsolutePath ||
+      ![path isEqualToString:path.stringByStandardizingPath]) return nil;
+  NSMutableArray<NSDictionary *> *registeredSources = [NSMutableArray array];
+  NSDictionary *library = [self readDictionaryAtURL:[self libraryURL]
+                                        defaultValue:[self defaultLibrary]
+                                               error:error];
+  if (!library) return nil;
+  for (NSDictionary *item in [library[@"items"] isKindOfClass:NSArray.class] ? library[@"items"] : @[]) {
+    NSDictionary *source = [item[@"source"] isKindOfClass:NSDictionary.class] ? item[@"source"] : nil;
+    if ([self isLinkedPDFSource:source] && [source[@"pdfPath"] isEqualToString:path]) {
+      [registeredSources addObject:source];
+    }
+  }
+  NSDictionary *graph = [self readDictionaryAtURL:[self currentGraphURL] defaultValue:nil error:nil];
+  for (NSDictionary *paper in [graph[@"papers"] isKindOfClass:NSArray.class] ? graph[@"papers"] : @[]) {
+    NSDictionary *source = [paper[@"source"] isKindOfClass:NSDictionary.class] ? paper[@"source"] : nil;
+    if ([self isLinkedPDFSource:source] && [source[@"pdfPath"] isEqualToString:path]) {
+      [registeredSources addObject:source];
+    }
+  }
+  if (registeredSources.count == 0) return nil;
+  // Matching descriptors must all identify the same immutable bytes. A stale
+  // duplicate registration fails closed instead of weakening the newest one.
+  NSString *registeredHash = nil;
+  for (NSDictionary *source in registeredSources) {
+    NSString *sourceHash = [source[@"sha256"] isKindOfClass:NSString.class]
+        ? [source[@"sha256"] lowercaseString] : nil;
+    if (sourceHash.length != 64 || (registeredHash && ![registeredHash isEqualToString:sourceHash])) {
+      if (error) *error = [self storageError:@"Conflicting linked-source registrations prevent this PDF from being opened." code:652];
+      return nil;
+    }
+    registeredHash = sourceHash;
+  }
+  return [self linkedPDFURLForSource:registeredSources.firstObject
+                    requireExisting:YES verifyHash:YES error:error];
+}
+
 - (void)openLibraryItemID:(NSString *)itemID externalArxiv:(BOOL)externalArxiv {
   NSError *error = nil;
   NSDictionary *item = [self libraryItemWithID:itemID error:&error];
@@ -5280,7 +7197,9 @@
   NSString *localPath = [source[@"pdfPath"] isKindOfClass:NSString.class]
       ? source[@"pdfPath"] : item[@"localPath"];
   NSURL *fileURL = nil;
-  if (storedFilename.length > 0 &&
+  if ([self isLinkedPDFSource:source]) {
+    fileURL = [self linkedPDFURLForSource:source requireExisting:YES verifyHash:YES error:&error];
+  } else if (storedFilename.length > 0 &&
       [storedFilename isEqualToString:storedFilename.lastPathComponent] &&
       [storedFilename.pathExtension.lowercaseString isEqualToString:@"pdf"]) {
     fileURL = [[self pdfDirectoryURL] URLByAppendingPathComponent:storedFilename];
@@ -5293,7 +7212,7 @@
   }
   if (!fileURL) {
     [self sendWorkspaceErrorForAction:@"openLibraryItem"
-                                error:[self storageError:@"This item does not have a local PDF." code:303]];
+                                error:error ?: [self storageError:@"This item does not have a registered, unchanged local PDF." code:303]];
     return;
   }
   if ([NSFileManager.defaultManager fileExistsAtPath:fileURL.path]) {
@@ -5446,13 +7365,39 @@
                             includePDFs:(BOOL)includePDFs
                                   error:(NSError **)error {
   NSFileManager *manager = NSFileManager.defaultManager;
-  NSURL *lockURL = [self stageRefreshLockURL];
+  // Backup closes over graph, Research Memory, and annotation truth. Acquire
+  // their cross-process locks in the same global order used by compound
+  // mutations so the manifest can never describe a torn mixed revision.
+  NSURL *stageLockURL = [self stageRefreshLockURL];
   NSError *lockError = nil;
-  NSString *lockToken = [self acquireDirectoryLockAtURL:lockURL
+  NSString *stageLockToken = [self acquireDirectoryLockAtURL:stageLockURL
       operation:@"Workspace backup" timeout:0 error:&lockError];
-  if (!lockToken) {
-    if (error) *error = [manager fileExistsAtPath:lockURL.path]
+  if (!stageLockToken) {
+    if (error) *error = [manager fileExistsAtPath:stageLockURL.path]
         ? [self storageError:@"Curator or Refresh is updating the workspace. The backup did not start; try again later." code:515]
+        : lockError;
+    return nil;
+  }
+  NSURL *memoryLockURL = [self researchMemoryLockURL];
+  NSString *memoryLockToken = [self acquireDirectoryLockAtURL:memoryLockURL
+      operation:@"Workspace backup" timeout:0 error:&lockError];
+  if (!memoryLockToken) {
+    [self releaseDirectoryLockAtURL:stageLockURL token:stageLockToken];
+    if (error) *error = [manager fileExistsAtPath:memoryLockURL.path]
+        ? [self storageError:
+            @"Research Memory is being updated. The backup did not start; try again later." code:516]
+        : lockError;
+    return nil;
+  }
+  NSURL *annotationLockURL = [self annotationMutationLockURL];
+  NSString *annotationLockToken = [self acquireDirectoryLockAtURL:annotationLockURL
+      operation:@"Workspace backup" timeout:0 error:&lockError];
+  if (!annotationLockToken) {
+    [self releaseDirectoryLockAtURL:memoryLockURL token:memoryLockToken];
+    [self releaseDirectoryLockAtURL:stageLockURL token:stageLockToken];
+    if (error) *error = [manager fileExistsAtPath:annotationLockURL.path]
+        ? [self storageError:
+            @"Annotations are being updated. The backup did not start; try again later." code:517]
         : lockError;
     return nil;
   }
@@ -5512,7 +7457,9 @@
       }
     }
   } @finally {
-    [self releaseDirectoryLockAtURL:lockURL token:lockToken];
+    [self releaseDirectoryLockAtURL:annotationLockURL token:annotationLockToken];
+    [self releaseDirectoryLockAtURL:memoryLockURL token:memoryLockToken];
+    [self releaseDirectoryLockAtURL:stageLockURL token:stageLockToken];
   }
 }
 
@@ -5694,10 +7641,27 @@
       return nil;
     }
 
+    NSDictionary *source = [paper[@"source"] isKindOfClass:NSDictionary.class] ? paper[@"source"] : @{};
+    NSString *pdfPath = [source[@"pdfPath"] isKindOfClass:NSString.class]
+        ? source[@"pdfPath"] : ([paper[@"pdfPath"] isKindOfClass:NSString.class] ? paper[@"pdfPath"] : nil);
+    NSString *recordedSourceHash = [source[@"sha256"] isKindOfClass:NSString.class]
+        ? [source[@"sha256"] lowercaseString] : nil;
+    if ([self isLinkedPDFSource:source]) {
+      BOOL linkedReferenceClosed = [self linkedPDFURLForSource:source
+                                                requireExisting:NO verifyHash:NO error:nil] != nil &&
+          recordedSourceHash.length == 64;
+      if (!linkedReferenceClosed) {
+        if (error) *error = [self storageError:
+            [NSString stringWithFormat:@"The backup contains an invalid linked PDF reference for paper %@.", paperID]
+                                          code:523];
+        return nil;
+      }
+      // Linked PDFs intentionally remain outside the backup. The graph and
+      // library preserve their absolute root-relative descriptor and hash so
+      // restore can report a missing or changed external source honestly.
+      continue;
+    }
     if (includesPDFs) {
-      NSDictionary *source = [paper[@"source"] isKindOfClass:NSDictionary.class] ? paper[@"source"] : @{};
-      NSString *pdfPath = [source[@"pdfPath"] isKindOfClass:NSString.class]
-          ? source[@"pdfPath"] : ([paper[@"pdfPath"] isKindOfClass:NSString.class] ? paper[@"pdfPath"] : nil);
       BOOL pdfClosed = pdfPath.length > 0 && [self isSafeWorkspaceRelativePath:pdfPath] &&
           [pdfPath isEqualToString:pdfPath.stringByStandardizingPath] &&
           [pdfPath hasPrefix:@"Library/PDFs/"] && [seenPaths containsObject:pdfPath] &&
@@ -5708,13 +7672,28 @@
                                           code:523];
         return nil;
       }
-      NSString *recordedSourceHash = [source[@"sha256"] isKindOfClass:NSString.class]
-          ? [source[@"sha256"] lowercaseString] : nil;
       if (recordedSourceHash.length > 0 &&
           (recordedSourceHash.length != 64 || ![recordedSourceHash isEqualToString:verifiedHashes[pdfPath]])) {
         if (error) *error = [self storageError:
             [NSString stringWithFormat:@"The graph PDF hash for paper %@ does not match the verified file in the backup.", paperID]
                                           code:524];
+        return nil;
+      }
+    }
+  }
+  if ([seenPaths containsObject:@"library.json"]) {
+    NSDictionary *backupLibrary = [self readDictionaryAtURL:
+        [workspaceDirectory URLByAppendingPathComponent:@"library.json"]
+                                           defaultValue:nil
+                                                  error:error];
+    if (!backupLibrary) return nil;
+    for (NSDictionary *item in [backupLibrary[@"items"] isKindOfClass:NSArray.class] ? backupLibrary[@"items"] : @[]) {
+      NSDictionary *itemSource = [item[@"source"] isKindOfClass:NSDictionary.class] ? item[@"source"] : @{};
+      if (![self isLinkedPDFSource:itemSource]) continue;
+      NSString *itemHash = [itemSource[@"sha256"] isKindOfClass:NSString.class]
+          ? [itemSource[@"sha256"] lowercaseString] : nil;
+      if (![self linkedPDFURLForSource:itemSource requireExisting:NO verifyHash:NO error:nil] || itemHash.length != 64) {
+        if (error) *error = [self storageError:@"The backup library contains an invalid linked PDF reference." code:654];
         return nil;
       }
     }
@@ -6059,6 +8038,14 @@
     [self presentPDFImporter];
     return;
   }
+  if ([action isEqualToString:@"pickLiteratureFolder"]) {
+    [self presentLiteratureFolderImporter];
+    return;
+  }
+  if ([action isEqualToString:@"pickZoteroLibrary"]) {
+    [self presentZoteroImporter];
+    return;
+  }
   if ([action isEqualToString:@"saveArxiv"]) {
     [self saveArxivValue:payload[@"value"]];
     return;
@@ -6073,6 +8060,31 @@
                  projectID:payload[@"projectId"]
           expectedRevision:[payload[@"expectedRevision"] isKindOfClass:NSNumber.class]
               ? payload[@"expectedRevision"] : nil];
+    return;
+  }
+  if ([action isEqualToString:@"loadRegionDocument"]) {
+    NSDictionary *request = [payload copy];
+    dispatch_async(_persistenceQueue, ^{
+      @autoreleasepool { [self loadRegionDocumentPayload:request]; }
+    });
+    return;
+  }
+  if ([action isEqualToString:@"saveRegionDocument"]) {
+    NSDictionary *request = [payload copy];
+    dispatch_async(_persistenceQueue, ^{
+      @autoreleasepool { [self saveRegionDocumentPayload:request]; }
+    });
+    return;
+  }
+  if ([action isEqualToString:@"importRegionDocumentFile"]) {
+    [self presentRegionDocumentImporterForPayload:payload];
+    return;
+  }
+  if ([action isEqualToString:@"retireRegionDocument"]) {
+    NSDictionary *request = [payload copy];
+    dispatch_async(_persistenceQueue, ^{
+      @autoreleasepool { [self retireRegionDocumentPayload:request]; }
+    });
     return;
   }
   if ([action isEqualToString:@"setActiveProject"] && [payload[@"projectId"] isKindOfClass:NSString.class]) {
@@ -6151,14 +8163,17 @@
        [standardized hasPrefix:@"Knowledge/fulltext/"] ||
        [standardized hasPrefix:@"Knowledge/artifacts/"] ||
        ([standardized hasPrefix:@"Projects/"] && [standardized containsString:@"/context-packs/"] &&
-        ([standardized.pathExtension.lowercaseString isEqualToString:@"json"] ||
+       ([standardized.pathExtension.lowercaseString isEqualToString:@"json"] ||
          [standardized.pathExtension.lowercaseString isEqualToString:@"md"])) ||
        [standardized hasPrefix:@"Library/PDFs/"]);
+  NSError *linkedError = nil;
+  NSURL *linkedURL = path.isAbsolutePath
+      ? [self registeredLinkedPDFURLForPath:standardized error:&linkedError] : nil;
   NSString *resolvedPath = allowedRelativePath
-      ? [self URLForWorkspaceRelativePath:standardized error:nil].path : nil;
+      ? [self URLForWorkspaceRelativePath:standardized error:nil].path : linkedURL.path;
   if (!resolvedPath) {
     [self sendWorkspaceErrorForAction:@"open"
-                                error:[self storageError:@"Only Liteverse-managed PDFs, knowledge cards, and full-text files may be opened." code:506]];
+                                error:linkedError ?: [self storageError:@"Only registered Liteverse PDFs, knowledge cards, and full-text files may be opened." code:506]];
     return;
   }
   if ([NSFileManager.defaultManager fileExistsAtPath:resolvedPath]) {

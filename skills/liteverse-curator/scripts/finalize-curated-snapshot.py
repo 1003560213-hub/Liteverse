@@ -30,7 +30,7 @@ REQUIRED_HEADINGS = (
     "Evidence index",
     "Annotation provenance",
 )
-SCIENTIFIC_HEADINGS = REQUIRED_HEADINGS[:6]
+SCIENTIFIC_HEADINGS = REQUIRED_HEADINGS[:5]
 ALLOWED_VERIFICATION = {
     "imported",
     "extracted",
@@ -128,6 +128,74 @@ def safe_support_path(support: Path, relative: str, label: str) -> Path:
     if resolved != resolved_support and resolved_support not in resolved.parents:
         raise FinalizationError(f"{label} escapes the support directory: {relative}")
     return resolved
+
+
+def normalized_absolute_path(value: str, label: str) -> Path:
+    candidate = Path(value).expanduser()
+    if not candidate.is_absolute():
+        raise FinalizationError(f"{label} must be absolute: {value}")
+    normalized = Path(os.path.abspath(os.path.normpath(candidate)))
+    if str(candidate) != str(normalized):
+        raise FinalizationError(f"{label} must be normalized: {value}")
+    return normalized
+
+
+def validate_linked_source_path(paper_id: str, linked_root: Path, relative: Path, pdf_path: Path) -> None:
+    root_info = linked_root.lstat()
+    if linked_root.is_symlink() or not linked_root.is_dir():
+        raise FinalizationError(f"paper {paper_id} linked root must be a real directory, not a symbolic link")
+    del root_info
+    cursor = linked_root
+    for index, part in enumerate(relative.parts):
+        cursor = cursor / part
+        info = cursor.lstat()
+        if cursor.is_symlink():
+            raise FinalizationError(f"paper {paper_id} linked source path contains a symbolic link: {cursor}")
+        final = index == len(relative.parts) - 1
+        if final and not cursor.is_file():
+            raise FinalizationError(f"paper {paper_id} linked PDF path is not a file: {cursor}")
+        if not final and not cursor.is_dir():
+            raise FinalizationError(f"paper {paper_id} linked source ancestor is not a directory: {cursor}")
+        del info
+    root_real = Path(os.path.realpath(linked_root))
+    pdf_real = Path(os.path.realpath(pdf_path))
+    if root_real != linked_root:
+        raise FinalizationError(f"paper {paper_id} linked root path traverses a symbolic-link ancestor")
+    if pdf_real != pdf_path:
+        raise FinalizationError(f"paper {paper_id} linked PDF path traverses a symbolic-link ancestor")
+    try:
+        common = Path(os.path.commonpath([root_real, pdf_real]))
+    except ValueError as error:
+        raise FinalizationError(f"paper {paper_id} linked PDF is not on the selected root volume") from error
+    if common != root_real or pdf_real == root_real:
+        raise FinalizationError(f"paper {paper_id} linked PDF real path escapes its selected root")
+
+
+def resolve_pdf_source(support: Path, paper_id: str, paper: dict[str, Any], source: dict[str, Any]) -> tuple[str, str, Path]:
+    storage_mode = source.get("storageMode", "managed")
+    if storage_mode not in {"managed", "linked"}:
+        raise FinalizationError(f"paper {paper_id} has invalid source.storageMode: {storage_mode}")
+    configured = source.get("pdfPath") or paper.get("pdfPath")
+    if not isinstance(configured, str) or not configured:
+        raise FinalizationError(f"paper {paper_id} is missing its source PDF path")
+    if storage_mode == "linked":
+        pdf_path = normalized_absolute_path(configured, f"paper {paper_id} linked PDF path")
+        linked_root = source.get("linkedRootPath")
+        relative_path = source.get("relativePath")
+        if not isinstance(linked_root, str) or not isinstance(relative_path, str):
+            raise FinalizationError(f"paper {paper_id} linked root/reference must be strings")
+        root_path = normalized_absolute_path(linked_root, f"paper {paper_id} linked root")
+        relative = Path(relative_path)
+        if relative.is_absolute() or not relative.parts or any(part in {"", ".", ".."} for part in relative.parts):
+            raise FinalizationError(f"paper {paper_id} linked relativePath is unsafe: {relative_path}")
+        if Path(os.path.abspath(os.path.normpath(root_path / relative))) != pdf_path:
+            raise FinalizationError(f"paper {paper_id} linked root and relative path do not resolve to source.pdfPath")
+        validate_linked_source_path(paper_id, root_path, relative, pdf_path)
+        return storage_mode, str(pdf_path), pdf_path
+    expected = f"Library/PDFs/{paper_id}.pdf"
+    if configured != expected:
+        raise FinalizationError(f"paper {paper_id} managed PDF path must be {expected}")
+    return storage_mode, expected, safe_support_path(support, expected, "PDF path")
 
 
 def refuse_protected_graph_target(path: Path) -> None:
@@ -284,11 +352,21 @@ def validate_card(
     body: str,
     pdf_hash: str,
     card_path: Path,
+    storage_mode: str,
+    source_path: str,
 ) -> int:
     if metadata.get("paper_id") != paper_id:
         raise FinalizationError(f"card paper_id mismatch: {card_path}")
     if metadata.get("source_sha256") != pdf_hash:
         raise FinalizationError(f"card/PDF SHA-256 mismatch: {paper_id}")
+    card_storage_mode = metadata.get("source_storage_mode", "managed")
+    card_source_path = metadata.get("source_pdf_path")
+    if card_storage_mode != storage_mode:
+        raise FinalizationError(f"card/source storage mode mismatch: {paper_id}")
+    if storage_mode == "linked" and card_source_path != source_path:
+        raise FinalizationError(f"card/linked PDF path mismatch: {paper_id}")
+    if storage_mode == "managed" and card_source_path not in {None, source_path}:
+        raise FinalizationError(f"card/managed PDF path mismatch: {paper_id}")
     status = metadata.get("verification_status")
     if status not in ALLOWED_VERIFICATION:
         raise FinalizationError(f"invalid verification_status for {paper_id}: {status}")
@@ -338,20 +416,28 @@ def finalize(args: argparse.Namespace) -> dict[str, Any]:
         source = paper.get("source") if isinstance(paper.get("source"), dict) else {}
         card_relative = paper.get("markdownPath") or artifacts.get("cardPath")
         fulltext_relative = paper.get("fulltextPath") or artifacts.get("fulltextPath")
-        pdf_relative = source.get("pdfPath") or paper.get("pdfPath")
-        if not all(isinstance(value, str) and value for value in (card_relative, fulltext_relative, pdf_relative)):
-            raise FinalizationError(f"paper {paper_id} is missing managed artifact paths")
+        if not all(isinstance(value, str) and value for value in (card_relative, fulltext_relative)):
+            raise FinalizationError(f"paper {paper_id} is missing managed Markdown artifact paths")
 
         card_path = safe_support_path(support, card_relative, "card path")
         fulltext_path = safe_support_path(support, fulltext_relative, "fulltext path")
-        pdf_path = safe_support_path(support, pdf_relative, "PDF path")
+        storage_mode, pdf_reference, pdf_path = resolve_pdf_source(support, paper_id, paper, source)
         if not card_path.is_file() or not fulltext_path.is_file() or not pdf_path.is_file():
-            raise FinalizationError(f"managed artifact missing for {paper_id}")
+            source_label = "linked source PDF" if storage_mode == "linked" else "managed artifact"
+            raise FinalizationError(f"{source_label} missing for {paper_id}")
 
         card_text = card_path.read_text(encoding="utf-8")
         card, card_body, _ = parse_frontmatter(card_text, card_path)
         pdf_hash = sha256_file(pdf_path)
-        evidence_count = validate_card(paper_id, card, card_body, pdf_hash, card_path)
+        evidence_count = validate_card(
+            paper_id,
+            card,
+            card_body,
+            pdf_hash,
+            card_path,
+            storage_mode,
+            pdf_reference,
+        )
         status = card["verification_status"]
         status_counts[status] = status_counts.get(status, 0) + 1
 
@@ -365,8 +451,11 @@ def finalize(args: argparse.Namespace) -> dict[str, Any]:
         summary_parts = cleaned_bullets(section(card_body, "Research question"), 1)
         summary_parts += cleaned_bullets(section(card_body, "Main results"), 1)
         project_role = cleaned_bullets(section(card_body, "Project role"), 2)
-        if not summary_parts or not project_role:
-            raise FinalizationError(f"card lacks graph summary/project role content: {paper_id}")
+        if not summary_parts:
+            raise FinalizationError(f"card lacks graph summary content: {paper_id}")
+        project_role_text = " ".join(project_role) if project_role else (
+            "No project-specific role has been assigned; record one in the active project's Research Memory when this paper is adopted."
+        )
 
         primary = card.get("primary_category")
         secondary = card.get("secondary_category")
@@ -375,7 +464,7 @@ def finalize(args: argparse.Namespace) -> dict[str, Any]:
         paper["metadataStatus"] = card.get("metadata_status", "provisional")
         paper["verificationStatus"] = status
         paper["summary"] = " ".join(summary_parts)
-        paper["projectRole"] = " ".join(project_role)
+        paper["projectRole"] = project_role_text
         paper["primaryCategory"] = primary
         paper["categoryIds"] = [primary] + ([secondary] if secondary else [])
         paper["classificationStatus"] = card.get("classification_status", "provisional")
@@ -383,11 +472,13 @@ def finalize(args: argparse.Namespace) -> dict[str, Any]:
         paper["source"] = {
             **source,
             "kind": card.get("source_type", "pdf"),
-            "pdfPath": pdf_relative,
+            "storageMode": storage_mode,
+            "pdfPath": pdf_reference,
             "sha256": pdf_hash,
             "arxivId": card.get("arxiv_id"),
             "doi": card.get("doi"),
         }
+        paper["pdfPath"] = pdf_reference
         paper["artifacts"] = {
             **artifacts,
             "cardPath": card_relative,
@@ -406,6 +497,8 @@ def finalize(args: argparse.Namespace) -> dict[str, Any]:
             "authors": authors,
             "metadata_status": card.get("metadata_status", "provisional"),
             "source_sha256": pdf_hash,
+            "source_storage_mode": storage_mode,
+            "source_pdf_path": pdf_reference,
             "arxiv_id": card.get("arxiv_id"),
             "doi": card.get("doi"),
             "extraction_status": card.get("extraction_status"),

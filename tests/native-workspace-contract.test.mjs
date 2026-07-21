@@ -23,12 +23,16 @@ async function writeBackupFixture(backupPath, options = {}) {
     omitPDF = false,
     extraFile = false,
     extraSymlink = false,
+    linkedSource = false,
+    invalidLinkedRelative = false,
   } = options;
   const workspace = path.join(backupPath, "Workspace");
   await mkdir(workspace, { recursive: true });
   const cardPath = "Knowledge/cards/paper-1.md";
   const fulltextPath = "Knowledge/fulltext/paper-1.md";
-  const pdfPath = "Library/PDFs/paper-1.pdf";
+  const linkedRootPath = "/Volumes/LiteverseTestLiterature";
+  const linkedRelativePath = invalidLinkedRelative ? "../paper-1.pdf" : "paper-1.pdf";
+  const pdfPath = linkedSource ? path.join(linkedRootPath, linkedRelativePath) : "Library/PDFs/paper-1.pdf";
   const pdfText = "%PDF fixture\n";
   const graph = {
     schemaVersion: "3.0.0",
@@ -42,7 +46,16 @@ async function writeBackupFixture(backupPath, options = {}) {
       markdownPath: cardPath,
       fulltextPath,
       pdfPath,
-      source: { kind: "pdf", pdfPath, sha256: sha256(pdfText) },
+      source: linkedSource
+        ? {
+            kind: "pdf",
+            storageMode: "linked",
+            pdfPath,
+            linkedRootPath,
+            relativePath: linkedRelativePath,
+            sha256: sha256(pdfText),
+          }
+        : { kind: "pdf", storageMode: "managed", pdfPath, sha256: sha256(pdfText) },
       artifacts: { cardPath, fulltextPath },
       useCount: 0,
     }] : [],
@@ -52,7 +65,7 @@ async function writeBackupFixture(backupPath, options = {}) {
   if (paper) {
     payloads.set(cardPath, "---\npaper_id: paper-1\n---\n\n# Paper 1\n");
     if (!omitFulltext) payloads.set(fulltextPath, "---\npaper_id: paper-1\n---\n\n<!-- page: 1 -->\n");
-    if (includesPDFs && !omitPDF) payloads.set(pdfPath, pdfText);
+    if (includesPDFs && !omitPDF && !linkedSource) payloads.set(pdfPath, pdfText);
   }
   for (const [relativePath, text] of payloads) {
     const destination = path.join(workspace, relativePath);
@@ -98,7 +111,7 @@ test("native workspace bridge keeps sources managed and reports honest artifact 
   assert.match(source, /missingSourceHashPaperIds/);
   assert.match(source, /hashMismatchPaperIds/);
   assert.match(source, /sourceHashMatches/);
-  assert.match(source, /\[self cachedSHA256ForFileAtURL:\[self URLForWorkspaceRelativePath:pdfPath error:nil\] error:nil\]/);
+  assert.match(source, /registeredPDFURLForSource:source requireExisting:YES verifyHash:NO/);
   assert.match(source, /evidence_verified[^\n]+&& !hasIntegrityIssue && evidenceCount > 0/);
   assert.match(source, /missingCardPaperIds/);
   assert.match(source, /missingFulltextPaperIds/);
@@ -210,6 +223,34 @@ test("Research Information appends project-memory truth and synchronizes project
   assert.match(source, /events\.jsonl is the only truth/);
 });
 
+test("region documents use append-only Research Memory with revision-pinned native actions", async () => {
+  const source = await readFile(path.join(root, "macos", "LiteverseApp.m"), "utf8");
+
+  for (const action of [
+    "loadRegionDocument",
+    "saveRegionDocument",
+    "importRegionDocumentFile",
+    "retireRegionDocument",
+  ]) {
+    assert.match(source, new RegExp(`action isEqualToString:@"${action}"`));
+  }
+  assert.match(source, /@"kind": @"app_region_document"/);
+  assert.match(source, /@"evidenceState": @"user_declared"/);
+  assert.match(source, /@"provenance": @"user"/);
+  assert.match(source, /@"kind": @"nebula_region"/);
+  assert.match(source, /@"graphRevisionAtAssignment"/);
+  assert.match(source, /expectedMemoryRevision/);
+  assert.match(source, /expectedGraphRevision/);
+  assert.match(source, /Region document content must not exceed 1 MiB/);
+  assert.match(source, /NSURLIsSymbolicLinkKey/);
+  assert.match(source, /initWithData:data encoding:NSUTF8StringEncoding/);
+  assert.match(source, /Imported region documents must be \.md\/markdown or \.txt\/plain text/);
+  assert.match(source, /Only the active version of a region document can be superseded/);
+  assert.match(source, /memory_retired/);
+  assert.match(source, /appendJSONObjects:events toURL:state\[@"ledgerURL"\]/);
+  assert.match(source, /not scientifically verified/);
+});
+
 test("native Context Preview is revision-pinned, cache-only, and never adopts evidence", async () => {
   const source = await readFile(path.join(root, "macos", "LiteverseApp.m"), "utf8");
   const method = source.match(/- \(NSDictionary \*\)buildContextPreviewForPayload:[\s\S]+?\n}\n\n- \(NSDictionary \*\)validatedPartitionProposalsAtURL/)?.[0] || "";
@@ -247,6 +288,12 @@ test("native backup import is hash checked and cannot overwrite the active works
   assert.match(source, /__liteverseWorkspaceImported/);
   assert.match(source, /loadWorkspaceHealth/);
   assert.match(source, /Curator or Refresh is updating the workspace/);
+  const exportMethod = source.match(/- \(NSDictionary \*\)exportWorkspaceToURL:[\s\S]+?\n}\n\n- \(NSDictionary \*\)validateBackupAtURL/)?.[0] || "";
+  assert.match(exportMethod, /stageRefreshLockURL/);
+  assert.match(exportMethod, /researchMemoryLockURL/);
+  assert.match(exportMethod, /annotationMutationLockURL/);
+  assert.equal((exportMethod.match(/operation:@"Workspace backup"/g) || []).length, 3);
+  assert.match(exportMethod, /releaseDirectoryLockAtURL:annotationLockURL[\s\S]*releaseDirectoryLockAtURL:memoryLockURL[\s\S]*releaseDirectoryLockAtURL:stageLockURL/);
   assert.match(source, /backupComponentSummaryForFiles/);
   assert.match(source, /backup does not close over the knowledge-card or full-text files for paper %@/);
   assert.match(source, /backup Workspace contains a file not listed in the manifest/);
@@ -259,7 +306,7 @@ test("native backup import is hash checked and cannot overwrite the active works
   assert.doesNotMatch(source, /copyItemAtURL:sourceWorkspace toURL:recoveredWorkspace/);
 });
 
-test("native backup validator enforces graph artifact closure and exact Workspace contents", async () => {
+test("native backup validator enforces graph artifact closure and exact Workspace contents", async (t) => {
   const temporary = await mkdtemp(path.join(tmpdir(), "liteverse-native-backup-test-"));
   const validator = path.join(temporary, "native-backup-validator");
   try {
@@ -273,6 +320,33 @@ test("native backup validator enforces graph artifact closure and exact Workspac
       path.join(root, "tests", "native-backup-validator.m"),
       "-o", validator,
     ]);
+
+    const linkedScanRoot = await mkdtemp(path.join(root, ".linked-native-scan-"));
+    t.after(() => rm(linkedScanRoot, { recursive: true, force: true }));
+    const linkedScanSupport = path.join(temporary, "linked-scan-support");
+    const linkedExternal = path.join(temporary, "linked-scan-external");
+    await mkdir(path.join(linkedScanRoot, "nested"), { recursive: true });
+    await mkdir(path.join(linkedScanRoot, ".hidden-folder"), { recursive: true });
+    await mkdir(linkedExternal, { recursive: true });
+    await writeFile(path.join(linkedScanRoot, "top.pdf"), "%PDF top\n");
+    await writeFile(path.join(linkedScanRoot, "nested", "visible.pdf"), "%PDF visible\n");
+    await writeFile(path.join(linkedScanRoot, ".hidden.pdf"), "%PDF hidden\n");
+    await writeFile(path.join(linkedScanRoot, ".hidden-folder", "hidden.pdf"), "%PDF hidden folder\n");
+    await writeFile(path.join(linkedExternal, "outside.pdf"), "%PDF outside\n");
+    await symlink(linkedExternal, path.join(linkedScanRoot, "linked-directory"));
+    await symlink(path.join(linkedExternal, "outside.pdf"), path.join(linkedScanRoot, "linked-file.pdf"));
+    const linkedScan = await execFileAsync(validator, ["linked-scan", linkedScanSupport, linkedScanRoot]);
+    const linkedDescriptors = JSON.parse(linkedScan.stdout);
+    assert.deepEqual(linkedDescriptors.map((entry) => entry.relativePath), ["nested/visible.pdf", "top.pdf"]);
+    assert.ok(linkedDescriptors.every((entry) => entry.linkedRootPath === linkedScanRoot));
+    assert.ok(linkedDescriptors.every((entry) => entry.pdfPath.startsWith(`${linkedScanRoot}/`)));
+    const linkedRootAlias = `${linkedScanRoot}-alias`;
+    await symlink(linkedScanRoot, linkedRootAlias);
+    t.after(() => rm(linkedRootAlias, { force: true }));
+    await assert.rejects(
+      execFileAsync(validator, ["linked-scan", linkedScanSupport, linkedRootAlias]),
+      /not a symbolic link/,
+    );
 
     const searchSupport = path.join(temporary, "search-support");
     const searchPDF = "%PDF-1.4\nLiteverse native search fixture\n%%EOF\n";
@@ -471,6 +545,26 @@ tags: ["adaptive sampling", "calibration"]
     const withPDFs = path.join(temporary, "with-pdfs.liteverse-backup");
     await writeBackupFixture(withPDFs, { includesPDFs: true });
     await execFileAsync(validator, [withPDFs]);
+
+    const withLinkedReferences = path.join(temporary, "with-linked-references.liteverse-backup");
+    await writeBackupFixture(withLinkedReferences, { includesPDFs: true, linkedSource: true });
+    await execFileAsync(validator, [withLinkedReferences]);
+    await assert.rejects(access(path.join(
+      withLinkedReferences,
+      "Workspace",
+      "Users",
+      "liteverse",
+      "Literature",
+      "paper-1.pdf",
+    )));
+
+    const invalidLinkedReference = path.join(temporary, "invalid-linked-reference.liteverse-backup");
+    await writeBackupFixture(invalidLinkedReference, {
+      includesPDFs: true,
+      linkedSource: true,
+      invalidLinkedRelative: true,
+    });
+    await assert.rejects(execFileAsync(validator, [invalidLinkedReference]), /invalid linked PDF reference/);
 
     const tampered = path.join(temporary, "tampered.liteverse-backup");
     await writeBackupFixture(tampered);

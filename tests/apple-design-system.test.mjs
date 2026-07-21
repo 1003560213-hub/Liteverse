@@ -57,8 +57,9 @@ test("drawer metrics and Canvas labels use restrained, non-overlapping presentat
   assert.doesNotMatch(component, /lineWidth \* 4\.2/);
   assert.match(
     component,
-    /const lineDash = hasVerifiedRelation\s*\? \[\]\s*:\s*hasUnscoredRelation\s*\? \[2, 8\]\s*:\s*\[7, 8\]/,
+    /context\.setLineDash\(state === "verified" \? \[\] : state === "candidate" \? \[7, 8\] : \[2, 8\]\)/,
   );
-  assert.match(component, /const photonCount = focused \? 1 : 0/);
+  assert.match(component, /if \(focused && !reducedMotion\)/);
+  assert.match(component, /selectedBundle\.lanes\.map/);
   assert.match(component, /hitWidth: Math\.max\(7, lineWidth \+ 4\)/);
 });

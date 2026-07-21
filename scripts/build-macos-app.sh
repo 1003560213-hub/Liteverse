@@ -60,6 +60,11 @@ done
 for REGION_ASSET in "$CONTENTS/Resources/web/nebula-regions"/*.png; do
   /usr/bin/sips -Z 768 "$REGION_ASSET" --out "$REGION_ASSET" >/dev/null
 done
+for GALAXY_ASSET in "$CONTENTS/Resources/web/galaxies"/*.png; do
+  /usr/bin/sips -Z 768 "$GALAXY_ASSET" --out "$GALAXY_ASSET" >/dev/null
+done
+/usr/bin/sips -Z 768 "$CONTENTS/Resources/web/liteverse-black-hole-transparent.png" \
+  --out "$CONTENTS/Resources/web/liteverse-black-hole-transparent.png" >/dev/null
 /bin/cp "$ROOT/data/empty-universe.json" "$CONTENTS/Resources/seed-universe.json"
 mkdir -p "$CONTENTS/Resources/CodexSkills"
 /usr/bin/rsync -a --delete --exclude '__pycache__' --exclude '*.py[cod]' \

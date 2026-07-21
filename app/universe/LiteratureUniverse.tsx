@@ -6,6 +6,7 @@ import {
   useMemo,
   useRef,
   useState,
+  type KeyboardEvent as ReactKeyboardEvent,
   type PointerEvent as ReactPointerEvent,
   type WheelEvent as ReactWheelEvent,
 } from "react";
@@ -16,6 +17,7 @@ import {
   type LibraryHealth,
   type LibraryItem,
   type LiteratureSearchPayload,
+  type MemoryItem,
   type PartitionProposalSet,
   type SettingsTab,
   type WorkspaceHealth,
@@ -40,6 +42,24 @@ import {
   type UsageCounts,
 } from "./types";
 import { ZoomControl } from "./ZoomControl";
+import {
+  buildGalaxyHierarchy,
+  memoriesByCategory,
+  paperPositionInGalaxy,
+  type Galaxy,
+  type GalaxyRelationLane,
+  type PersonalMemory,
+} from "./hierarchy";
+import { ScientificText } from "./ScientificText";
+import {
+  canActivateCanvasTarget,
+  canvasBackAction,
+  canvasViewLevel,
+  cycleCanvasTarget,
+  memoryOrbitAngle,
+  sameCanvasTarget,
+  type CanvasTarget,
+} from "./canvas-navigation";
 
 const FALLBACK_UNIVERSE = emptyUniverseData as unknown as UniverseGraph;
 type Annotation = {
@@ -69,6 +89,9 @@ type KnowledgeCardPayload = {
 type SearchScope = "global" | "region";
 type RelationLayerState = "verified" | "candidate" | "unscored";
 type ProjectedStar = { id: string; x: number; y: number; radius: number };
+type ProjectedGalaxy = { id: string; x: number; y: number; radius: number };
+type ProjectedBlackHole = { categoryId: string; x: number; y: number; radius: number; enabled: boolean };
+type ProjectedMemoryStar = { id: string; x: number; y: number; radius: number };
 type ProjectedRegion = {
   id: string;
   x: number;
@@ -88,11 +111,17 @@ type RelationBundle = {
   target: string;
   relations: Relation[];
 };
-type HitTarget =
-  | { kind: "paper"; id: string }
-  | { kind: "relation"; key: string }
-  | { kind: "category"; id: string }
-  | null;
+type GalaxyRelationBundle = {
+  key: string;
+  sourceGalaxyId: string;
+  targetGalaxyId: string;
+  lanes: GalaxyRelationLane[];
+};
+type HitTarget = CanvasTarget | null;
+type CanvasKeyboardItem = {
+  target: CanvasTarget;
+  label: string;
+};
 type Vector3 = [number, number, number];
 type CameraTransition = {
   fromCenter: Vector3;
@@ -119,17 +148,157 @@ type CommitReveal = {
 const DEFAULT_ROTATION = { x: -0.08, y: -0.22 } as const;
 const DEFAULT_ZOOM = 1.08;
 const REGION_FOCUS_ZOOM = 1.78;
+const GALAXY_FOCUS_ZOOM = 2.62;
+const BLACK_HOLE_FOCUS_ZOOM = 2.34;
 const CAMERA_TRANSITION_MS = 620;
 const INTERACTION_FPS = 30;
 const IDLE_FPS = 12;
 const BACKGROUND_FPS = 4;
+const BENCHMARKED_PAPERS_PER_UNIVERSE = 1_000;
+const ALL_NEBULA_MAX_RADIUS_RATIO = 0.155;
+const ALL_NEBULA_MAX_RADIUS_PX = 154;
+const ALL_NEBULA_MIN_RADIUS_PX = 52;
+const FOCUSED_NEBULA_MAX_RADIUS_RATIO = 0.39;
+const FOCUSED_NEBULA_MAX_RADIUS_PX = 360;
+const NEBULA_VISUAL_BOUND_SCALE = 1.08;
+const ALL_VIEW_AMBIENT_PAPERS_PER_NEBULA = 12;
+const FOCUSED_AMBIENT_PAPERS_PER_NEBULA = 48;
 
-function sameHitTarget(left: HitTarget, right: HitTarget) {
-  if (left === right) return true;
-  if (!left || !right || left.kind !== right.kind) return false;
-  if (left.kind === "paper" && right.kind === "paper") return left.id === right.id;
-  if (left.kind === "category" && right.kind === "category") return left.id === right.id;
-  return left.kind === "relation" && right.kind === "relation" && left.key === right.key;
+type ScreenNebulaFrame = {
+  center: { x: number; y: number };
+  radius: number;
+};
+
+type NebulaClusterFrame = ScreenNebulaFrame & {
+  rawRadius: number;
+};
+
+type ScreenSpatialPoint = {
+  x: number;
+  y: number;
+};
+
+type AmbientGalaxyGroup = {
+  id: string;
+  paperIds: readonly string[];
+};
+
+/**
+ * Keeps every all-universe nebula inside a restrained screen-space footprint.
+ * The default/reset camera layout has enough center separation for the minimum
+ * radius and therefore guarantees a visible gap. An arbitrary 3D rotation can
+ * project two world centers across one another; in that case both nebulae stay
+ * usable at the minimum size and may overlap briefly instead of disappearing.
+ * Only radii change: world identity, centers, depth, and hit order stay intact.
+ */
+export function constrainAllNebulaRadii<T extends ScreenNebulaFrame>(
+  frames: readonly T[],
+  viewportWidth: number,
+  viewportHeight: number,
+): Array<T & { radius: number }> {
+  const viewportMinimum = Math.max(1, Math.min(viewportWidth, viewportHeight));
+  const maximumRadius = Math.max(
+    ALL_NEBULA_MIN_RADIUS_PX,
+    Math.min(
+      ALL_NEBULA_MAX_RADIUS_PX,
+      viewportMinimum * ALL_NEBULA_MAX_RADIUS_RATIO,
+    ),
+  );
+  const minimumRadius = ALL_NEBULA_MIN_RADIUS_PX;
+  const visualGap = Math.min(18, Math.max(10, viewportMinimum * 0.016));
+  const constrained: Array<T & { radius: number }> = frames.map((frame) => ({
+    ...frame,
+    radius: Math.max(minimumRadius, Math.min(frame.radius, maximumRadius)),
+  }));
+
+  for (let leftIndex = 0; leftIndex < constrained.length; leftIndex += 1) {
+    for (let rightIndex = leftIndex + 1; rightIndex < constrained.length; rightIndex += 1) {
+      const left = constrained[leftIndex];
+      const right = constrained[rightIndex];
+      const centerDistance = Math.hypot(
+        right.center.x - left.center.x,
+        right.center.y - left.center.y,
+      );
+      const maximumCombinedRadius = Math.max(
+        0,
+        (centerDistance - visualGap) / NEBULA_VISUAL_BOUND_SCALE,
+      );
+      const combinedRadius = left.radius + right.radius;
+      if (combinedRadius <= maximumCombinedRadius || combinedRadius === 0) continue;
+      const leftFlex = Math.max(0, left.radius - minimumRadius);
+      const rightFlex = Math.max(0, right.radius - minimumRadius);
+      const availableReduction = leftFlex + rightFlex;
+      if (availableReduction === 0) continue;
+      const requiredReduction = Math.min(
+        combinedRadius - maximumCombinedRadius,
+        availableReduction,
+      );
+      left.radius -= requiredReduction * (leftFlex / availableReduction);
+      right.radius -= requiredReduction * (rightFlex / availableReduction);
+    }
+  }
+
+  return constrained;
+}
+
+export function containPointInNebulaEllipse<T extends ScreenSpatialPoint>(
+  point: T,
+  frame: NebulaClusterFrame,
+  radiusXRatio: number,
+  radiusYRatio: number,
+): T & { x: number; y: number } {
+  const compression = Math.min(
+    1,
+    frame.radius / Math.max(1, frame.rawRadius),
+  );
+  let offsetX = (point.x - frame.center.x) * compression;
+  let offsetY = (point.y - frame.center.y) * compression;
+  const radiusX = Math.max(1, frame.radius * radiusXRatio);
+  const radiusY = Math.max(1, frame.radius * radiusYRatio);
+  const normalizedDistance = Math.hypot(offsetX / radiusX, offsetY / radiusY);
+  if (normalizedDistance > 1) {
+    offsetX /= normalizedDistance;
+    offsetY /= normalizedDistance;
+  }
+  return {
+    ...point,
+    x: frame.center.x + offsetX,
+    y: frame.center.y + offsetY,
+  };
+}
+
+export function selectAmbientPaperIds(
+  galaxies: readonly AmbientGalaxyGroup[],
+  maximumCount: number,
+) {
+  if (maximumCount <= 0) return [];
+  const selected = new Set<string>();
+  const orderedGalaxies = [...galaxies].sort((left, right) =>
+    left.id.localeCompare(right.id));
+  for (const galaxy of orderedGalaxies) {
+    const representative = [...galaxy.paperIds].sort(
+      (left, right) =>
+        stableHash(`${galaxy.id}:${left}:ambient-representative`) -
+          stableHash(`${galaxy.id}:${right}:ambient-representative`) ||
+        left.localeCompare(right),
+    )[0];
+    if (representative) selected.add(representative);
+    if (selected.size >= maximumCount) return [...selected];
+  }
+  const remaining = orderedGalaxies
+    .flatMap((galaxy) => galaxy.paperIds.map((paperId) => ({ galaxyId: galaxy.id, paperId })))
+    .filter(({ paperId }) => !selected.has(paperId))
+    .sort(
+      (left, right) =>
+        stableHash(`${left.galaxyId}:${left.paperId}:ambient-order`) -
+          stableHash(`${right.galaxyId}:${right.paperId}:ambient-order`) ||
+        left.paperId.localeCompare(right.paperId),
+    );
+  for (const { paperId } of remaining) {
+    selected.add(paperId);
+    if (selected.size >= maximumCount) break;
+  }
+  return [...selected];
 }
 
 function paperIntegrityIssue(
@@ -209,6 +378,12 @@ type LiteverseHostWindow = typeof window & {
   __liteverseReceiveLiteratureSearchError?: (payload: { requestId: string; message: string }) => void;
   __liteverseReceiveContextPreview?: (payload: ContextPack) => void;
   __liteverseReceiveContextPreviewError?: (payload: { requestId: string; message: string }) => void;
+  __liteverseReceiveRegionDocument?: (payload: {
+    projectId: string;
+    memoryRevision: number;
+    graphRevision: number;
+    document: MemoryItem;
+  }) => void;
   __liteverseReceiveUniverse?: (
     graph: UniverseGraph | { graph: UniverseGraph; usageCounts?: UsageCounts },
     usage?: UsageCounts,
@@ -476,21 +651,28 @@ function getNativeBridge() {
 export function LiteratureUniverse() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const projectedStarsRef = useRef<ProjectedStar[]>([]);
+  const projectedGalaxiesRef = useRef<ProjectedGalaxy[]>([]);
+  const projectedBlackHolesRef = useRef<ProjectedBlackHole[]>([]);
+  const projectedMemoryStarsRef = useRef<ProjectedMemoryStar[]>([]);
   const projectedRegionsRef = useRef<ProjectedRegion[]>([]);
   const projectedRelationsRef = useRef<ProjectedRelation[]>([]);
   const selectedPaperRef = useRef<string | null>(null);
+  const selectedGalaxyRef = useRef<string | null>(null);
+  const notesCategoryRef = useRef<string | null>(null);
+  const selectedMemoryRef = useRef<string | null>(null);
   const selectedRelationRef = useRef<string | null>(null);
   const hoveredRef = useRef<HitTarget>(null);
   const universeRef = useRef<UniverseGraph>(FALLBACK_UNIVERSE);
   const visibleRef = useRef<Set<string>>(new Set());
   const heatRef = useRef<Record<string, number>>({});
   const categoryFilterRef = useRef("all");
-  const relationBundlesRef = useRef<RelationBundle[]>([]);
+  const galaxyRelationBundlesRef = useRef<GalaxyRelationBundle[]>([]);
+  const projectMemoryRef = useRef<PersonalMemory[]>([]);
   const rotationRef = useRef<{ x: number; y: number }>({ ...DEFAULT_ROTATION });
   const zoomRef = useRef(DEFAULT_ZOOM);
   const cameraCenterRef = useRef<Vector3>([0, 0, 0]);
   const cameraTransitionRef = useRef<CameraTransition | null>(null);
-  const pointerRef = useRef({ down: false, x: 0, y: 0, moved: false });
+  const pointerRef = useRef({ down: false, x: 0, y: 0, startX: 0, startY: 0, moved: false });
   const pendingPointerHitRef = useRef<{
     clientX: number;
     clientY: number;
@@ -500,7 +682,7 @@ export function LiteratureUniverse() {
   const requestRefreshCommitRef = useRef<(() => void) | null>(null);
   const settingsButtonRef = useRef<HTMLButtonElement>(null);
   const researchDraftDirtyRef = useRef(false);
-  const pendingWorkspaceActionRef = useRef<"pdf" | "arxiv" | "research" | null>(null);
+  const pendingWorkspaceActionRef = useRef<"pdf" | "folder" | "arxiv" | "research" | "memory-document" | null>(null);
   const refreshAnimationRef = useRef<ActiveRefreshAnimation | null>(null);
   const commitRevealRef = useRef<CommitReveal | null>(null);
   const universeRevisionRef = useRef<number | undefined>(FALLBACK_UNIVERSE.revision);
@@ -521,8 +703,13 @@ export function LiteratureUniverse() {
   const [runtimeError, setRuntimeError] = useState("");
   const [hasAuthoritativeGraph, setHasAuthoritativeGraph] = useState(false);
   const [selectedPaperId, setSelectedPaperId] = useState<string | null>(null);
+  const [selectedGalaxyId, setSelectedGalaxyId] = useState<string | null>(null);
+  const [notesCategoryId, setNotesCategoryId] = useState<string | null>(null);
+  const [selectedMemoryId, setSelectedMemoryId] = useState<string | null>(null);
   const [selectedRelationKey, setSelectedRelationKey] = useState<string | null>(null);
   const [hovered, setHovered] = useState<HitTarget>(null);
+  const [keyboardFocus, setKeyboardFocus] = useState<HitTarget>(null);
+  const [keyboardAnnouncement, setKeyboardAnnouncement] = useState("");
   const [categoryFilter, setCategoryFilter] = useState("all");
   const [query, setQuery] = useState("");
   const [searchScope, setSearchScope] = useState<SearchScope>("global");
@@ -532,7 +719,6 @@ export function LiteratureUniverse() {
     unscored: true,
   });
   const [minimumRelationStrength, setMinimumRelationStrength] = useState(0);
-  const [onlySelectedRelations, setOnlySelectedRelations] = useState(false);
   const [copied, setCopied] = useState<string | null>(null);
   const [drawerTab, setDrawerTab] = useState<DrawerTab>("summary");
   const [annotations, setAnnotations] = useState<Annotation[]>([]);
@@ -548,7 +734,7 @@ export function LiteratureUniverse() {
   const [workspace, setWorkspace] = useState<WorkspaceState>(EMPTY_WORKSPACE);
   const [researchDraft, setResearchDraft] = useState("");
   const [workspaceBusyAction, setWorkspaceBusyAction] = useState<
-    "pdf" | "arxiv" | "research" | null
+    "pdf" | "folder" | "arxiv" | "research" | "memory-document" | null
   >(null);
   const [workspaceNotice, setWorkspaceNotice] = useState("");
   const [workspaceError, setWorkspaceError] = useState("");
@@ -588,11 +774,18 @@ export function LiteratureUniverse() {
           ? selected
           : null,
       );
+      const nextHierarchy = buildGalaxyHierarchy(merged);
+      setSelectedGalaxyId((selected) =>
+        selected && nextHierarchy.galaxyById.has(selected) ? selected : null,
+      );
+      setNotesCategoryId((selected) =>
+        selected && merged.categories.some((category) => category.id === selected)
+          ? selected
+          : null,
+      );
       setSelectedRelationKey((selected) => {
         if (!selected) return null;
-        return merged.relations.some(
-          (relation) => [relation.source, relation.target].sort().join("--") === selected,
-        )
+        return nextHierarchy.relationLanes.some((lane) => lane.key === selected)
           ? selected
           : null;
       });
@@ -698,6 +891,27 @@ export function LiteratureUniverse() {
     hostWindow.__liteverseReceiveKnowledgeCard = (payload) => {
       setKnowledgeCard(payload);
       setKnowledgeCardLoading(false);
+    };
+    hostWindow.__liteverseReceiveRegionDocument = (payload) => {
+      const memoryId = payload.document.memoryId || payload.document.id;
+      if (!memoryId) return;
+      setWorkspace((current) => {
+        if (current.projects.activeProjectId !== payload.projectId) return current;
+        const existing = current.projectMemory.items.some(
+          (item) => (item.memoryId || item.id) === memoryId,
+        );
+        return {
+          ...current,
+          projectMemory: {
+            revision: payload.memoryRevision,
+            items: existing
+              ? current.projectMemory.items.map((item) =>
+                  (item.memoryId || item.id) === memoryId ? payload.document : item)
+              : [...current.projectMemory.items, payload.document],
+          },
+        };
+      });
+      setSelectedMemoryId(memoryId);
     };
     hostWindow.__liteverseReceiveLiteratureSearch = (payload) => {
       if (payload.requestId !== literatureSearchRequestRef.current) return;
@@ -884,6 +1098,7 @@ export function LiteratureUniverse() {
       delete hostWindow.__liteverseReceiveLiteratureSearchError;
       delete hostWindow.__liteverseReceiveContextPreview;
       delete hostWindow.__liteverseReceiveContextPreviewError;
+      delete hostWindow.__liteverseReceiveRegionDocument;
       delete hostWindow.__liteverseReceiveUniverse;
       delete hostWindow.__liteverseReceivePendingRefresh;
       delete hostWindow.__liteverseRefreshCommitted;
@@ -912,6 +1127,28 @@ export function LiteratureUniverse() {
     () => new Map(universe.papers.map((paper) => [paper.id, paper])),
     [universe.papers],
   );
+  const galaxyHierarchy = useMemo(() => buildGalaxyHierarchy(universe), [universe]);
+  const selectedGalaxy = selectedGalaxyId
+    ? galaxyHierarchy.galaxyById.get(selectedGalaxyId) || null
+    : null;
+  const projectMemoriesByCategory = useMemo(
+    () => memoriesByCategory(
+      workspace.projectMemory.items as PersonalMemory[],
+      macroCategories,
+      universe.papers,
+    ),
+    [macroCategories, universe.papers, workspace.projectMemory.items],
+  );
+  const selectedMemory = selectedMemoryId
+    ? (workspace.projectMemory.items as PersonalMemory[]).find(
+        (item) => (item.memoryId || item.id) === selectedMemoryId,
+      ) || null
+    : null;
+  const viewLevel = canvasViewLevel({
+    categoryFilter,
+    selectedGalaxyId,
+    notesCategoryId,
+  });
 
   const visibleLiteratureSearch = useMemo<LiteratureSearchPayload | null>(() => {
     if (!literatureSearch) return null;
@@ -946,10 +1183,22 @@ export function LiteratureUniverse() {
         primaryCategory: paper.primaryCategory,
         categoryIds: paper.categoryIds,
         position: paper.position,
+        galaxyId: paper.galaxyId,
       })),
+      galaxies: universe.galaxies,
+      hierarchy: universe.hierarchy,
       visuals: universe.visuals,
+      projectMemory: workspace.projectMemory.items.map((item) => ({
+        id: item.memoryId || item.id,
+        state: item.state,
+        updatedAt: item.updatedAt,
+        categoryId: (item as PersonalMemory).scope?.categoryId ||
+          (item as PersonalMemory).scope?.regionId ||
+          (item as PersonalMemory).source?.categoryId ||
+          (item as PersonalMemory).source?.regionId,
+      })),
     }),
-    [universe.categories, universe.papers, universe.visuals],
+    [universe.categories, universe.galaxies, universe.hierarchy, universe.papers, universe.visuals, workspace.projectMemory.items],
   );
 
   const heatByPaper = useMemo(
@@ -1087,9 +1336,6 @@ export function LiteratureUniverse() {
         displayState === "suggestion" ||
         !relationLayers[displayState] ||
         (displayState !== "unscored" && strength < minimumRelationStrength) ||
-        (onlySelectedRelations &&
-          (!selectedPaperId ||
-            (relation.source !== selectedPaperId && relation.target !== selectedPaperId))) ||
         !paperById.has(relation.source) ||
         !paperById.has(relation.target)
       ) {
@@ -1110,11 +1356,35 @@ export function LiteratureUniverse() {
     return [...groups.values()];
   }, [
     minimumRelationStrength,
-    onlySelectedRelations,
     paperById,
     relationLayers,
-    selectedPaperId,
     universe.relations,
+  ]);
+
+  const galaxyRelationBundles = useMemo(() => {
+    const groups = new Map<string, GalaxyRelationBundle>();
+    for (const lane of galaxyHierarchy.relationLanes) {
+      const displayState = relationDisplayState(lane.relation);
+      const strength = normalizedPercent(lane.relation.strength) || 0;
+      if (
+        displayState === "suggestion" ||
+        !relationLayers[displayState] ||
+        (displayState !== "unscored" && strength < minimumRelationStrength)
+      ) continue;
+      const current = groups.get(lane.key);
+      if (current) current.lanes.push(lane);
+      else groups.set(lane.key, {
+        key: lane.key,
+        sourceGalaxyId: lane.sourceGalaxyId,
+        targetGalaxyId: lane.targetGalaxyId,
+        lanes: [lane],
+      });
+    }
+    return [...groups.values()];
+  }, [
+    galaxyHierarchy.relationLanes,
+    minimumRelationStrength,
+    relationLayers,
   ]);
 
   const searchResults = useMemo(() => {
@@ -1139,11 +1409,11 @@ export function LiteratureUniverse() {
   }, [categoryFilter, query, searchScope, universe.papers]);
 
   const visiblePapers = useMemo(() => {
+    if (!selectedGalaxy) return [];
+    const galaxyPaperIds = new Set(selectedGalaxy.paperIds);
     const normalized = query.trim().toLowerCase();
     return universe.papers.filter((paper) => {
-      const categoryMatch =
-        categoryFilter === "all" || paper.primaryCategory === categoryFilter;
-      if (!categoryMatch) return false;
+      if (!galaxyPaperIds.has(paper.id)) return false;
       if (!normalized || searchScope === "global") return true;
       const searchable = [
         paper.title,
@@ -1155,7 +1425,7 @@ export function LiteratureUniverse() {
       ].join(" ").toLowerCase();
       return searchable.includes(normalized);
     });
-  }, [categoryFilter, query, searchScope, universe.papers]);
+  }, [query, searchScope, selectedGalaxy, universe.papers]);
 
   const libraryHealth = useMemo<LibraryHealth>(() => {
     const verificationStates = universe.papers.map((paper) => paperVerificationState(
@@ -1195,7 +1465,13 @@ export function LiteratureUniverse() {
       : selectedPaper.useCount || 0
     : 0;
   const selectedBundle = selectedRelationKey
-    ? relationBundles.find((bundle) => bundle.key === selectedRelationKey) || null
+    ? galaxyRelationBundles.find((bundle) => bundle.key === selectedRelationKey) || null
+    : null;
+  const selectedSourceGalaxy = selectedBundle
+    ? galaxyHierarchy.galaxyById.get(selectedBundle.sourceGalaxyId) || null
+    : null;
+  const selectedTargetGalaxy = selectedBundle
+    ? galaxyHierarchy.galaxyById.get(selectedBundle.targetGalaxyId) || null
     : null;
   const selectedPaperAnnotations = selectedPaper
     ? annotations
@@ -1211,10 +1487,102 @@ export function LiteratureUniverse() {
           bundle.source === selectedPaper.id || bundle.target === selectedPaper.id,
       )
     : [];
-  const visibleRelationRecordCount = relationBundles.reduce(
-    (sum, bundle) => sum + bundle.relations.length,
+  const visibleRelationRecordCount = galaxyRelationBundles.reduce(
+    (sum, bundle) => sum + bundle.lanes.length,
     0,
   );
+  const sceneObjectCount = viewLevel === "notes"
+    ? (projectMemoriesByCategory.get(notesCategoryId || "") || []).length
+    : viewLevel === "papers"
+      ? visiblePapers.length
+      : viewLevel === "galaxies"
+        ? (galaxyHierarchy.galaxiesByCategoryId.get(categoryFilter) || []).length
+        : galaxyHierarchy.galaxies.length;
+  const sceneObjectNoun = viewLevel === "notes"
+    ? sceneObjectCount === 1 ? "note star" : "note stars"
+    : viewLevel === "papers"
+      ? sceneObjectCount === 1 ? "paper star" : "paper stars"
+      : sceneObjectCount === 1 ? "galaxy" : "galaxies";
+  const noteCountByCategory = useMemo(
+    () => new Map(
+      macroCategories.map((category) => [
+        category.id,
+        (projectMemoriesByCategory.get(category.id) || []).length,
+      ]),
+    ),
+    [macroCategories, projectMemoriesByCategory],
+  );
+  const canvasKeyboardItems = useMemo<CanvasKeyboardItem[]>(() => {
+    const relationItems = galaxyRelationBundles
+      .filter((bundle) => {
+        if (viewLevel === "universe") return true;
+        if (viewLevel !== "galaxies") return false;
+        const source = galaxyHierarchy.galaxyById.get(bundle.sourceGalaxyId);
+        const target = galaxyHierarchy.galaxyById.get(bundle.targetGalaxyId);
+        return source?.categoryId === categoryFilter && target?.categoryId === categoryFilter;
+      })
+      .map((bundle) => {
+        const source = galaxyHierarchy.galaxyById.get(bundle.sourceGalaxyId);
+        const target = galaxyHierarchy.galaxyById.get(bundle.targetGalaxyId);
+        const count = bundle.lanes.length;
+        return {
+          target: { kind: "relation", key: bundle.key } as CanvasTarget,
+          label: `Galaxy relationship from ${source?.name || "unknown galaxy"} to ${target?.name || "unknown galaxy"}, ${count} ${count === 1 ? "lane" : "lanes"}. Press Enter for details.`,
+        };
+      });
+
+    if (viewLevel === "universe") {
+      const nebulaItems = macroCategories.map((category) => {
+        const count = (galaxyHierarchy.galaxiesByCategoryId.get(category.id) || []).length;
+        return {
+          target: { kind: "category", id: category.id } as CanvasTarget,
+          label: `Nebula ${category.name}, ${count} ${count === 1 ? "galaxy" : "galaxies"}. Press Enter to explore.`,
+        };
+      });
+      return [...nebulaItems, ...relationItems];
+    }
+
+    if (viewLevel === "galaxies") {
+      const galaxies = galaxyHierarchy.galaxiesByCategoryId.get(categoryFilter) || [];
+      const galaxyItems = galaxies.map((galaxy) => ({
+        target: { kind: "galaxy", id: galaxy.id } as CanvasTarget,
+        label: `Galaxy ${galaxy.name}, ${galaxy.paperIds.length} ${galaxy.paperIds.length === 1 ? "paper" : "papers"}. Press Enter to explore.`,
+      }));
+      const noteCount = noteCountByCategory.get(categoryFilter) || 0;
+      const categoryName = categoryById.get(categoryFilter)?.name || "This nebula";
+      const blackHoleItem: CanvasKeyboardItem = {
+        target: { kind: "black-hole", categoryId: categoryFilter },
+        label: noteCount > 0
+          ? `${categoryName} knowledge black hole, ${noteCount} ${noteCount === 1 ? "Note or Knowledge Card" : "Notes and Knowledge Cards"}. Press Enter to explore.`
+          : `${categoryName} knowledge black hole. No Notes. Unavailable.`,
+      };
+      return [...galaxyItems, blackHoleItem, ...relationItems];
+    }
+
+    if (viewLevel === "papers") {
+      return visiblePapers.map((paper) => ({
+        target: { kind: "paper", id: paper.id } as CanvasTarget,
+        label: `Paper star, ${paper.shortTitle}. Press Enter for details.`,
+      }));
+    }
+
+    return (projectMemoriesByCategory.get(notesCategoryId || "") || []).map((memory) => ({
+      target: { kind: "memory", id: memory.memoryId || memory.id || "" } as CanvasTarget,
+      label: `${memory.presentation?.kind === "knowledge_card" ? "Knowledge Card" : "Note"} star, ${memory.presentation?.title || memory.title || memory.statement || "Untitled personal knowledge"}. Press Enter for details.`,
+    }));
+  }, [
+    categoryById,
+    categoryFilter,
+    galaxyHierarchy.galaxiesByCategoryId,
+    galaxyHierarchy.galaxyById,
+    galaxyRelationBundles,
+    macroCategories,
+    noteCountByCategory,
+    notesCategoryId,
+    projectMemoriesByCategory,
+    viewLevel,
+    visiblePapers,
+  ]);
   const pendingNewPaperCount = useMemo(() => {
     if (!pendingRefresh) return 0;
     if (pendingRefresh.newPaperIds.length > 0) return pendingRefresh.newPaperIds.length;
@@ -1236,6 +1604,15 @@ export function LiteratureUniverse() {
     selectedPaperRef.current = selectedPaperId;
   }, [selectedPaperId]);
   useEffect(() => {
+    selectedGalaxyRef.current = selectedGalaxyId;
+  }, [selectedGalaxyId]);
+  useEffect(() => {
+    notesCategoryRef.current = notesCategoryId;
+  }, [notesCategoryId]);
+  useEffect(() => {
+    selectedMemoryRef.current = selectedMemoryId;
+  }, [selectedMemoryId]);
+  useEffect(() => {
     universeRef.current = universe;
   }, [universe]);
   useEffect(() => {
@@ -1254,8 +1631,11 @@ export function LiteratureUniverse() {
     categoryFilterRef.current = categoryFilter;
   }, [categoryFilter]);
   useEffect(() => {
-    relationBundlesRef.current = relationBundles;
-  }, [relationBundles]);
+    galaxyRelationBundlesRef.current = galaxyRelationBundles;
+  }, [galaxyRelationBundles]);
+  useEffect(() => {
+    projectMemoryRef.current = workspace.projectMemory.items as PersonalMemory[];
+  }, [workspace.projectMemory.items]);
   useEffect(
     () => () => {
       if (pointerHitFrameRef.current) {
@@ -1266,7 +1646,14 @@ export function LiteratureUniverse() {
   );
 
   const startCameraTransition = useCallback(
-    (toCenter: Vector3, toZoom: number) => {
+    (toCenter: Vector3, toZoom: number, immediate = false) => {
+      if (immediate) {
+        cameraCenterRef.current = [...toCenter];
+        zoomRef.current = toZoom;
+        cameraTransitionRef.current = null;
+        setZoomLevel(toZoom);
+        return;
+      }
       cameraTransitionRef.current = {
         fromCenter: [...cameraCenterRef.current],
         toCenter,
@@ -1279,30 +1666,112 @@ export function LiteratureUniverse() {
     [],
   );
 
+  const clearCanvasKeyboardFocus = useCallback(() => {
+    setKeyboardFocus(null);
+    hoveredRef.current = null;
+    setHovered(null);
+  }, []);
+
   const focusCategory = useCallback(
-    (categoryId: string) => {
+    (categoryId: string, immediate = false) => {
       const category = getCategory(categoryId);
       if (!category) return;
       startCameraTransition(
         [category.center[0], category.center[1], category.center[2]],
         REGION_FOCUS_ZOOM,
+        immediate,
       );
       setCategoryFilter(categoryId);
       setQuery("");
       setSettingsOpen(false);
       setSelectedPaperId(null);
+      setSelectedGalaxyId(null);
+      setNotesCategoryId(null);
+      setSelectedMemoryId(null);
       setSelectedRelationKey(null);
+      clearCanvasKeyboardFocus();
     },
-    [getCategory, startCameraTransition],
+    [clearCanvasKeyboardFocus, getCategory, startCameraTransition],
   );
 
-  const showAllUniverse = useCallback(() => {
-    startCameraTransition([0, 0, 0], DEFAULT_ZOOM);
+  const showAllUniverse = useCallback((immediate = false) => {
+    startCameraTransition([0, 0, 0], DEFAULT_ZOOM, immediate);
     setCategoryFilter("all");
     setQuery("");
     setSelectedPaperId(null);
+    setSelectedGalaxyId(null);
+    setNotesCategoryId(null);
+    setSelectedMemoryId(null);
     setSelectedRelationKey(null);
-  }, [startCameraTransition]);
+    clearCanvasKeyboardFocus();
+  }, [clearCanvasKeyboardFocus, startCameraTransition]);
+
+  const focusGalaxy = useCallback(
+    (galaxyId: string, immediate = false) => {
+      const galaxy = galaxyHierarchy.galaxyById.get(galaxyId);
+      if (!galaxy) return;
+      startCameraTransition(galaxy.position, GALAXY_FOCUS_ZOOM, immediate);
+      setCategoryFilter(galaxy.categoryId);
+      setSelectedGalaxyId(galaxy.id);
+      setNotesCategoryId(null);
+      setSelectedMemoryId(null);
+      setSelectedPaperId(null);
+      setSelectedRelationKey(null);
+      setQuery("");
+      setSettingsOpen(false);
+      clearCanvasKeyboardFocus();
+    },
+    [clearCanvasKeyboardFocus, galaxyHierarchy.galaxyById, startCameraTransition],
+  );
+
+  const focusNotes = useCallback(
+    (categoryId: string, immediate = false) => {
+      const category = categoryById.get(categoryId);
+      const items = projectMemoriesByCategory.get(categoryId) || [];
+      if (!category || items.length === 0) return;
+      startCameraTransition(category.center, BLACK_HOLE_FOCUS_ZOOM, immediate);
+      setCategoryFilter(categoryId);
+      setSelectedGalaxyId(null);
+      setNotesCategoryId(categoryId);
+      setSelectedMemoryId(null);
+      setSelectedPaperId(null);
+      setSelectedRelationKey(null);
+      setQuery("");
+      setSettingsOpen(false);
+      clearCanvasKeyboardFocus();
+    },
+    [categoryById, clearCanvasKeyboardFocus, projectMemoriesByCategory, startCameraTransition],
+  );
+
+  const returnToNebula = useCallback((immediate = false) => {
+    if (categoryFilter === "all") return;
+    focusCategory(categoryFilter, immediate);
+  }, [categoryFilter, focusCategory]);
+
+  const goBack = useCallback((immediate = false) => {
+    const action = canvasBackAction({
+      categoryFilter,
+      selectedGalaxyId,
+      notesCategoryId,
+      selectedPaperId,
+      selectedMemoryId,
+      selectedRelationKey,
+    });
+    if (action === "close-memory") setSelectedMemoryId(null);
+    else if (action === "close-paper") setSelectedPaperId(null);
+    else if (action === "close-relation") setSelectedRelationKey(null);
+    else if (action === "show-nebula") returnToNebula(immediate);
+    else if (action === "show-universe") showAllUniverse(immediate);
+  }, [
+    categoryFilter,
+    notesCategoryId,
+    returnToNebula,
+    selectedGalaxyId,
+    selectedMemoryId,
+    selectedPaperId,
+    selectedRelationKey,
+    showAllUniverse,
+  ]);
 
   const resetUniverseView = useCallback(() => {
     rotationRef.current = { ...DEFAULT_ROTATION };
@@ -1375,6 +1844,9 @@ export function LiteratureUniverse() {
     setCategoryFilter("all");
     setQuery("");
     setSelectedPaperId(null);
+    setSelectedGalaxyId(null);
+    setNotesCategoryId(null);
+    setSelectedMemoryId(null);
     setSelectedRelationKey(null);
     setSettingsOpen(false);
     setRefreshError("");
@@ -1401,13 +1873,19 @@ export function LiteratureUniverse() {
     const renderCategoriesById = new Map(
       renderUniverse.categories.map((category) => [category.id, category]),
     );
+    const renderHierarchy = buildGalaxyHierarchy(renderUniverse);
+    const renderGalaxiesById = renderHierarchy.galaxyById;
     const renderPapersById = new Map(
       renderUniverse.papers.map((paper) => [paper.id, paper]),
     );
+    const renderMemoriesByCategory = memoriesByCategory(
+      projectMemoryRef.current,
+      renderUniverse.categories,
+      renderUniverse.papers,
+    );
     const getRenderCategory = (id: string) =>
       renderCategoriesById.get(id) || renderUniverse.categories[0]!;
-    const getRenderPaper = (id: string) =>
-      renderPapersById.get(id) || renderUniverse.papers[0]!;
+    const getRenderGalaxy = (id: string) => renderGalaxiesById.get(id);
 
     let frame = 0;
     let width = 0;
@@ -1452,6 +1930,37 @@ export function LiteratureUniverse() {
           (paper) => paper.primaryCategory === category.id,
         ),
       ]),
+    );
+    const paperFlashProfiles = new Map(
+      renderUniverse.papers.map((paper) => {
+        const seed = stableHash(`${paper.id}:nebula-flash`);
+        return [
+          paper.id,
+          {
+            phase: ((seed % 3_600) / 3_600) * Math.PI * 2,
+            speed: 0.58 + ((seed >>> 8) % 620) / 1_000,
+            flare: (seed >>> 17) % 5 === 0,
+          },
+        ] as const;
+      }),
+    );
+    const ambientPaperSelections = new Map(
+      renderUniverse.categories.map((category) => {
+        const galaxies = renderHierarchy.galaxiesByCategoryId.get(category.id) || [];
+        return [
+          category.id,
+          {
+            allView: selectAmbientPaperIds(
+              galaxies,
+              ALL_VIEW_AMBIENT_PAPERS_PER_NEBULA,
+            ),
+            focused: selectAmbientPaperIds(
+              galaxies,
+              FOCUSED_AMBIENT_PAPERS_PER_NEBULA,
+            ),
+          },
+        ] as const;
+      }),
     );
     const categoryParticles = new Map(
       renderUniverse.categories.map((category) => [
@@ -1535,6 +2044,63 @@ export function LiteratureUniverse() {
       suppliedStarReady = true;
     };
     suppliedStarSource.src = "./liteverse-star-source.png";
+
+    const galaxySprites = new Map<string, HTMLCanvasElement>();
+    const galaxySources: HTMLImageElement[] = [];
+    let disposed = false;
+    const loadGalaxySprite = (assetId: string) => new Promise<void>((resolve) => {
+      const source = new Image();
+      source.decoding = "async";
+      galaxySources.push(source);
+      const release = () => {
+        source.onload = null;
+        source.onerror = null;
+        source.removeAttribute("src");
+        resolve();
+      };
+      source.onerror = release;
+      source.onload = () => {
+        if (!disposed) {
+          const maximumDimension = 420;
+          const scale = Math.min(1, maximumDimension / Math.max(source.naturalWidth, source.naturalHeight));
+          const sprite = document.createElement("canvas");
+          sprite.width = Math.max(1, Math.round(source.naturalWidth * scale));
+          sprite.height = Math.max(1, Math.round(source.naturalHeight * scale));
+          const spriteContext = sprite.getContext("2d")!;
+          spriteContext.filter = "saturate(.92) brightness(.94) contrast(1.04)";
+          spriteContext.drawImage(source, 0, 0, sprite.width, sprite.height);
+          spriteContext.filter = "none";
+          galaxySprites.set(assetId, sprite);
+        }
+        release();
+      };
+      source.src = `./galaxies/${assetId}`;
+    });
+    // Decode one galaxy at a time. A private universe can use all ten source
+    // images, and parallel decoding briefly retained every full-size bitmap.
+    void (async () => {
+      for (const assetId of new Set(renderHierarchy.galaxies.map((galaxy) => galaxy.assetId))) {
+        if (disposed) break;
+        await loadGalaxySprite(assetId);
+      }
+    })();
+
+    const blackHoleSprite = document.createElement("canvas");
+    let blackHoleReady = false;
+    const blackHoleSource = new Image();
+    blackHoleSource.decoding = "async";
+    blackHoleSource.onload = () => {
+      const maximumDimension = 720;
+      const scale = Math.min(1, maximumDimension / Math.max(blackHoleSource.naturalWidth, blackHoleSource.naturalHeight));
+      blackHoleSprite.width = Math.max(1, Math.round(blackHoleSource.naturalWidth * scale));
+      blackHoleSprite.height = Math.max(1, Math.round(blackHoleSource.naturalHeight * scale));
+      const spriteContext = blackHoleSprite.getContext("2d")!;
+      spriteContext.drawImage(blackHoleSource, 0, 0, blackHoleSprite.width, blackHoleSprite.height);
+      blackHoleReady = true;
+      blackHoleSource.onload = null;
+      blackHoleSource.removeAttribute("src");
+    };
+    blackHoleSource.src = "./liteverse-black-hole-transparent.png";
 
     const createNebulaTexture = (category: Category) => {
       const texture = document.createElement("canvas");
@@ -1867,7 +2433,7 @@ export function LiteratureUniverse() {
       context.restore();
 
       const worldScale = Math.min(width, height) * 0.115 * zoomRef.current;
-      const categoryFrames = renderUniverse.categories
+      const rawCategoryFrames = renderUniverse.categories
         .filter(
           (category) =>
             categoryFilterRef.current === "all" ||
@@ -1878,16 +2444,26 @@ export function LiteratureUniverse() {
           const members = categoryMembers.get(category.id)!;
           const primaryMembers = primaryCategoryMembers.get(category.id)!;
           const extentMembers = primaryMembers.length > 0 ? primaryMembers : members;
+          const galaxyMembers = renderHierarchy.galaxiesByCategoryId.get(category.id) || [];
           const worldExtent = Math.max(
             1.55,
-            ...extentMembers.map(
-              (paper) =>
+            ...(galaxyMembers.length > 0
+              ? galaxyMembers.map(
+                (galaxy) =>
+                  Math.hypot(
+                    galaxy.position[0] - category.center[0],
+                    galaxy.position[1] - category.center[1],
+                    galaxy.position[2] - category.center[2],
+                  ) + 1.05,
+              )
+              : extentMembers.map(
+                (paper) =>
                 Math.hypot(
                   paper.position[0] - category.center[0],
                   paper.position[1] - category.center[1],
                   paper.position[2] - category.center[2],
                 ) + 0.48,
-            ),
+              )),
           );
           const heatMembers = primaryMembers.length > 0 ? primaryMembers : members;
           const heat =
@@ -1895,6 +2471,11 @@ export function LiteratureUniverse() {
               (sum, paper) => sum + (heatRef.current[paper.id] || 0),
               0,
             ) / Math.max(1, heatMembers.length);
+          const rawRadius =
+            worldExtent *
+            worldScale *
+            center.perspective *
+            (1 + Math.min(0.07, heat * 0.035));
           return {
             category,
             center,
@@ -1902,14 +2483,24 @@ export function LiteratureUniverse() {
             rotation:
               ((stableHash(`${category.id}:roll`) % 1_000) / 1_000 - 0.5) *
               0.18,
-            radius:
-              worldExtent *
-              worldScale *
-              center.perspective *
-              (1 + Math.min(0.07, heat * 0.035)),
+            rawRadius,
+            radius: rawRadius,
           };
         })
         .sort((left, right) => right.center.depth - left.center.depth);
+      const categoryFrames = categoryFilterRef.current === "all"
+        ? constrainAllNebulaRadii(rawCategoryFrames, width, height)
+        : rawCategoryFrames.map((frame) => ({
+            ...frame,
+            radius: Math.min(
+              frame.radius,
+              FOCUSED_NEBULA_MAX_RADIUS_PX,
+              Math.min(width, height) * FOCUSED_NEBULA_MAX_RADIUS_RATIO,
+            ),
+          }));
+      const categoryFrameById = new Map(
+        categoryFrames.map((frame) => [frame.category.id, frame]),
+      );
 
       const projectedRegions: ProjectedRegion[] = [];
       for (const { category, center, heat, radius, rotation } of categoryFrames) {
@@ -1935,6 +2526,11 @@ export function LiteratureUniverse() {
           hoveredRef.current.id === category.id;
 
         const direction = stableHash(`${category.id}:direction`) % 2 ? -1 : 1;
+        const particleLayoutScale = Math.min(
+          1,
+          radius /
+            Math.max(1, worldScale * center.perspective * 1.66),
+        );
         const particleFrames = categoryParticles.get(category.id)!.map((particle) => {
           const angle =
             particle.angle +
@@ -1947,9 +2543,9 @@ export function LiteratureUniverse() {
           const localZ =
             particle.depth + Math.sin(angle * 1.7 + particle.phase) * 0.18;
           const point = project([
-            category.center[0] + localX,
-            category.center[1] + localY,
-            category.center[2] + localZ,
+            category.center[0] + localX * particleLayoutScale,
+            category.center[1] + localY * particleLayoutScale,
+            category.center[2] + localZ * particleLayoutScale,
           ]);
           const pulse =
             0.55 +
@@ -2083,7 +2679,15 @@ export function LiteratureUniverse() {
 
       const positions = new Map<string, ReturnType<typeof project>>();
       for (const paper of renderUniverse.papers) {
-        positions.set(paper.id, project(paper.position));
+        const galaxy = renderHierarchy.galaxyByPaperId.get(paper.id);
+        const members = galaxy?.paperIds || [];
+        const memberIndex = Math.max(0, members.indexOf(paper.id));
+        positions.set(
+          paper.id,
+          project(galaxy
+            ? paperPositionInGalaxy(paper, galaxy, memberIndex, members.length)
+            : paper.position),
+        );
       }
 
       const activeRefresh = refreshAnimationRef.current;
@@ -2181,170 +2785,338 @@ export function LiteratureUniverse() {
         }
       }
 
+      const galaxyPositions = new Map(
+        renderHierarchy.galaxies.map((galaxy) => {
+          const rawPoint = project(galaxy.position);
+          const categoryFrame = categoryFrameById.get(galaxy.categoryId);
+          const point = categoryFilterRef.current === "all" && categoryFrame
+            ? containPointInNebulaEllipse(rawPoint, categoryFrame, 0.58, 0.34)
+            : rawPoint;
+          return [galaxy.id, point] as const;
+        }),
+      );
       const projectedRelations: ProjectedRelation[] = [];
-      for (const [bundleIndex, bundle] of relationBundlesRef.current.entries()) {
-        if (
-          !visibleRef.current.has(bundle.source) ||
-          !visibleRef.current.has(bundle.target)
-        ) {
-          continue;
-        }
-        const source = positions.get(bundle.source)!;
-        const target = positions.get(bundle.target)!;
-        const selected = selectedRelationRef.current === bundle.key;
-        const hoveredRelation =
-          hoveredRef.current?.kind === "relation" &&
-          hoveredRef.current.key === bundle.key;
-        const paperFocused =
-          bundle.source === selectedPaperRef.current ||
-          bundle.target === selectedPaperRef.current;
-        const focused = selected || hoveredRelation || paperFocused;
-        const reveal = commitRevealRef.current;
-        const isNewBundle = Boolean(
-          reveal && bundle.relations.some((relation) => reveal.relationIds.has(relation.id)),
-        );
-        const revealAlpha = isNewBundle
-          ? Math.min(1, Math.max(0, (time - (reveal?.startedAt || time)) / 780))
-          : 1;
-        const scoredRelations = bundle.relations.filter(isRelationScored);
-        const relationStrength =
-          scoredRelations.length > 0
-            ? scoredRelations.reduce(
-                (sum, relation) => sum + (normalizedPercent(relation.strength) || 0),
+      const showGalaxyNetwork = !selectedGalaxyRef.current && !notesCategoryRef.current;
+      if (showGalaxyNetwork) {
+        for (const [bundleIndex, bundle] of galaxyRelationBundlesRef.current.entries()) {
+          const sourceGalaxy = getRenderGalaxy(bundle.sourceGalaxyId);
+          const targetGalaxy = getRenderGalaxy(bundle.targetGalaxyId);
+          if (!sourceGalaxy || !targetGalaxy) continue;
+          const focusedCategory = categoryFilterRef.current;
+          if (focusedCategory !== "all" &&
+              (sourceGalaxy.categoryId !== focusedCategory || targetGalaxy.categoryId !== focusedCategory)) continue;
+          const source = galaxyPositions.get(sourceGalaxy.id)!;
+          const target = galaxyPositions.get(targetGalaxy.id)!;
+          const deltaX = target.x - source.x;
+          const deltaY = target.y - source.y;
+          const distance = Math.max(1, Math.hypot(deltaX, deltaY));
+          const normalX = -deltaY / distance;
+          const normalY = deltaX / distance;
+          const selected = selectedRelationRef.current === bundle.key;
+          const hoveredRelation = hoveredRef.current?.kind === "relation" && hoveredRef.current.key === bundle.key;
+          const focused = selected || hoveredRelation;
+          for (const lane of bundle.lanes) {
+            const laneOffset = (lane.laneIndex - (lane.laneCount - 1) / 2) * 7;
+            const start = { x: source.x + normalX * laneOffset, y: source.y + normalY * laneOffset };
+            const end = { x: target.x + normalX * laneOffset, y: target.y + normalY * laneOffset };
+            const control = {
+              x: (start.x + end.x) / 2 + normalX * (20 + laneOffset * 0.24),
+              y: (start.y + end.y) / 2 + normalY * (20 + laneOffset * 0.24),
+            };
+            const state = relationDisplayState(lane.relation);
+            const unscored = state === "unscored";
+            const sourceColor = getRenderCategory(sourceGalaxy.categoryId).color;
+            const targetColor = getRenderCategory(targetGalaxy.categoryId).color;
+            const gradient = context.createLinearGradient(start.x, start.y, end.x, end.y);
+            gradient.addColorStop(0, hexToRgba(sourceColor, unscored ? 0.2 : focused ? 0.94 : 0.58));
+            gradient.addColorStop(1, hexToRgba(targetColor, unscored ? 0.2 : focused ? 0.94 : 0.58));
+            const strength = (normalizedPercent(lane.relation.strength) || 28) / 100;
+            const lineWidth = unscored ? 0.62 : 0.9 + strength * 0.85 + (focused ? 0.55 : 0);
+            const reveal = commitRevealRef.current;
+            const revealAlpha = reveal?.relationIds.has(lane.relation.id)
+              ? Math.min(1, Math.max(0, (time - reveal.startedAt) / 780))
+              : 1;
+            context.save();
+            context.lineCap = "round";
+            context.strokeStyle = gradient;
+            context.globalAlpha = revealAlpha * (unscored ? 0.42 : focused ? 0.98 : 0.76);
+            context.lineWidth = lineWidth;
+            context.setLineDash(state === "verified" ? [] : state === "candidate" ? [7, 8] : [2, 8]);
+            context.beginPath();
+            context.moveTo(start.x, start.y);
+            context.quadraticCurveTo(control.x, control.y, end.x, end.y);
+            context.stroke();
+            if (focused && !reducedMotion) {
+              const photonT = ((motionTime * 0.00008 + bundleIndex * 0.137 + lane.laneIndex * 0.081) % 1 + 1) % 1;
+              const inverse = 1 - photonT;
+              context.setLineDash([]);
+              context.fillStyle = "rgba(245,250,255,.82)";
+              context.beginPath();
+              context.arc(
+                inverse * inverse * start.x + 2 * inverse * photonT * control.x + photonT * photonT * end.x,
+                inverse * inverse * start.y + 2 * inverse * photonT * control.y + photonT * photonT * end.y,
+                1.15,
                 0,
-              ) /
-              scoredRelations.length /
-              100
-            : 0.28;
-        const bundleStates = bundle.relations.map(relationDisplayState);
-        const hasVerifiedRelation = bundleStates.includes("verified");
-        const hasUnscoredRelation = bundleStates.includes("unscored");
-        const allUnscored = bundleStates.every((state) => state === "unscored");
-        const evidenceCount = bundle.relations.reduce(
-          (sum, relation) =>
-            sum + (relation.evidenceIds?.length || relation.evidenceCount || 0),
-          0,
-        );
-        const sourceColor = getRenderCategory(
-          getRenderPaper(bundle.source).primaryCategory,
-        ).color;
-        const targetColor = getRenderCategory(
-          getRenderPaper(bundle.target).primaryCategory,
-        ).color;
-        const gradient = context.createLinearGradient(
-          source.x,
-          source.y,
-          target.x,
-          target.y,
-        );
-        gradient.addColorStop(
-          0,
-          hexToRgba(sourceColor, allUnscored ? (focused ? 0.34 : 0.075) : (focused ? 0.92 : 0.62)),
-        );
-        gradient.addColorStop(
-          1,
-          hexToRgba(targetColor, allUnscored ? (focused ? 0.34 : 0.075) : (focused ? 0.92 : 0.62)),
-        );
-        const evidenceWeight = Math.min(
-          1.25,
-          Math.sqrt(Math.max(1, evidenceCount)) * 0.24,
-        );
-        const lineWidth = allUnscored
-          ? (focused ? 1.15 : 0.52) + evidenceWeight * 0.18
-          : (focused ? 1.75 : 0.9) +
-            evidenceWeight * (0.4 + relationStrength * 0.35);
-        const control = {
-          x: (source.x + target.x) / 2,
-          y: (source.y + target.y) / 2 - 11 * bundle.relations.length,
-        };
-        const lineDash = hasVerifiedRelation
-          ? []
-          : hasUnscoredRelation
-            ? [2, 8]
-            : [7, 8];
-        context.save();
-        context.lineCap = "round";
-        context.strokeStyle = gradient;
-        context.setLineDash(lineDash);
-        if (focused) {
-          context.globalAlpha = (allUnscored ? 0.1 : 0.14) * revealAlpha;
-          context.lineWidth = lineWidth + 1.25;
-          context.shadowBlur = 0;
-          context.beginPath();
-          context.moveTo(source.x, source.y);
-          context.quadraticCurveTo(control.x, control.y, target.x, target.y);
-          context.stroke();
+                Math.PI * 2,
+              );
+              context.fill();
+            }
+            context.restore();
+            const points = Array.from({ length: 25 }, (_, index) => {
+              const t = index / 24;
+              const inverse = 1 - t;
+              return {
+                x: inverse * inverse * start.x + 2 * inverse * t * control.x + t * t * end.x,
+                y: inverse * inverse * start.y + 2 * inverse * t * control.y + t * t * end.y,
+              };
+            });
+            projectedRelations.push({ key: bundle.key, points, hitWidth: Math.max(7, lineWidth + 4) });
+          }
         }
-
-        context.globalAlpha = (
-          allUnscored ? (focused ? 0.6 : 0.22) : (focused ? 0.98 : 0.78)
-        ) * revealAlpha;
-        context.lineWidth = lineWidth;
-        context.shadowBlur = 0;
-        context.beginPath();
-        context.moveTo(source.x, source.y);
-        context.quadraticCurveTo(control.x, control.y, target.x, target.y);
-        context.stroke();
-
-        context.setLineDash(lineDash);
-        context.strokeStyle = `rgba(238,248,255,${
-          allUnscored ? (focused ? 0.12 : 0.025) : focused ? 0.32 : 0.13
-        })`;
-        context.lineWidth = Math.max(0.35, lineWidth * 0.18);
-        context.shadowBlur = 0;
-        context.beginPath();
-        context.moveTo(source.x, source.y);
-        context.quadraticCurveTo(control.x, control.y, target.x, target.y);
-        context.stroke();
-
-        context.globalCompositeOperation = "source-over";
-        context.fillStyle = "rgba(238, 248, 255, 0.72)";
-        context.shadowBlur = 0;
-        const photonCount = focused ? 1 : 0;
-        for (let photonIndex = 0; photonIndex < photonCount; photonIndex += 1) {
-          const photonT =
-            ((motionTime * 0.00007 +
-              bundleIndex * 0.137 +
-              photonIndex / photonCount) %
-              1 +
-              1) %
-            1;
-          const inverse = 1 - photonT;
-          const photonX =
-            inverse * inverse * source.x +
-            2 * inverse * photonT * control.x +
-            photonT * photonT * target.x;
-          const photonY =
-            inverse * inverse * source.y +
-            2 * inverse * photonT * control.y +
-            photonT * photonT * target.y;
-          context.beginPath();
-          context.arc(photonX, photonY, 1, 0, Math.PI * 2);
-          context.fill();
-        }
-        context.restore();
-
-        const points = Array.from({ length: 25 }, (_, index) => {
-          const t = index / 24;
-          const inverse = 1 - t;
-          return {
-            x:
-              inverse * inverse * source.x +
-              2 * inverse * t * control.x +
-              t * t * target.x,
-            y:
-              inverse * inverse * source.y +
-              2 * inverse * t * control.y +
-              t * t * target.y,
-          };
-        });
-        projectedRelations.push({
-          key: bundle.key,
-          points,
-          hitWidth: Math.max(7, lineWidth + 4),
-        });
       }
       projectedRelationsRef.current = projectedRelations;
+
+      const projectedGalaxies: ProjectedGalaxy[] = [];
+      const projectedBlackHoles: ProjectedBlackHole[] = [];
+      const projectedMemoryStars: ProjectedMemoryStar[] = [];
+      const activeGalaxyId = selectedGalaxyRef.current;
+      const activeNotesCategoryId = notesCategoryRef.current;
+      const drawGalaxy = (galaxy: Galaxy, point: ReturnType<typeof project>, radius: number, alpha: number) => {
+        const sprite = galaxySprites.get(galaxy.assetId);
+        if (!sprite) return;
+        const aspect = sprite.width / sprite.height;
+        const drawWidth = aspect >= 1 ? radius * 2 : radius * 2 * aspect;
+        const drawHeight = aspect >= 1 ? radius * 2 / aspect : radius * 2;
+        context.save();
+        context.globalCompositeOperation = "screen";
+        context.globalAlpha = alpha;
+        context.translate(point.x, point.y);
+        context.rotate(((stableHash(`${galaxy.id}:visual-roll`) % 1000) / 1000 - 0.5) * 0.28);
+        context.drawImage(sprite, -drawWidth / 2, -drawHeight / 2, drawWidth, drawHeight);
+        context.restore();
+      };
+
+      if (!activeNotesCategoryId) {
+        const visibleGalaxies = renderHierarchy.galaxies
+          .filter((galaxy) => categoryFilterRef.current === "all" || galaxy.categoryId === categoryFilterRef.current)
+          .sort((left, right) => galaxyPositions.get(right.id)!.depth - galaxyPositions.get(left.id)!.depth);
+        for (const galaxy of visibleGalaxies) {
+          const point = galaxyPositions.get(galaxy.id)!;
+          const isActive = activeGalaxyId === galaxy.id;
+          if (activeGalaxyId && !isActive) continue;
+          const inNebulaView = categoryFilterRef.current !== "all" && !activeGalaxyId;
+          const hoveredGalaxy = hoveredRef.current?.kind === "galaxy" && hoveredRef.current.id === galaxy.id;
+          const allViewFrame = categoryFrameById.get(galaxy.categoryId);
+          const allViewBaseRadius = allViewFrame
+            ? Math.max(9, Math.min(18, allViewFrame.radius * 0.16))
+            : 12;
+          const radius =
+            (activeGalaxyId ? 150 : inNebulaView ? 58 : allViewBaseRadius) * point.perspective +
+            Math.min(
+              inNebulaView ? 18 : 4,
+              Math.sqrt(galaxy.paperIds.length) * (inNebulaView ? 3.2 : 0.72),
+            );
+          drawGalaxy(galaxy, point, radius, activeGalaxyId ? 0.28 : hoveredGalaxy ? 0.98 : inNebulaView ? 0.86 : 0.58);
+          if (!activeGalaxyId && inNebulaView) {
+            context.save();
+            context.textAlign = "center";
+            context.font = "650 14px -apple-system, BlinkMacSystemFont, 'SF Pro Text', sans-serif";
+            context.fillStyle = hoveredGalaxy ? "rgba(255,255,255,.98)" : "rgba(245,245,247,.9)";
+            context.shadowColor = "rgba(0,0,0,.9)";
+            context.shadowBlur = 8;
+            context.fillText(galaxy.name, point.x, point.y + radius * 0.62 + 18, 210);
+            context.font = "500 11px -apple-system, BlinkMacSystemFont, 'SF Pro Text', sans-serif";
+            context.fillStyle = "rgba(235,235,245,.62)";
+            context.fillText(`${galaxy.paperIds.length} ${galaxy.paperIds.length === 1 ? "paper" : "papers"}`, point.x, point.y + radius * 0.62 + 35);
+            context.restore();
+            projectedGalaxies.push({ id: galaxy.id, x: point.x, y: point.y, radius: Math.max(34, radius * 0.72) });
+          }
+        }
+
+        if (categoryFilterRef.current !== "all" && !activeGalaxyId) {
+          const category = getRenderCategory(categoryFilterRef.current);
+          const point = project(category.center);
+          const memoryItems = renderMemoriesByCategory.get(category.id) || [];
+          const enabled = memoryItems.length > 0;
+          const radius = 72 * point.perspective;
+          if (blackHoleReady) {
+            context.save();
+            context.globalCompositeOperation = "screen";
+            context.globalAlpha = enabled ? 0.94 : 0.48;
+            context.drawImage(blackHoleSprite, point.x - radius * 1.55, point.y - radius * 0.87, radius * 3.1, radius * 1.74);
+            context.restore();
+          } else {
+            const fallback = context.createRadialGradient(point.x, point.y, 0, point.x, point.y, radius);
+            fallback.addColorStop(0, "rgba(0,0,0,1)");
+            fallback.addColorStop(0.36, "rgba(0,0,0,.98)");
+            fallback.addColorStop(0.48, "rgba(255,145,66,.78)");
+            fallback.addColorStop(0.68, "rgba(63,108,255,.26)");
+            fallback.addColorStop(1, "rgba(0,0,0,0)");
+            context.fillStyle = fallback;
+            context.beginPath();
+            context.arc(point.x, point.y, radius, 0, Math.PI * 2);
+            context.fill();
+          }
+          context.save();
+          context.textAlign = "center";
+          context.font = "650 13px -apple-system, BlinkMacSystemFont, 'SF Pro Text', sans-serif";
+          context.fillStyle = enabled ? "rgba(245,245,247,.92)" : "rgba(235,235,245,.48)";
+          context.shadowColor = "rgba(0,0,0,.9)";
+          context.shadowBlur = 7;
+          context.fillText(enabled ? `${memoryItems.length} Notes & Cards` : "No Notes", point.x, point.y + radius * 0.62 + 18);
+          context.restore();
+          projectedBlackHoles.push({ categoryId: category.id, x: point.x, y: point.y, radius: Math.max(34, radius * 0.7), enabled });
+        }
+      } else {
+        const category = getRenderCategory(activeNotesCategoryId);
+        const center = project(category.center);
+        const memoryItems = renderMemoriesByCategory.get(category.id) || [];
+        const blackHoleRadius = 110 * center.perspective;
+        if (blackHoleReady) {
+          context.save();
+          context.globalCompositeOperation = "screen";
+          context.globalAlpha = 0.96;
+          context.drawImage(
+            blackHoleSprite,
+            center.x - blackHoleRadius * 1.65,
+            center.y - blackHoleRadius * 0.93,
+            blackHoleRadius * 3.3,
+            blackHoleRadius * 1.86,
+          );
+          context.restore();
+        }
+        memoryItems.forEach((memory, index) => {
+          const memoryId = memory.memoryId || memory.id || `memory-${index}`;
+          const ring = index % 4;
+          const orbitRadiusX = 132 + ring * 42;
+          const orbitRadiusY = orbitRadiusX * (0.34 + ring * 0.025);
+          const phase = (stableHash(`${memoryId}:orbit`) % 360) / 360 * Math.PI * 2;
+          const direction = stableHash(`${memoryId}:direction`) % 2 ? 1 : -1;
+          const angle = memoryOrbitAngle(phase, direction, time, ring, reducedMotion);
+          if (index < 4) {
+            context.save();
+            context.strokeStyle = hexToRgba(category.color, 0.16);
+            context.lineWidth = 0.7;
+            context.setLineDash([3, 8]);
+            context.beginPath();
+            context.ellipse(center.x, center.y, orbitRadiusX, orbitRadiusY, ring * 0.12, 0, Math.PI * 2);
+            context.stroke();
+            context.restore();
+          }
+          const x = center.x + Math.cos(angle) * orbitRadiusX;
+          const y = center.y + Math.sin(angle) * orbitRadiusY;
+          const hoveredMemory = hoveredRef.current?.kind === "memory" && hoveredRef.current.id === memoryId;
+          const selectedMemory = selectedMemoryRef.current === memoryId;
+          const radius = hoveredMemory || selectedMemory ? 8.5 : 6.2;
+          const glow = context.createRadialGradient(x, y, 0, x, y, radius * 4.2);
+          glow.addColorStop(0, "rgba(255,255,255,.98)");
+          glow.addColorStop(0.18, hexToRgba(category.color, 0.86));
+          glow.addColorStop(1, hexToRgba(category.color, 0));
+          context.save();
+          context.globalCompositeOperation = "screen";
+          context.fillStyle = glow;
+          context.beginPath();
+          context.arc(x, y, radius * 4.2, 0, Math.PI * 2);
+          context.fill();
+          context.restore();
+          context.fillStyle = "rgba(255,255,255,.98)";
+          context.beginPath();
+          context.arc(x, y, 2.1, 0, Math.PI * 2);
+          context.fill();
+          if (hoveredMemory || selectedMemory) {
+            context.save();
+            context.font = "650 13px -apple-system, BlinkMacSystemFont, 'SF Pro Text', sans-serif";
+            context.fillStyle = "rgba(245,245,247,.96)";
+            context.shadowColor = "rgba(0,0,0,.9)";
+            context.shadowBlur = 8;
+            context.fillText(memory.title || memory.statement || memory.type, x + 14, y + 4, 240);
+            context.restore();
+          }
+          projectedMemoryStars.push({ id: memoryId, x, y, radius: 18 });
+        });
+      }
+
+      // Paper stars remain a quiet visual cue before a galaxy is opened. They
+      // are deliberately not added to projectedStars: the hierarchy stays
+      // intact, so clicking here still selects a nebula or galaxy rather than
+      // skipping directly to a paper.
+      const showAmbientPaperFlashes = !activeGalaxyId && !activeNotesCategoryId;
+      if (showAmbientPaperFlashes) {
+        const focusedCategoryId = categoryFilterRef.current;
+        const universeView = focusedCategoryId === "all";
+        const ambientPaperIds = universeView
+          ? renderUniverse.categories.flatMap(
+              (category) => ambientPaperSelections.get(category.id)?.allView || [],
+            )
+          : ambientPaperSelections.get(focusedCategoryId)?.focused || [];
+        context.save();
+        context.globalCompositeOperation = "screen";
+        for (const paperId of ambientPaperIds) {
+          const paper = renderPapersById.get(paperId);
+          if (!paper) continue;
+          const rawPoint = positions.get(paper.id);
+          const profile = paperFlashProfiles.get(paper.id);
+          const categoryFrame = categoryFrameById.get(paper.primaryCategory);
+          const point = rawPoint && categoryFrame
+            ? containPointInNebulaEllipse(
+                rawPoint,
+                categoryFrame,
+                universeView ? 0.76 : 0.82,
+                universeView ? 0.48 : 0.52,
+              )
+            : rawPoint;
+          if (!point || !profile || point.x < -20 || point.x > width + 20 || point.y < -20 || point.y > height + 20) {
+            continue;
+          }
+          const category = getRenderCategory(paper.primaryCategory);
+          const flashPeak = reducedMotion
+            ? 0.58
+            : Math.pow(
+                (Math.sin(motionTime * 0.00105 * profile.speed + profile.phase) + 1) * 0.5,
+                5,
+              );
+          const pulse = reducedMotion ? 0.68 : 0.44 + flashPeak * 0.56;
+          const glowRadius =
+            (universeView ? 8.2 : 11.5) *
+            Math.max(0.72, point.perspective) *
+            (0.9 + pulse * 0.18);
+          context.globalAlpha = (universeView ? 0.34 : 0.5) * pulse;
+          context.drawImage(
+            starSprites.get(category.id)!,
+            point.x - glowRadius,
+            point.y - glowRadius,
+            glowRadius * 2,
+            glowRadius * 2,
+          );
+          context.globalAlpha = (universeView ? 0.72 : 0.88) * pulse;
+          context.fillStyle = "rgba(249,252,255,.98)";
+          context.beginPath();
+          context.arc(
+            point.x,
+            point.y,
+            Math.max(0.7, (universeView ? 0.9 : 1.15) * point.perspective),
+            0,
+            Math.PI * 2,
+          );
+          context.fill();
+          if (profile.flare && (reducedMotion || flashPeak > 0.72)) {
+            const flareRadius = glowRadius * (universeView ? 0.72 : 0.9);
+            context.globalAlpha = reducedMotion ? 0.22 : 0.24 + flashPeak * 0.38;
+            context.strokeStyle = hexToRgba(category.color, 0.86);
+            context.lineWidth = 0.55;
+            context.beginPath();
+            context.moveTo(point.x - flareRadius, point.y);
+            context.lineTo(point.x + flareRadius, point.y);
+            context.moveTo(point.x, point.y - flareRadius * 0.62);
+            context.lineTo(point.x, point.y + flareRadius * 0.62);
+            context.stroke();
+          }
+        }
+        context.restore();
+      }
+      projectedGalaxiesRef.current = projectedGalaxies;
+      projectedBlackHolesRef.current = projectedBlackHoles;
+      projectedMemoryStarsRef.current = projectedMemoryStars;
 
       const projectedStars: ProjectedStar[] = [];
       const regionLabelCandidates: Array<{
@@ -2766,12 +3538,19 @@ export function LiteratureUniverse() {
     document.addEventListener("visibilitychange", handleVisibilityChange);
     frame = window.requestAnimationFrame(render);
     return () => {
+      disposed = true;
       window.removeEventListener("resize", resize);
       window.removeEventListener("focus", handleFocus);
       window.removeEventListener("blur", handleBlur);
       document.removeEventListener("visibilitychange", handleVisibilityChange);
       suppliedStarSource.onload = null;
       suppliedStarSource.removeAttribute("src");
+      blackHoleSource.onload = null;
+      blackHoleSource.removeAttribute("src");
+      for (const source of galaxySources) {
+        source.onload = null;
+        source.removeAttribute("src");
+      }
       for (const source of regionNebulaSources) {
         source.onload = null;
         source.removeAttribute("src");
@@ -2784,6 +3563,13 @@ export function LiteratureUniverse() {
       backdropCanvas.height = 0;
       suppliedStarSprite.width = 0;
       suppliedStarSprite.height = 0;
+      blackHoleSprite.width = 0;
+      blackHoleSprite.height = 0;
+      for (const sprite of galaxySprites.values()) {
+        sprite.width = 0;
+        sprite.height = 0;
+      }
+      galaxySprites.clear();
       for (const sprite of starSprites.values()) {
         sprite.width = 0;
         sprite.height = 0;
@@ -2814,6 +3600,36 @@ export function LiteratureUniverse() {
       }
     }
     if (nearestStar) return { kind: "paper", id: nearestStar.id };
+
+    let nearestMemory: { id: string; distance: number } | null = null;
+    for (const memory of projectedMemoryStarsRef.current) {
+      const distance = Math.hypot(memory.x - point.x, memory.y - point.y);
+      if (distance <= memory.radius && (!nearestMemory || distance < nearestMemory.distance)) {
+        nearestMemory = { id: memory.id, distance };
+      }
+    }
+    if (nearestMemory) return { kind: "memory", id: nearestMemory.id };
+
+    let nearestGalaxy: { id: string; distance: number } | null = null;
+    for (const galaxy of projectedGalaxiesRef.current) {
+      const distance = Math.hypot(galaxy.x - point.x, galaxy.y - point.y);
+      if (distance <= galaxy.radius && (!nearestGalaxy || distance < nearestGalaxy.distance)) {
+        nearestGalaxy = { id: galaxy.id, distance };
+      }
+    }
+    if (nearestGalaxy) return { kind: "galaxy", id: nearestGalaxy.id };
+
+    let nearestBlackHole: { categoryId: string; distance: number } | null = null;
+    for (const blackHole of projectedBlackHolesRef.current) {
+      if (!blackHole.enabled) continue;
+      const distance = Math.hypot(blackHole.x - point.x, blackHole.y - point.y);
+      if (distance <= blackHole.radius && (!nearestBlackHole || distance < nearestBlackHole.distance)) {
+        nearestBlackHole = { categoryId: blackHole.categoryId, distance };
+      }
+    }
+    if (nearestBlackHole) {
+      return { kind: "black-hole", categoryId: nearestBlackHole.categoryId };
+    }
 
     let nearestRelation: { key: string; distance: number } | null = null;
     for (const relation of projectedRelationsRef.current) {
@@ -2856,21 +3672,22 @@ export function LiteratureUniverse() {
   }, []);
 
   const handlePointerDown = (event: ReactPointerEvent<HTMLCanvasElement>) => {
+    setKeyboardFocus(null);
     pendingPointerHitRef.current = null;
     if (pointerHitFrameRef.current) {
       window.cancelAnimationFrame(pointerHitFrameRef.current);
       pointerHitFrameRef.current = 0;
     }
-    const cameraTransition = cameraTransitionRef.current;
-    if (cameraTransition) {
-      cameraCenterRef.current = [...cameraTransition.toCenter];
-      zoomRef.current = cameraTransition.toZoom;
-      cameraTransitionRef.current = null;
-    }
+    // The render loop continuously stores the visible interpolated camera.
+    // Cancelling here preserves that exact frame instead of snapping to the
+    // transition target before a drag begins.
+    cameraTransitionRef.current = null;
     pointerRef.current = {
       down: true,
       x: event.clientX,
       y: event.clientY,
+      startX: event.clientX,
+      startY: event.clientY,
       moved: false,
     };
     event.currentTarget.setPointerCapture(event.pointerId);
@@ -2880,7 +3697,10 @@ export function LiteratureUniverse() {
     if (pointerRef.current.down) {
       const dx = event.clientX - pointerRef.current.x;
       const dy = event.clientY - pointerRef.current.y;
-      if (Math.abs(dx) + Math.abs(dy) > 2) pointerRef.current.moved = true;
+      if (Math.hypot(
+        event.clientX - pointerRef.current.startX,
+        event.clientY - pointerRef.current.startY,
+      ) > 8) pointerRef.current.moved = true;
       rotationRef.current.y += dx * 0.006;
       rotationRef.current.x = Math.max(
         -0.72,
@@ -2902,7 +3722,8 @@ export function LiteratureUniverse() {
       pendingPointerHitRef.current = null;
       if (!pending) return;
       const target = findTarget(pending.clientX, pending.clientY);
-      if (!sameHitTarget(hoveredRef.current, target)) {
+      if (!sameCanvasTarget(hoveredRef.current, target)) {
+        setKeyboardFocus(null);
         hoveredRef.current = target;
         setHovered(target);
       }
@@ -2916,15 +3737,13 @@ export function LiteratureUniverse() {
     if (moved) return;
     const target = findTarget(event.clientX, event.clientY);
     if (target?.kind === "paper") {
-      const bridge = getNativeBridge();
-      bridge?.postMessage({ action: "loadAnnotations" });
-      bridge?.postMessage({ action: "loadUniverse" });
-      setSettingsOpen(false);
-      setSelectedPaperId(target.id);
-      setSelectedRelationKey(null);
-      setDrawerTab("summary");
-      setEditingAnnotationId(null);
-      setAnnotationDraft("");
+      selectPaper(target.id);
+    } else if (target?.kind === "memory") {
+      selectMemoryDocument(target.id);
+    } else if (target?.kind === "galaxy") {
+      focusGalaxy(target.id);
+    } else if (target?.kind === "black-hole") {
+      focusNotes(target.categoryId);
     } else if (target?.kind === "relation") {
       setSettingsOpen(false);
       setSelectedRelationKey(target.key);
@@ -2938,12 +3757,8 @@ export function LiteratureUniverse() {
   };
 
   const setUniverseZoom = (value: number) => {
-    const cameraTransition = cameraTransitionRef.current;
-    if (cameraTransition) {
-      cameraCenterRef.current = [...cameraTransition.toCenter];
-      cameraTransitionRef.current = null;
-    }
-    const bounded = Math.max(0.68, Math.min(1.9, value));
+    cameraTransitionRef.current = null;
+    const bounded = Math.max(0.68, Math.min(3.2, value));
     zoomRef.current = bounded;
     setZoomLevel(bounded);
   };
@@ -2954,11 +3769,14 @@ export function LiteratureUniverse() {
   };
 
   const selectPaper = (id: string) => {
+    const galaxy = galaxyHierarchy.galaxyByPaperId.get(id);
+    if (galaxy && selectedGalaxyId !== galaxy.id) focusGalaxy(galaxy.id);
     const bridge = getNativeBridge();
     bridge?.postMessage({ action: "loadAnnotations" });
     bridge?.postMessage({ action: "loadUniverse" });
     setSettingsOpen(false);
     setSelectedPaperId(id);
+    setSelectedMemoryId(null);
     setSelectedRelationKey(null);
     setQuery("");
     setDrawerTab("summary");
@@ -2966,14 +3784,109 @@ export function LiteratureUniverse() {
     setAnnotationDraft("");
   };
 
+  const selectMemoryDocument = (id: string) => {
+    const memory = (workspace.projectMemory.items as PersonalMemory[]).find(
+      (item) => (item.memoryId || item.id) === id,
+    );
+    if (!memory) return;
+    setSettingsOpen(false);
+    setSelectedMemoryId(id);
+    setSelectedPaperId(null);
+    setSelectedRelationKey(null);
+    const categoryId = memory.scope?.categoryId || memory.scope?.regionId ||
+      memory.source?.categoryId || memory.source?.regionId || notesCategoryId;
+    const bridge = getNativeBridge();
+    if (bridge && categoryId) {
+      bridge.postMessage({
+        action: "loadRegionDocument",
+        projectId: workspace.projects.activeProjectId,
+        expectedMemoryRevision: workspace.projectMemory.revision,
+        expectedGraphRevision: universe.revision ?? 0,
+        categoryId,
+        memoryId: id,
+      });
+    }
+  };
+
+  const focusCanvasKeyboardTarget = (target: CanvasTarget | null) => {
+    if (!target) return;
+    const index = canvasKeyboardItems.findIndex((item) => sameCanvasTarget(item.target, target));
+    if (index < 0) return;
+    setKeyboardFocus(target);
+    hoveredRef.current = target;
+    setHovered(target);
+    setKeyboardAnnouncement(
+      `${canvasKeyboardItems[index].label} Item ${index + 1} of ${canvasKeyboardItems.length}.`,
+    );
+  };
+
+  const activateCanvasKeyboardTarget = (target: CanvasTarget) => {
+    const item = canvasKeyboardItems.find((candidate) => sameCanvasTarget(candidate.target, target));
+    if (!canActivateCanvasTarget(target, noteCountByCategory)) {
+      setKeyboardAnnouncement(`${item?.label || "Knowledge black hole."} It cannot be opened.`);
+      return;
+    }
+    if (target.kind === "paper") selectPaper(target.id);
+    else if (target.kind === "memory") selectMemoryDocument(target.id);
+    else if (target.kind === "galaxy") focusGalaxy(target.id);
+    else if (target.kind === "black-hole") focusNotes(target.categoryId);
+    else if (target.kind === "relation") {
+      setSettingsOpen(false);
+      setSelectedRelationKey(target.key);
+      setSelectedPaperId(null);
+    } else focusCategory(target.id);
+    setKeyboardAnnouncement(`Opened ${item?.label || "the focused universe item"}`);
+  };
+
+  const handleCanvasKeyDown = (event: ReactKeyboardEvent<HTMLCanvasElement>) => {
+    const key = event.key;
+    if (["ArrowRight", "ArrowDown", "ArrowLeft", "ArrowUp", "Home", "End"].includes(key)) {
+      event.preventDefault();
+      if (canvasKeyboardItems.length === 0) {
+        setKeyboardAnnouncement("No interactive items are available in this view.");
+        return;
+      }
+      let target: CanvasTarget | null;
+      if (key === "Home") target = canvasKeyboardItems[0].target;
+      else if (key === "End") target = canvasKeyboardItems[canvasKeyboardItems.length - 1].target;
+      else target = cycleCanvasTarget(
+        canvasKeyboardItems.map((item) => item.target),
+        keyboardFocus,
+        key === "ArrowRight" || key === "ArrowDown" ? 1 : -1,
+      );
+      focusCanvasKeyboardTarget(target);
+      return;
+    }
+    if (key === "Enter" || key === " ") {
+      event.preventDefault();
+      if (keyboardFocus) activateCanvasKeyboardTarget(keyboardFocus);
+      else if (canvasKeyboardItems[0]) focusCanvasKeyboardTarget(canvasKeyboardItems[0].target);
+      return;
+    }
+    if (key === "Escape") {
+      const action = canvasBackAction({
+        categoryFilter,
+        selectedGalaxyId,
+        notesCategoryId,
+        selectedPaperId,
+        selectedMemoryId,
+        selectedRelationKey,
+      });
+      if (action === "none") return;
+      event.preventDefault();
+      setKeyboardFocus(null);
+      hoveredRef.current = null;
+      setHovered(null);
+      goBack(true);
+      setKeyboardAnnouncement("Moved back one level.");
+    }
+  };
+
   const selectSearchResult = (id: string) => {
     const paper = paperById.get(id);
     if (!paper) {
       setLiteratureSearchError("This paper is indexed but not yet in the current universe. Refresh before locating it.");
       return;
-    }
-    if (paper && categoryFilter !== paper.primaryCategory) {
-      focusCategory(paper.primaryCategory);
     }
     selectPaper(id);
   };
@@ -3087,6 +4000,32 @@ export function LiteratureUniverse() {
     bridge.postMessage({ action: "pickLiteraturePDF" });
   };
 
+  const pickLiteratureFolder = () => {
+    setWorkspaceError("");
+    setWorkspaceNotice("");
+    const bridge = getNativeBridge();
+    if (!bridge) {
+      setWorkspaceError("Linked-folder import is available in the Liteverse macOS app.");
+      return;
+    }
+    pendingWorkspaceActionRef.current = "folder";
+    setWorkspaceBusyAction("folder");
+    bridge.postMessage({ action: "pickLiteratureFolder" });
+  };
+
+  const pickZoteroLibrary = () => {
+    setWorkspaceError("");
+    setWorkspaceNotice("");
+    const bridge = getNativeBridge();
+    if (!bridge) {
+      setWorkspaceError("Zotero connection is available in the Liteverse macOS app.");
+      return;
+    }
+    pendingWorkspaceActionRef.current = "folder";
+    setWorkspaceBusyAction("folder");
+    bridge.postMessage({ action: "pickZoteroLibrary" });
+  };
+
   const saveArxivEntry = (rawValue: string) => {
     setWorkspaceError("");
     setWorkspaceNotice("");
@@ -3189,6 +4128,58 @@ export function LiteratureUniverse() {
     researchDraftDirtyRef.current = false;
     persistFallbackWorkspace(nextWorkspace);
     setWorkspaceNotice("Research memory was updated and saved on this device.");
+  };
+
+  const saveRegionDocument = (input: {
+    categoryId: string;
+    kind: "note" | "knowledge_card";
+    format: "markdown" | "plain_text";
+    title: string;
+    content: string;
+  }) => {
+    setWorkspaceError("");
+    setWorkspaceNotice("");
+    const bridge = getNativeBridge();
+    if (!bridge) {
+      setWorkspaceError("Nebula Notes and Knowledge Cards are available in the Liteverse macOS app.");
+      return;
+    }
+    pendingWorkspaceActionRef.current = "memory-document";
+    setWorkspaceBusyAction("memory-document");
+    bridge.postMessage({
+      action: "saveRegionDocument",
+      projectId: workspace.projects.activeProjectId,
+      expectedMemoryRevision: workspace.projectMemory.revision,
+      expectedGraphRevision: universe.revision ?? 0,
+      categoryId: input.categoryId,
+      kind: input.kind,
+      format: input.format,
+      title: input.title,
+      content: input.content,
+    });
+  };
+
+  const importRegionDocument = (input: {
+    categoryId: string;
+    kind: "note" | "knowledge_card";
+  }) => {
+    setWorkspaceError("");
+    setWorkspaceNotice("");
+    const bridge = getNativeBridge();
+    if (!bridge) {
+      setWorkspaceError("Local .md and .txt import is available in the Liteverse macOS app.");
+      return;
+    }
+    pendingWorkspaceActionRef.current = "memory-document";
+    setWorkspaceBusyAction("memory-document");
+    bridge.postMessage({
+      action: "importRegionDocumentFile",
+      projectId: workspace.projects.activeProjectId,
+      expectedMemoryRevision: workspace.projectMemory.revision,
+      expectedGraphRevision: universe.revision ?? 0,
+      categoryId: input.categoryId,
+      kind: input.kind,
+    });
   };
 
   const selectProject = (projectId: string) => {
@@ -3423,6 +4414,8 @@ export function LiteratureUniverse() {
       className={`universe-shell ${settingsOpen ? "has-settings-open" : ""} ${
         selectedPaper ? "has-paper-open" : ""
       } ${selectedBundle ? "has-relation-open" : ""} ${
+        selectedMemory ? "has-memory-open" : ""
+      } ${
         refreshPhase !== "idle" ? `is-refresh-${refreshPhase}` : ""
       }`}
     >
@@ -3432,12 +4425,32 @@ export function LiteratureUniverse() {
       <canvas
         ref={canvasRef}
         className="universe-canvas"
+        role="application"
+        aria-roledescription="interactive literature map"
+        aria-describedby="universe-keyboard-help"
+        aria-keyshortcuts="ArrowRight ArrowLeft ArrowDown ArrowUp Home End Enter Space Escape"
         aria-label={
-          categoryFilter === "all"
-            ? "Liteverse 3D literature universe. Select a region nebula to focus it and reveal paper titles; select a star for its summary or a beam for relationship details."
-            : `${getCategory(categoryFilter)?.name || "Literature"} is focused, showing ${visiblePapers.length} paper ${visiblePapers.length === 1 ? "title" : "titles"}. Press Escape to return to the full universe.`
+          viewLevel === "universe"
+            ? "Liteverse 3D literature universe. Select a nebula to enter its galaxy network."
+            : viewLevel === "galaxies"
+              ? `${getCategory(categoryFilter)?.name || "Literature"} galaxy network. Select a galaxy for its paper stars, or its black hole for Notes and Knowledge Cards.`
+              : viewLevel === "papers"
+                ? `${selectedGalaxy?.name || "Research galaxy"}, showing ${visiblePapers.length} paper ${visiblePapers.length === 1 ? "star" : "stars"}.`
+                : `${getCategory(notesCategoryId || categoryFilter)?.name || "Literature"} personal knowledge orbit, showing ${sceneObjectCount} ${sceneObjectNoun}.`
         }
         tabIndex={0}
+        onFocus={() => {
+          if (!keyboardAnnouncement) {
+            setKeyboardAnnouncement("Interactive literature map. Use arrow keys to move through visible items, Enter or Space to open, and Escape to go back.");
+          }
+        }}
+        onBlur={() => {
+          setKeyboardFocus(null);
+          if (keyboardFocus && sameCanvasTarget(hoveredRef.current, keyboardFocus)) {
+            hoveredRef.current = null;
+            setHovered(null);
+          }
+        }}
         onPointerDown={handlePointerDown}
         onPointerMove={handlePointerMove}
         onPointerUp={handlePointerUp}
@@ -3450,18 +4463,18 @@ export function LiteratureUniverse() {
             window.cancelAnimationFrame(pointerHitFrameRef.current);
             pointerHitFrameRef.current = 0;
           }
-          hoveredRef.current = null;
-          setHovered(null);
-          event.currentTarget.dataset.interactive = "false";
+          hoveredRef.current = keyboardFocus;
+          setHovered(keyboardFocus);
+          event.currentTarget.dataset.interactive = keyboardFocus ? "true" : "false";
         }}
         onWheel={handleWheel}
-        onKeyDown={(event) => {
-          if (event.key === "Escape" && categoryFilter !== "all") {
-            event.preventDefault();
-            resetUniverseView();
-          }
-        }}
+        onKeyDown={handleCanvasKeyDown}
       />
+      <p id="universe-keyboard-help" className="sr-status">
+        Use the arrow keys to cycle through visible nebulae, galaxies, knowledge black holes,
+        galaxy relationship lanes, paper stars, or note stars. Press Enter or Space to open
+        the focused item, Home or End to jump, and Escape to go back.
+      </p>
 
       {runtimeError && (
         <div className="runtime-error glass-surface" role="alert">
@@ -3493,7 +4506,7 @@ export function LiteratureUniverse() {
           <button
             type="button"
             className={categoryFilter === "all" ? "is-active" : ""}
-            onClick={showAllUniverse}
+            onClick={() => showAllUniverse()}
           >
             All regions
           </button>
@@ -3515,15 +4528,42 @@ export function LiteratureUniverse() {
             <button type="button" className={heatScope === "project" ? "is-active" : ""} onClick={() => setHeatScope("project")}>Project heat</button>
             <button type="button" className={heatScope === "global" ? "is-active" : ""} onClick={() => setHeatScope("global")}>Global heat</button>
           </span>
-          <span><i /> {visiblePapers.length} {visiblePapers.length === 1 ? "star" : "stars"}</span>
+          <span><i /> {sceneObjectCount} {sceneObjectNoun}</span>
           <button
             type="button"
-            onClick={resetUniverseView}
+            onClick={viewLevel === "universe" ? resetUniverseView : () => goBack()}
           >
-            {categoryFilter === "all" ? "Reset view" : "Exit region"}
+            {viewLevel === "universe" ? "Reset view" : "Back"}
           </button>
         </div>
       </header>
+
+      {viewLevel !== "universe" && (
+        <nav className="universe-breadcrumb glass-surface" aria-label="Universe location">
+          <button type="button" className="breadcrumb-back" onClick={() => goBack()} aria-label="Go back one level">←</button>
+          <button type="button" onClick={() => showAllUniverse()}>Universe</button>
+          <span aria-hidden="true">›</span>
+          <button
+            type="button"
+            aria-current={viewLevel === "galaxies" ? "page" : undefined}
+            onClick={() => focusCategory(categoryFilter)}
+          >
+            {getCategory(categoryFilter)?.name || "Nebula"}
+          </button>
+          {selectedGalaxy && (
+            <>
+              <span aria-hidden="true">›</span>
+              <span aria-current="page">{selectedGalaxy.name}</span>
+            </>
+          )}
+          {viewLevel === "notes" && (
+            <>
+              <span aria-hidden="true">›</span>
+              <span aria-current="page">Notes &amp; Knowledge Cards</span>
+            </>
+          )}
+        </nav>
+      )}
 
       <div className={`search-orbit ${query ? "is-searching" : ""}`}>
         <span>⌕</span>
@@ -3579,13 +4619,17 @@ export function LiteratureUniverse() {
             <button type="button" className="is-primary" onClick={() => openSettings("literature")}>Import your first paper</button>
           </div>
           <small>After searching the full library, Codex proposes three broad region schemes. Until one is selected, papers remain in staging and the current graph stays unchanged.</small>
+          <small className="onboarding-capacity-note" role="note">
+            <span>Built to grow</span>
+            One universe can grow from a few foundational papers to hundreds. Search and context workflows are benchmark-tested with up to {BENCHMARKED_PAPERS_PER_UNIVERSE.toLocaleString("en-US")} papers.
+          </small>
         </section>
       )}
 
-      {universe.papers.length > 0 && (
+      {universe.papers.length > 0 && viewLevel !== "papers" && viewLevel !== "notes" && (
         <details className="relationship-layers glass-surface">
           <summary>
-            <span><i />Relationship layers</span>
+            <span><i />Galaxy relationship lanes</span>
             <small>{visibleRelationRecordCount} visible</small>
           </summary>
           <div className="relationship-layer-panel">
@@ -3605,11 +4649,7 @@ export function LiteratureUniverse() {
               <span>Minimum strength <output>{minimumRelationStrength}%</output></span>
               <input type="range" min="0" max="80" step="10" value={minimumRelationStrength} onChange={(event) => setMinimumRelationStrength(Number(event.target.value))} />
             </label>
-            <label className="only-selected-relations">
-              <input type="checkbox" checked={onlySelectedRelations} disabled={!selectedPaper} onChange={(event) => setOnlySelectedRelations(event.target.checked)} />
-              Show only relationships for the selected paper
-            </label>
-            <p>Unscored beams represent legacy graph records, not verified source evidence.</p>
+            <p>Each lane is one paper-level relationship projected between galaxies. Unscored lanes are not verified source evidence.</p>
           </div>
         </details>
       )}
@@ -3671,9 +4711,14 @@ export function LiteratureUniverse() {
         onSelectProject={selectProject}
         onCreateProject={createProject}
         onPickPDF={pickLiteraturePDF}
+        onPickLiteratureFolder={pickLiteratureFolder}
+        onPickZoteroLibrary={pickZoteroLibrary}
         onSaveArxiv={saveArxivEntry}
         onResearchDraftChange={updateResearchDraft}
         onSaveResearch={saveResearchInformation}
+        regions={macroCategories.map((category) => ({ id: category.id, name: category.name }))}
+        onSaveRegionDocument={saveRegionDocument}
+        onImportRegionDocument={importRegionDocument}
         localContextPreview={localContextPreview}
         contextPreviewBusy={contextPreviewBusy}
         contextPreviewError={contextPreviewError}
@@ -3745,7 +4790,7 @@ export function LiteratureUniverse() {
 
                   <section>
                     <span className="section-label">PAPER SUMMARY</span>
-                    <p>{selectedPaper.summary}</p>
+                    <ScientificText as="p">{selectedPaper.summary}</ScientificText>
                   </section>
                   <section className={`paper-verification-card ${selectedPaperVerification.tone}`}>
                     <span className="section-label">EVIDENCE STATUS</span>
@@ -3756,7 +4801,7 @@ export function LiteratureUniverse() {
                   </section>
                   <section>
                     <span className="section-label">ROLE IN THIS PROJECT</span>
-                    <p>{selectedPaper.projectRole}</p>
+                    <ScientificText as="p">{selectedPaper.projectRole}</ScientificText>
                   </section>
 
                   <div className="tag-cloud">
@@ -3805,7 +4850,7 @@ export function LiteratureUniverse() {
                         {knowledgeCard.sections.map((section) => (
                           <details key={section.id} open={knowledgeCard.sections.length <= 4}>
                             <summary>{section.title}</summary>
-                            <pre>{section.content}</pre>
+                            <ScientificText as="pre">{section.content}</ScientificText>
                           </details>
                         ))}
                       </div>
@@ -3814,7 +4859,7 @@ export function LiteratureUniverse() {
                         {knowledgeCard.evidence.map((evidence) => (
                           <article key={evidence.id}>
                             <header><b>{evidence.id}</b><small>{evidence.locator || "No locator"}</small></header>
-                            <p>{evidence.text}</p>
+                            <ScientificText as="p">{evidence.text}</ScientificText>
                           </article>
                         ))}
                         {!knowledgeCard.evidence.length && <p className="empty-inline">No evidence locators are recorded in this knowledge card.</p>}
@@ -3871,7 +4916,7 @@ export function LiteratureUniverse() {
                           <b>{annotation.status === "pending" ? "Awaiting Codex curation" : "Curated"}</b>
                           <small>v{annotation.revision} · {dateLabel(annotation.updatedAt)}</small>
                         </div>
-                        <p>{annotation.text}</p>
+                        <ScientificText as="p">{annotation.text}</ScientificText>
                         <button type="button" onClick={() => editAnnotation(annotation)}>Edit this note</button>
                       </article>
                     ))}
@@ -3884,7 +4929,7 @@ export function LiteratureUniverse() {
                 <div id="paper-panel-relations" className="drawer-tab-content paper-relations-list" role="tabpanel" aria-labelledby="paper-tab-relations">
                   <div className="annotation-intro">
                     <span className="section-label">CONNECTED PAPERS</span>
-                    <p>Select a record to close the paper drawer and open the corresponding relationship beam.</p>
+                    <p>Select a connected paper to enter its galaxy and open that paper star.</p>
                   </div>
                   {selectedPaperRelationBundles.map((bundle) => {
                     const otherId = bundle.source === selectedPaper.id ? bundle.target : bundle.source;
@@ -3895,7 +4940,7 @@ export function LiteratureUniverse() {
                       <button
                         type="button"
                         key={bundle.key}
-                        onClick={() => { setSelectedRelationKey(bundle.key); setSelectedPaperId(null); }}
+                        onClick={() => selectPaper(otherId)}
                       >
                         <span className="relation-list-beam" />
                         <span><b>{getPaper(otherId).shortTitle}</b><small>{bundle.relations.map((relation) => relationLabels[relation.type] || relation.label).join(" · ")}{pendingScore ? " · Unscored" : ""}</small></span>
@@ -3914,24 +4959,24 @@ export function LiteratureUniverse() {
       <aside
         className={`relation-drawer glass-surface ${selectedBundle ? "is-open" : ""}`}
         role="dialog"
-        aria-label="Relationship details"
+        aria-label="Galaxy relationship details"
         aria-hidden={!selectedBundle}
         inert={!selectedBundle}
       >
-        {selectedBundle && (
+        {selectedBundle && selectedSourceGalaxy && selectedTargetGalaxy && (
           <>
             <button className="drawer-close" type="button" onClick={() => setSelectedRelationKey(null)} aria-label="Close relationship details">×</button>
             <div className="relation-heading">
-              <span className="section-label">RELATION BEAM</span>
+              <span className="section-label">GALAXY RELATION LANES</span>
               <div className="relation-pair">
-                <button type="button" onClick={() => selectPaper(selectedBundle.source)}>{getPaper(selectedBundle.source).shortTitle}</button>
+                <button type="button" onClick={() => focusGalaxy(selectedSourceGalaxy.id)}>{selectedSourceGalaxy.name}</button>
                 <span>↔</span>
-                <button type="button" onClick={() => selectPaper(selectedBundle.target)}>{getPaper(selectedBundle.target).shortTitle}</button>
+                <button type="button" onClick={() => focusGalaxy(selectedTargetGalaxy.id)}>{selectedTargetGalaxy.name}</button>
               </div>
-              <p>This beam combines {selectedBundle.relations.length} independent relationship {selectedBundle.relations.length === 1 ? "record" : "records"}.</p>
+              <p>{selectedBundle.lanes.length} independent paper-level {selectedBundle.lanes.length === 1 ? "relationship is" : "relationships are"} projected as parallel galaxy lanes.</p>
             </div>
             <div className="relation-details">
-              {selectedBundle.relations.map((relation) => {
+              {selectedBundle.lanes.map(({ relation }) => {
                 const displayState = relationDisplayState(relation);
                 const strength = normalizedPercent(relation.strength);
                 const confidence = normalizedPercent(relation.confidence);
@@ -3939,11 +4984,11 @@ export function LiteratureUniverse() {
                   <article key={relation.id} className={`relation-score-${displayState}`}>
                     <div className="relation-meta">
                       <span className={`relation-status ${displayState}`} />
-                      <b>{relationLabels[relation.type] || relation.label}</b>
+                      <b>{getPaper(relation.source).shortTitle} ↔ {getPaper(relation.target).shortTitle}</b>
                       <small>
                         {displayState === "unscored"
                           ? "Unscored · legacy confidence is archival only"
-                          : `${relationStatusLabel(displayState)} · Relationship strength ${Math.round(strength || 0)}%`}
+                          : `${relationStatusLabel(displayState)} · ${relationLabels[relation.type] || relation.label} · Strength ${Math.round(strength || 0)}%`}
                       </small>
                       {displayState !== "unscored" && (
                         <em className={`confidence-badge ${displayState}`}>
@@ -3951,10 +4996,10 @@ export function LiteratureUniverse() {
                         </em>
                       )}
                     </div>
-                    <p>{relation.note}</p>
+                    <ScientificText as="p">{relation.note}</ScientificText>
                     <footer>
                       <span>Evidence</span>
-                      <p className="relation-evidence-text">{relationEvidenceText(relation)}</p>
+                      <ScientificText as="p" className="relation-evidence-text">{relationEvidenceText(relation)}</ScientificText>
                     </footer>
                   </article>
                 );
@@ -3964,8 +5009,57 @@ export function LiteratureUniverse() {
         )}
       </aside>
 
-      <div className="sr-status" aria-live="polite">
-        {selectedPaper ? `Selected ${selectedPaper.shortTitle}` : selectedBundle ? "Relationship beam selected" : ""}
+      <aside
+        className={`memory-drawer glass-surface ${selectedMemory ? "is-open" : ""}`}
+        role="dialog"
+        aria-label="Personal knowledge details"
+        aria-hidden={!selectedMemory}
+        inert={!selectedMemory}
+      >
+        {selectedMemory && (
+          <>
+            <button className="drawer-close" type="button" onClick={() => setSelectedMemoryId(null)} aria-label="Close personal knowledge details">×</button>
+            <div className="drawer-scroll">
+              <div className="drawer-kicker">
+                <span>{selectedMemory.presentation?.kind === "knowledge_card" ? "Knowledge Card" : "Note"}</span>
+                <span>{selectedMemory.evidenceState.replaceAll("_", " ")}</span>
+                <span>{selectedMemory.state}</span>
+              </div>
+              <h2>{selectedMemory.presentation?.title || selectedMemory.title || selectedMemory.statement || "Untitled research note"}</h2>
+              <p className="drawer-authors">
+                {Array.isArray(selectedMemory.provenance)
+                  ? selectedMemory.provenance.join(" · ")
+                  : selectedMemory.provenance}
+                {selectedMemory.updatedAt || selectedMemory.createdAt
+                  ? ` · ${dateLabel(selectedMemory.updatedAt || selectedMemory.createdAt || "")}`
+                  : ""}
+              </p>
+              <section className="memory-document-content">
+                <span className="section-label">PERSONAL KNOWLEDGE</span>
+                <ScientificText as="div">
+                  {selectedMemory.content || selectedMemory.statement || "No note content is available."}
+                </ScientificText>
+              </section>
+              <section className="memory-provenance-card">
+                <span className="section-label">STATUS</span>
+                <p>Personal notes and cards remain project memory. They are not promoted to paper evidence unless separately verified against a source.</p>
+              </section>
+            </div>
+          </>
+        )}
+      </aside>
+
+      <div className="sr-status" role="status" aria-live="polite" aria-atomic="true">
+        {keyboardAnnouncement}
+      </div>
+      <div className="sr-status" role="status" aria-live="polite" aria-atomic="true">
+        {selectedPaper
+          ? `Selected ${selectedPaper.shortTitle}`
+          : selectedMemory
+            ? `Selected ${selectedMemory.title || selectedMemory.statement || "personal knowledge"}`
+            : selectedBundle
+              ? "Galaxy relationship lanes selected"
+              : ""}
       </div>
     </main>
   );

@@ -1,6 +1,7 @@
 import { access, readFile } from "node:fs/promises";
 import path from "node:path";
 import process from "node:process";
+import { inspectGalaxyHierarchy } from "./lib/liteverse-galaxy-hierarchy.mjs";
 
 const root = path.resolve(import.meta.dirname, "..");
 const universe = JSON.parse(
@@ -168,15 +169,37 @@ for (const paper of universe.papers) {
     const verificationStates = new Set(["imported", "extracted", "needs_ocr", "card_draft", "evidence_verified", "needs_attention", "source_missing"]);
     const extractionStates = new Set(["pending", "extracted", "needs_ocr", "failed"]);
     const metadataStates = new Set(["provisional", "official_verified", "source_verified"]);
+    const storageMode = paper.source?.storageMode ?? "managed";
+    let sourcePathIsValid = false;
+    if (storageMode === "linked") {
+      const linkedPath = paper.source?.pdfPath;
+      sourcePathIsValid = typeof linkedPath === "string"
+        && path.isAbsolute(linkedPath)
+        && path.resolve(linkedPath) === linkedPath
+        && paper.pdfPath === linkedPath;
+      const linkedRoot = paper.source?.linkedRootPath;
+      const relativePath = paper.source?.relativePath;
+      sourcePathIsValid = sourcePathIsValid
+        && typeof linkedRoot === "string"
+        && path.isAbsolute(linkedRoot)
+        && path.resolve(linkedRoot) === linkedRoot
+        && typeof relativePath === "string"
+        && relativePath.length > 0
+        && !path.isAbsolute(relativePath)
+        && !relativePath.split(/[\\/]+/).some((part) => !part || part === "." || part === "..")
+        && path.resolve(linkedRoot, ...relativePath.split(/[\\/]+/)) === linkedPath;
+    } else if (storageMode === "managed") {
+      sourcePathIsValid = paper.source?.pdfPath === expectedPdf && paper.pdfPath === expectedPdf;
+    }
     if (Object.hasOwn(paper, "verified") || !verificationStates.has(paper.verificationStatus) || !metadataStates.has(paper.metadataStatus)) {
       errors.push(`${paper.id}: schema v3 requires an explicit verificationStatus and must not retain verified`);
     }
     if (
-      paper.source?.pdfPath !== expectedPdf || paper.pdfPath !== expectedPdf ||
+      !sourcePathIsValid ||
       !/^[a-f0-9]{64}$/.test(paper.source?.sha256 || "") ||
       !["pdf", "arxiv"].includes(paper.source?.kind)
     ) {
-      errors.push(`${paper.id}: source must include the managed PDF path, source kind, and SHA-256`);
+      errors.push(`${paper.id}: source must include a valid managed or linked PDF reference, source kind, and SHA-256`);
     }
     if (
       paper.artifacts?.cardPath !== expectedCard || paper.artifacts?.fulltextPath !== expectedFulltext ||
@@ -205,6 +228,14 @@ for (const paper of universe.papers) {
       }
     }
   }
+}
+
+// Hierarchy is additive for schema v3 so legacy and empty public seeds remain
+// valid. Once any hierarchy field is present, require complete deterministic
+// closure between every paper, galaxy, and parent nebula.
+const galaxyHierarchy = inspectGalaxyHierarchy(universe);
+if (galaxyHierarchy.present) {
+  for (const item of galaxyHierarchy.issues) errors.push(item.message);
 }
 
 for (const relation of universe.relations) {
@@ -274,5 +305,5 @@ if (errors.length) {
 }
 
 console.log(
-  `Literature-universe data is valid: ${universe.papers.length} papers, ${universe.relations.length} relations, and ${universe.categories.length} nebulae.`,
+  `Literature-universe data is valid: ${universe.papers.length} papers, ${universe.relations.length} relations, ${universe.categories.length} nebulae, and ${galaxyHierarchy.galaxyCount} galaxies.`,
 );

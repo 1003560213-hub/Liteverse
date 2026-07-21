@@ -31,6 +31,7 @@ test("1,000-card warm BM25 search p95 and Context Pack assembly stay within targ
     await Promise.all([
       mkdir(path.join(support, "Knowledge", "cards"), { recursive: true }),
       mkdir(path.join(support, "Knowledge", "claims"), { recursive: true }),
+      mkdir(path.join(support, "Library", "PDFs"), { recursive: true }),
     ]);
     await inBatches(Array.from({ length: count }, (_, index) => index), 80, async (index) => {
       const paperId = `synthetic-${String(index).padStart(4, "0")}`;
@@ -101,6 +102,7 @@ test("1,000-card warm BM25 search p95 and Context Pack assembly stay within targ
         mkdir(path.join(support, artifactRoot), { recursive: true }),
         writeFile(path.join(support, "Knowledge", "cards", `${paperId}.md`), card),
         writeFile(path.join(support, "Knowledge", "claims", `${paperId}.json`), claimsText),
+        writeFile(path.join(support, "Library", "PDFs", `${paperId}.pdf`), `source-${paperId}`),
       ]);
       await Promise.all([
         writeFile(path.join(support, artifactRoot, "card.md"), card),

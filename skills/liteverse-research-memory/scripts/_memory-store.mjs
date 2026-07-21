@@ -41,6 +41,11 @@ export const PROVENANCE = new Set([
   "computationArtifact",
   "aiInference",
 ]);
+export const REGION_DOCUMENT_KINDS = new Set(["note", "knowledge_card"]);
+export const REGION_DOCUMENT_FORMATS = new Set(["markdown", "plain_text"]);
+const REGION_DOCUMENT_INPUTS = new Set(["manual", "file_import"]);
+const REGION_DOCUMENT_ID = /^regiondoc-[a-z0-9]+(?:-[a-z0-9]+)*$/;
+const MAX_REGION_DOCUMENT_BYTES = 1024 * 1024;
 
 const EVENT_TYPES = new Set([
   "project_initialized",
@@ -143,25 +148,55 @@ export async function withMemoryLock(support, callback) {
   const lockPath = path.join(support, ".locks", "research-memory.lock");
   await mkdir(path.dirname(lockPath), { recursive: true });
   const deadline = Date.now() + 15_000;
+  const token = randomUUID();
   while (true) {
     try {
       await mkdir(lockPath);
-      await atomicWrite(
-        path.join(lockPath, "owner.json"),
-        `${JSON.stringify({ pid: process.pid, createdAt: new Date().toISOString() })}\n`,
-      );
+      try {
+        await atomicWrite(
+          path.join(lockPath, "owner.json"),
+          `${JSON.stringify({
+            schemaVersion: 1,
+            pid: process.pid,
+            createdAt: new Date().toISOString(),
+            token,
+            operation: "research-memory mutation",
+          })}\n`,
+        );
+      } catch (ownerError) {
+        // We exclusively created this directory and have not published an
+        // owner token. Do not strand an ownerless lock if publication fails.
+        await rm(lockPath, { recursive: true, force: true });
+        throw ownerError;
+      }
       break;
     } catch (error) {
       if (error.code !== "EEXIST") throw error;
       try {
         const details = await stat(lockPath);
-        if (Date.now() - details.mtimeMs > 60_000) {
-          await rm(lockPath, { recursive: true, force: true });
+        const owner = await readJsonStrict(path.join(lockPath, "owner.json"), { optional: true });
+        let ownerAlive = true;
+        if (Number.isInteger(owner?.pid) && owner.pid > 0) {
+          try {
+            process.kill(owner.pid, 0);
+          } catch (probeError) {
+            ownerAlive = probeError?.code === "EPERM";
+          }
+        }
+        // Match the native lock contract: ownerless locks are never guessed
+        // stale, and a dead token/PID owner is quarantined before removal so a
+        // newly-created replacement can never be deleted by delayed cleanup.
+        if (Date.now() - details.mtimeMs > 60_000 && owner?.token && !ownerAlive) {
+          const quarantinePath = `${lockPath}.stale.${randomUUID()}`;
+          await rename(lockPath, quarantinePath);
+          await rm(quarantinePath, { recursive: true, force: true });
           continue;
         }
       } catch (statError) {
         if (statError.code === "ENOENT") continue;
-        throw statError;
+        // An owner file can be briefly absent while the lock creator is
+        // fsyncing it. Treat that state as busy rather than deleting the lock.
+        if (!(statError instanceof SyntaxError)) throw statError;
       }
       if (Date.now() >= deadline) fail(`timed out waiting for research-memory lock: ${lockPath}`);
       await new Promise((resolve) => setTimeout(resolve, 40));
@@ -170,7 +205,8 @@ export async function withMemoryLock(support, callback) {
   try {
     return await callback();
   } finally {
-    await rm(lockPath, { recursive: true, force: true });
+    const owner = await readJsonStrict(path.join(lockPath, "owner.json"), { optional: true });
+    if (owner?.token === token) await rm(lockPath, { recursive: true, force: true });
   }
 }
 
@@ -295,6 +331,111 @@ export function validateMemoryDraft(draft) {
   const supersedes = stringArray(draft.supersedes, "supersedes");
   if (state !== "active" && supersedes.length > 0) fail("only an active new memory may supersede older memory");
   const content = requireString(draft.content, "memory content", new Set(["code", "experiment"]).has(type) ? 20_000 : 1_000_000);
+  const hasRegionScope = draft.scope !== undefined && draft.scope !== null;
+  const hasRegionPresentation = draft.presentation !== undefined && draft.presentation !== null;
+  if (hasRegionScope !== hasRegionPresentation) {
+    fail("region documents require both scope and presentation metadata");
+  }
+  let scope = null;
+  let presentation = null;
+  let source = draft.source ?? null;
+  if (hasRegionScope) {
+    if (type !== "project_context") fail("region documents must use project_context memory type");
+    if (state !== "active") fail("a new region document must start active");
+    if (provenance !== "user" || evidenceState !== "user_declared") {
+      fail("region documents created by the App must remain user/user_declared");
+    }
+    if (paperEvidence.length > 0 || computationArtifact || draft.taskHash) {
+      fail("region documents cannot silently carry paper evidence, computation artifacts, or task adoption");
+    }
+    if (!draft.scope || typeof draft.scope !== "object" || Array.isArray(draft.scope)) {
+      fail("region document scope must be an object");
+    }
+    const allowedScopeKeys = new Set([
+      "kind", "categoryId", "categoryNameAtAssignment", "graphRevisionAtAssignment",
+    ]);
+    for (const key of Object.keys(draft.scope)) {
+      if (!allowedScopeKeys.has(key)) fail(`region document scope.${key} is not supported`);
+    }
+    if (draft.scope.kind !== "nebula_region") fail("region document scope.kind must be nebula_region");
+    if (!Number.isInteger(draft.scope.graphRevisionAtAssignment) || draft.scope.graphRevisionAtAssignment < 0) {
+      fail("region document graphRevisionAtAssignment must be a non-negative integer");
+    }
+    scope = {
+      kind: "nebula_region",
+      categoryId: requireString(draft.scope.categoryId, "region document categoryId", 256),
+      categoryNameAtAssignment: requireString(
+        draft.scope.categoryNameAtAssignment,
+        "region document categoryNameAtAssignment",
+        1_000,
+      ),
+      graphRevisionAtAssignment: draft.scope.graphRevisionAtAssignment,
+    };
+
+    if (!draft.presentation || typeof draft.presentation !== "object" || Array.isArray(draft.presentation)) {
+      fail("region document presentation must be an object");
+    }
+    const allowedPresentationKeys = new Set(["documentId", "kind", "format"]);
+    for (const key of Object.keys(draft.presentation)) {
+      if (!allowedPresentationKeys.has(key)) fail(`region document presentation.${key} is not supported`);
+    }
+    const documentId = requireString(draft.presentation.documentId, "region document documentId", 256);
+    if (!REGION_DOCUMENT_ID.test(documentId)) {
+      fail("region document documentId must start with regiondoc- and use lowercase slug characters");
+    }
+    if (!REGION_DOCUMENT_KINDS.has(draft.presentation.kind)) {
+      fail("region document presentation.kind must be note or knowledge_card");
+    }
+    if (!REGION_DOCUMENT_FORMATS.has(draft.presentation.format)) {
+      fail("region document presentation.format must be markdown or plain_text");
+    }
+    presentation = {
+      documentId,
+      kind: draft.presentation.kind,
+      format: draft.presentation.format,
+    };
+
+    if (!source || typeof source !== "object" || Array.isArray(source) || source.kind !== "app_region_document") {
+      fail("region documents require app_region_document source metadata");
+    }
+    const allowedSourceKeys = new Set([
+      "kind", "input", "fileName", "byteLength", "contentSha256",
+    ]);
+    for (const key of Object.keys(source)) {
+      if (!allowedSourceKeys.has(key)) fail(`region document source.${key} is not supported`);
+    }
+    if (!REGION_DOCUMENT_INPUTS.has(source.input)) {
+      fail("region document source.input must be manual or file_import");
+    }
+    if (!Number.isInteger(source.byteLength) || source.byteLength < 1 || source.byteLength > MAX_REGION_DOCUMENT_BYTES) {
+      fail(`region document source.byteLength must be from 1 through ${MAX_REGION_DOCUMENT_BYTES}`);
+    }
+    const encodedLength = Buffer.byteLength(content, "utf8");
+    if (encodedLength !== source.byteLength) fail("region document byteLength does not match its UTF-8 content");
+    if (!HASH.test(source.contentSha256 ?? "") || source.contentSha256 !== sha256(content)) {
+      fail("region document contentSha256 does not match its UTF-8 content");
+    }
+    let fileName = null;
+    if (source.input === "file_import") {
+      fileName = requireString(source.fileName, "region document fileName", 255);
+      if (fileName.includes("/") || fileName.includes("\\") || fileName.includes("\0")) {
+        fail("region document fileName must be a basename");
+      }
+      const extension = fileName.toLocaleLowerCase().split(".").pop();
+      const expectedFormat = extension === "md" ? "markdown" : extension === "txt" ? "plain_text" : null;
+      if (!expectedFormat) fail("region document imports must use a .md or .txt filename");
+      if (presentation.format !== expectedFormat) fail("region document format must match its imported filename");
+    } else if (source.fileName !== undefined && source.fileName !== null) {
+      fail("manual region documents cannot claim an imported fileName");
+    }
+    source = {
+      kind: "app_region_document",
+      input: source.input,
+      ...(fileName ? { fileName } : {}),
+      byteLength: source.byteLength,
+      contentSha256: source.contentSha256,
+    };
+  }
   return {
     memoryId,
     type,
@@ -308,7 +449,9 @@ export function validateMemoryDraft(draft) {
     paperEvidence,
     computationArtifact,
     taskHash: draft.taskHash ?? null,
-    source: draft.source ?? null,
+    source,
+    scope,
+    presentation,
   };
 }
 
@@ -368,6 +511,22 @@ export function applyEvents(projectId, events) {
         for (const targetId of [...draft.supersedes, ...draft.contradicts]) {
           if (!state.memories.has(targetId)) fail(`memory relationship target does not exist: ${targetId}`);
           if (targetId === draft.memoryId) fail("memory cannot relate to itself");
+        }
+        if (draft.presentation) {
+          const activeVersion = [...state.memories.values()].find(
+            (candidate) => candidate.state === "active"
+              && candidate.presentation?.documentId === draft.presentation.documentId,
+          );
+          if (activeVersion && !draft.supersedes.includes(activeVersion.memoryId)) {
+            fail(`region document already has an active version: ${draft.presentation.documentId}`);
+          }
+          for (const supersededId of draft.supersedes) {
+            const superseded = state.memories.get(supersededId);
+            if (superseded?.presentation?.documentId
+                && superseded.presentation.documentId !== draft.presentation.documentId) {
+              fail("a region document may only supersede a version of the same documentId");
+            }
+          }
         }
         const item = {
           ...draft,
@@ -728,7 +887,17 @@ export async function importResearchInformation(filePath) {
 
 export function memorySearchScore(item, queryTerms) {
   if (queryTerms.length === 0) return 1;
-  const fields = [item.title, item.content, item.type, item.evidenceState, item.provenance]
+  const fields = [
+    item.title,
+    item.content,
+    item.type,
+    item.evidenceState,
+    item.provenance,
+    item.scope?.categoryId,
+    item.scope?.categoryNameAtAssignment,
+    item.presentation?.kind,
+    item.presentation?.format,
+  ]
     .filter(Boolean)
     .join("\n")
     .toLocaleLowerCase();

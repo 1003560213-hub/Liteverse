@@ -2,9 +2,10 @@
 
 ## Assignment contract
 
-- Do not install, preserve, or prefer a fixed default taxonomy. Existing regions are historical state, not an automatic recommendation.
-- Search the complete available corpus and prepare exactly three materially distinct partition options before assigning regions.
-- Ask the user to choose one option. Do not classify or stage from a proposal alone.
+- Do not install or prefer a fixed default taxonomy. A valid explicitly selected taxonomy is durable project state and should be reused for ordinary incremental additions; it is not a default for a new universe.
+- Search the complete corpus and prepare exactly three materially distinct partition options only for first initialization, an explicit user-requested repartition, or a stable novel-cluster advisory that passes the creation gate below.
+- For ordinary additions, run `screen-incremental-classification.mjs`, treat all scores as routing-only, and scientifically confirm the new papers against the existing regions. Do not reclassify unchanged papers.
+- When three options are required, ask the user to choose one. Do not classify or stage from a proposal alone.
 - Keep each option between one and ten macro regions.
 - Give every paper exactly one `primaryCategory` and at most one `secondaryCategory`.
 - Record methods, targets, regimes, observables, codes, and model variants as tags rather than regions.
@@ -29,7 +30,34 @@ When applying a choice, persist each macro region's nebula identity. Reused cate
 
 Persist the spatial layout at the same time. An unchanged reused region may retain its finite center and acts as an occupied footprint for subsequent placement. Generate all other macro centers deterministically from option order and the assignment seed on a bounded ellipsoidal/Fibonacci distribution sized for the existing universe view. Score those three-dimensional candidates against the hash-pinned default-background occupancy profile and the App's default-camera projection: prefer visually blank footprints, softly penalize projected nebula overlap and window-chrome intrusion, then retain normalized three-dimensional separation as a depth-preserving reward. This is a soft preference, not a collision ban; crowded layouts up to ten regions may overlap. If the packaged default background or its crop changes, regenerate and re-pin the profile before release. Regenerate every paper position from stable paper-ID ordering and a golden-angle three-dimensional cloud around its primary center. Positions must be unique, finite, reproducible, and remain within the region cloud radius; never leave positions tied to the previous taxonomy.
 
+## Nested galaxy routing
+
+After card finalization, claims, and relation review are complete, the staging gate derives galaxies inside each selected macro nebula. These are routing and visualization groups, not additional scientific categories, so they require no fourth partition proposal and must never change the user's selected macro taxonomy. Every paper belongs to exactly one galaxy under its primary region. One through three papers form one galaxy; larger regions normally use approximately one galaxy per five papers, with at least two and never more than twelve. Existing v2 anchor-based IDs, concentric-orbit positions, assets, and compatible memberships remain stable as papers are added.
+
+Place each region's galaxies around its central knowledge black hole on deterministic three-dimensional rings. Fill all four inner-ring slots before using the eight-slot outer ring, preserve the black-hole clearance, and refuse a placement that would violate the minimum galaxy-center separation. The depth component is part of the persisted position and must not be flattened by Curator or App fallback. Across the full universe, assign every supplied galaxy image before reusing one; after exhaustion, balance usage globally and resolve ties from the stable hierarchy seed. These rules are implemented by the shared hierarchy contract, never duplicated in a Skill-only approximation.
+
+Deterministic routing may use normalized tags and the topology/status of already reviewed paper relations only to choose a visual group. It must not persist or display that internal affinity as scientific similarity, relationship strength, or confidence. Galaxy-to-galaxy lanes are derived from the original paper relations at runtime; do not create aggregate scientific relations, add percentages, duplicate evidence, or alter Usage.
+
 After an explicit choice, `apply-partition-choice.mjs` revalidates all three options and locks, selects exactly one option, appends the user decision, and emits an ordinary unstaged snapshot. Any revision, snapshot, or artifact drift invalidates the proposal and requires three fresh options.
+
+## Incremental classification lease
+
+A selected taxonomy remains in force until the user requests repartition or the
+stable novel-cluster gate is met. Screen only the incoming papers against
+profiles built from current region names, descriptions, and member literature:
+
+```bash
+node scripts/screen-incremental-classification.mjs \
+  --snapshot <unstaged-snapshot.json> --input <new-papers.json>
+```
+
+The output is deterministic, `routingOnly: true`, and never writes a graph.
+Its 0–100 match values are lexical routing diagnostics, not scientific
+similarity or relationship strength. Confirm assignments using the paper's
+original-page evidence. A single low-fit paper remains provisional in the
+nearest region. Only at least four low-fit papers with at least 70% provisional
+within-cluster consistency may trigger three new full-corpus options; the
+ordinary screener never creates a category or applies an assignment itself.
 
 ## Empty workspace bootstrap
 

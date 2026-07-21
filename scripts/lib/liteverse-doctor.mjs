@@ -3,14 +3,18 @@ import path from "node:path";
 import {
   artifactFields,
   atomicWriteJson,
+  exists,
   parseCard,
   readJson,
   resolveManagedPath,
+  resolveSourcePdfPath,
   sha256File,
   sha256Text,
   snapshotPaperArtifact,
+  validateLinkedSourcePath,
 } from "./liteverse-core.mjs";
 import { ensureSearchIndex, rebuildSearchIndex } from "./liteverse-search.mjs";
+import { inspectGalaxyHierarchy } from "./liteverse-galaxy-hierarchy.mjs";
 
 function finding(severity, code, message, details = undefined) {
   return { severity, code, message, ...(details === undefined ? {} : { details }) };
@@ -28,6 +32,18 @@ async function inspect(support, { deep = true } = {}) {
   const index = await readJson(indexPath);
   if (!Array.isArray(graph?.papers)) throw new Error(`Graph/current.json has no papers array: ${graphPath}`);
   if (!Array.isArray(index?.papers)) throw new Error(`Knowledge/papers.json has no papers array: ${indexPath}`);
+  const galaxyHierarchy = inspectGalaxyHierarchy(graph);
+  if (!galaxyHierarchy.present && graph.papers.length) {
+    findings.push(finding(
+      "warning",
+      "hierarchy.missing",
+      "Graph/current.json has no deterministic galaxy hierarchy; the next Curator Refresh will add it",
+    ));
+  } else {
+    for (const item of galaxyHierarchy.issues) {
+      findings.push(finding("error", item.code, item.message, item.details));
+    }
+  }
   const graphById = new Map(graph.papers.map((paper) => [paper.id, paper]));
   const indexById = new Map(index.papers.map((paper) => [paper.paperId, paper]));
   const records = [];
@@ -40,7 +56,22 @@ async function inspect(support, { deep = true } = {}) {
     }
     const cardPath = resolveManagedPath(support, indexed.cardPath ?? graphPaper.markdownPath, `Knowledge/cards/${paperId}.md`);
     const fulltextPath = resolveManagedPath(support, indexed.fulltextPath ?? graphPaper.fulltextPath, `Knowledge/fulltext/${paperId}.md`);
-    const pdfPath = resolveManagedPath(support, indexed.pdfPath ?? indexed.source?.pdfPath ?? graphPaper.source?.pdfPath, `Library/PDFs/${paperId}.pdf`);
+    const indexedSource = resolveSourcePdfPath(support, indexed, `Library/PDFs/${paperId}.pdf`);
+    const graphSource = resolveSourcePdfPath(support, graphPaper, `Library/PDFs/${paperId}.pdf`);
+    if (
+      indexedSource.storageMode !== graphSource.storageMode
+      || indexedSource.sourcePath !== graphSource.sourcePath
+      || indexedSource.linkedRootPath !== graphSource.linkedRootPath
+      || indexedSource.relativePath !== graphSource.relativePath
+    ) {
+      findings.push(finding(
+        "error",
+        "source.reference_drift",
+        `${paperId}: Knowledge/papers.json and Graph/current.json reference different source PDFs`,
+        { indexed: indexedSource, graph: graphSource },
+      ));
+    }
+    const { pdfPath, storageMode, sourcePath } = indexedSource;
     let cardText;
     let fulltextText;
     try {
@@ -51,6 +82,16 @@ async function inspect(support, { deep = true } = {}) {
     }
     const card = parseCard(cardText, paperId);
     const cardStatus = statusOfCard(card);
+    const cardStorageMode = card.metadata.source_storage_mode ?? "managed";
+    const cardSourcePath = card.metadata.source_pdf_path ?? (cardStorageMode === "managed" ? sourcePath : null);
+    if (cardStorageMode !== storageMode || cardSourcePath !== sourcePath) {
+      findings.push(finding(
+        "error",
+        "source.card_reference_drift",
+        `${paperId}: card source reference does not match the indexed ${storageMode} PDF`,
+        { cardStorageMode, cardSourcePath, indexedStorageMode: storageMode, indexedSourcePath: sourcePath },
+      ));
+    }
     if (indexed.verificationStatus !== cardStatus) {
       findings.push(finding("warning", "projection.verification_status_drift", `${paperId}: papers.json=${indexed.verificationStatus ?? "<missing>"}, card=${cardStatus}`));
     }
@@ -59,7 +100,34 @@ async function inspect(support, { deep = true } = {}) {
     }
     const expectedSource = indexed.source?.sha256 ?? indexed.sha256 ?? graphPaper.source?.sha256 ?? card.sourceSha256;
     let actualSource = expectedSource;
-    if (deep) {
+    let sourceAvailable = false;
+    if (storageMode === "linked") {
+      try {
+        await validateLinkedSourcePath(indexedSource);
+        sourceAvailable = true;
+      } catch (error) {
+        actualSource = null;
+        findings.push(finding(
+          "error",
+          error.code === "ENOENT" ? "source.linked_missing" : "source.linked_unsafe",
+          `${paperId}: linked source PDF cannot be trusted at ${pdfPath}: ${error.message}`,
+          { storageMode, sourcePath },
+        ));
+      }
+    } else {
+      sourceAvailable = await exists(pdfPath);
+    }
+    if (!sourceAvailable) {
+      actualSource = null;
+      if (storageMode !== "linked") {
+        findings.push(finding(
+          "error",
+          "source.managed_missing",
+          `${paperId}: managed source PDF is missing at ${pdfPath}`,
+          { storageMode, sourcePath },
+        ));
+      }
+    } else if (deep) {
       try {
         actualSource = await sha256File(pdfPath);
       } catch (error) {
@@ -92,7 +160,19 @@ async function inspect(support, { deep = true } = {}) {
       // Graph/current is immutable. This is resolved by the next Curator staged refresh.
       records.push({ graphUnpinned: true });
     }
-    records.push({ paperId, indexed, graphPaper, card, cardText, fulltextText, pdfPath, expectedSource, actualSource });
+    records.push({
+      paperId,
+      indexed,
+      graphPaper,
+      card,
+      cardText,
+      fulltextText,
+      pdfPath,
+      storageMode,
+      sourcePath,
+      expectedSource,
+      actualSource,
+    });
   }
   const orphans = index.papers.filter((paper) => !graphById.has(paper.paperId)).map((paper) => paper.paperId);
   if (orphans.length) findings.push(finding("warning", "projection.orphan_papers", `${orphans.length} indexed papers are not in Graph/current.json`, orphans));
@@ -100,7 +180,15 @@ async function inspect(support, { deep = true } = {}) {
   if (unpinnedCount) {
     findings.push(finding("warning", "graph.artifacts_unpinned", `${unpinnedCount} graph papers need artifact revision locks in the next Curator staged Refresh`));
   }
-  return { graph, index, graphPath, indexPath, records: records.filter((record) => record.paperId), findings };
+  return {
+    graph,
+    index,
+    graphPath,
+    indexPath,
+    records: records.filter((record) => record.paperId),
+    galaxyHierarchy,
+    findings,
+  };
 }
 
 function summarize(findings) {
@@ -166,6 +254,8 @@ export async function doctorLiteverse(support, { fix = false, deep = true, rebui
     status: summarize(after.findings).error ? "error" : summarize(after.findings).warning ? "warning" : "healthy",
     graphRevision: after.graph.revision ?? null,
     paperCount: after.graph.papers.length,
+    galaxyCount: after.galaxyHierarchy.galaxyCount,
+    hierarchyPresent: after.galaxyHierarchy.present,
     fixed: fix,
     updatedPapers,
     artifactRevisionsCreated,

@@ -5,6 +5,7 @@ import process from "node:process";
 const root = path.resolve(import.meta.dirname, "..");
 const generatedDirectories = new Set([
   ".git",
+  ".gitnexus",
   ".next",
   ".vinext",
   ".wrangler",

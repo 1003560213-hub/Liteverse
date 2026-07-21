@@ -60,6 +60,20 @@ int main(int argc, const char *argv[]) {
       fputc('\n', stdout);
       return 0;
     }
+    if (argc == 4 && strcmp(argv[1], "linked-scan") == 0) {
+      LiteverseBackupTestDelegate *delegate = [[LiteverseBackupTestDelegate alloc] init];
+      delegate.testSupportURL = [[NSURL fileURLWithPath:[NSString stringWithUTF8String:argv[2]] isDirectory:YES]
+          URLByResolvingSymlinksInPath];
+      NSURL *rootURL = [NSURL fileURLWithPath:[NSString stringWithUTF8String:argv[3]] isDirectory:YES];
+      NSError *error = nil;
+      NSArray *descriptors = [delegate linkedPDFDescriptorsUnderRootURL:rootURL error:&error];
+      if (!descriptors) return reportFailure(error);
+      NSData *json = [NSJSONSerialization dataWithJSONObject:descriptors options:0 error:&error];
+      if (!json) return reportFailure(error);
+      fwrite(json.bytes, 1, json.length, stdout);
+      fputc('\n', stdout);
+      return 0;
+    }
     if (argc == 2) {
       LiteverseAppDelegate *delegate = [[LiteverseAppDelegate alloc] init];
       NSError *error = nil;
@@ -94,7 +108,7 @@ int main(int argc, const char *argv[]) {
       return 0;
     }
     {
-      fprintf(stderr, "usage: native-backup-validator <backup-directory> | partition <support> | search <support> <query> | import <backup> <support> | export <support> <destination> <include-pdfs>\n");
+      fprintf(stderr, "usage: native-backup-validator <backup-directory> | partition <support> | linked-scan <support> <folder> | search <support> <query> | import <backup> <support> | export <support> <destination> <include-pdfs>\n");
       return 64;
     }
   }
