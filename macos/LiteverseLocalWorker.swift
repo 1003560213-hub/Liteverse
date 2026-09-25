@@ -1683,7 +1683,10 @@ private func runMaterialize(_ job: JobRequest) throws -> [String: Any] {
     let fileManager = FileManager.default
     let pipeline = job.supportDirectory.appendingPathComponent("Work/LocalPipeline", isDirectory: true)
     try fileManager.createDirectory(at: pipeline, withIntermediateDirectories: true)
-    let lock = try WorkerLock(at: pipeline.appendingPathComponent(".worker.lock"))
+    // Jobs are independent; lock per job so several PDFs can be read in parallel.
+    let locks = pipeline.appendingPathComponent(".locks", isDirectory: true)
+    try fileManager.createDirectory(at: locks, withIntermediateDirectories: true)
+    let lock = try WorkerLock(at: locks.appendingPathComponent("\(job.jobID).lock"))
     defer { withExtendedLifetime(lock) {} }
 
     let liveCatalogFingerprint = try catalogFingerprint(at: job.supportDirectory)

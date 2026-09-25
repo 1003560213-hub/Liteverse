@@ -1,4 +1,5 @@
-import { readFile, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { readFile, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 
 const root = path.resolve(import.meta.dirname, "..");
@@ -64,3 +65,25 @@ html = html
 
 await writeFile(indexPath, html, "utf8");
 console.log("Liteverse desktop assets inlined into index.html.");
+
+// Embed the Blender-generated point clouds as a classic script. WKWebView
+// loads classic scripts from file:// URLs, but fetch() of file:// URLs is not
+// supported, so the renderer reads window.__LITEVERSE_UNIVERSE_ASSETS instead.
+const universeDirectory = path.join(outputDirectory, "universe");
+const manifest = JSON.parse(await readFile(path.join(universeDirectory, "manifest.json"), "utf8"));
+const files = {};
+for (const entry of [...manifest.galaxies, manifest.deepField]) {
+  const bytes = await readFile(path.join(universeDirectory, entry.file));
+  const digest = createHash("sha256").update(bytes).digest("hex");
+  if (digest !== entry.sha256) throw new Error(`Universe asset ${entry.file} does not match its manifest hash.`);
+  files[entry.file] = bytes.toString("base64");
+}
+await writeFile(
+  path.join(universeDirectory, "assets.js"),
+  `window.__LITEVERSE_UNIVERSE_ASSETS = ${JSON.stringify({ manifest, files })};\n`,
+  "utf8",
+);
+for (const entry of [...manifest.galaxies, manifest.deepField]) {
+  await rm(path.join(universeDirectory, entry.file));
+}
+console.log("Liteverse universe assets embedded into universe/assets.js.");

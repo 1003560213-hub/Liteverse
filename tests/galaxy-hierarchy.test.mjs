@@ -88,7 +88,9 @@ test("galaxy materialization is deterministic, additive, and preserves scientifi
   assert.equal(first.galaxies.filter((galaxy) => galaxy.categoryId === "nebula-1").length, targetGalaxyCount(12));
   assert.equal(first.galaxies.filter((galaxy) => galaxy.categoryId === "nebula-2").length, targetGalaxyCount(7));
   assert.ok(first.galaxies.every((galaxy) => GALAXY_ASSET_IDS.includes(galaxy.assetId)));
-  await Promise.all(GALAXY_ASSET_IDS.map((assetId) => access(path.join(root, "public", "galaxies", assetId))));
+  // Since 0.6 galaxy asset ids are stable identity slots mapped onto the ten
+  // Blender archetypes; the legacy PNG files are no longer shipped.
+  assert.equal(new Set(GALAXY_ASSET_IDS).size, 10);
   assert.ok(first.papers.every((item) => typeof item.galaxyId === "string"));
   assert.equal(new Set(first.papers.map((item) => item.id)).size, first.papers.length);
   assert.equal(JSON.stringify(first).includes("routingAffinity"), false);

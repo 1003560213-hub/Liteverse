@@ -305,7 +305,7 @@ test("native worker materializes a PDF atomically and detects a strict hash dupl
   assert.equal(await pathExists(path.join(support, "Projects")), false);
   assert.deepEqual(
     (await readdir(path.join(support, "Work", "LocalPipeline")))
-      .filter((entry) => entry !== ".worker.lock")
+      .filter((entry) => !entry.startsWith("."))
       .sort(),
     ["local-pdf-one"],
   );

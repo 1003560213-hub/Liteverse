@@ -40,31 +40,21 @@ done
   -framework Cocoa \
   -framework UniformTypeIdentifiers \
   -framework WebKit \
+  -framework PDFKit \
+  -framework IOKit \
   -lsqlite3 \
   "$ROOT/macos/LiteverseApp.m" \
   -o "$CONTENTS/MacOS/Liteverse"
 
 /bin/zsh "$ROOT/scripts/build-local-worker.sh" "$CONTENTS/MacOS/LiteverseLocalWorker"
+/bin/zsh "$ROOT/scripts/build-intelligence-helper.sh" "$CONTENTS/MacOS/LiteverseIntelligence"
 
 /usr/bin/ditto "$ROOT/dist-desktop" "$CONTENTS/Resources/web"
 /usr/bin/find "$CONTENTS/Resources/web" -name '.DS_Store' -delete
-# The UI never displays these sources above the sizes below. Pre-scaling the
-# packaged copies avoids decoding multi-megapixel artwork just to immediately
-# downsample it into an offscreen canvas; the original user assets stay intact.
+# Only the small brand mark is shown as an image; everything in the sky is
+# drawn from the Blender point clouds embedded in universe/assets.js.
 /usr/bin/sips -z 256 256 "$ROOT/public/liteverse-brand.png" \
   --out "$CONTENTS/Resources/web/liteverse-brand.png" >/dev/null
-/usr/bin/sips -c 355 355 --cropOffset 120 630 "$ROOT/public/liteverse-star-source.png" \
-  --out "$CONTENTS/Resources/web/liteverse-star-source.png" >/dev/null
-/usr/bin/sips -z 256 256 "$CONTENTS/Resources/web/liteverse-star-source.png" \
-  --out "$CONTENTS/Resources/web/liteverse-star-source.png" >/dev/null
-for REGION_ASSET in "$CONTENTS/Resources/web/nebula-regions"/*.png; do
-  /usr/bin/sips -Z 768 "$REGION_ASSET" --out "$REGION_ASSET" >/dev/null
-done
-for GALAXY_ASSET in "$CONTENTS/Resources/web/galaxies"/*.png; do
-  /usr/bin/sips -Z 768 "$GALAXY_ASSET" --out "$GALAXY_ASSET" >/dev/null
-done
-/usr/bin/sips -Z 768 "$CONTENTS/Resources/web/liteverse-black-hole-transparent.png" \
-  --out "$CONTENTS/Resources/web/liteverse-black-hole-transparent.png" >/dev/null
 /bin/cp "$ROOT/data/empty-universe.json" "$CONTENTS/Resources/seed-universe.json"
 mkdir -p "$CONTENTS/Resources/CodexSkills"
 /usr/bin/rsync -a --delete --exclude '__pycache__' --exclude '*.py[cod]' \

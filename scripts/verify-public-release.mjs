@@ -24,6 +24,7 @@ const binaryExtensions = new Set([
   ".ico",
   ".jpeg",
   ".jpg",
+  ".lvpc",
   ".pdf",
   ".png",
   ".sqlite",

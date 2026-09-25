@@ -67,14 +67,10 @@ for (const asset of nebulaAssets) {
   }
   nebulaAssetIds.add(asset.id);
   nebulaAssetSources.add(asset.src);
+  // Since 0.6 region styles are drawn procedurally; the catalog keeps stable
+  // style slots (ids) and the legacy source names for older workspaces.
   if (!asset.src?.startsWith("./")) {
     errors.push(`${asset.id}: the nebula asset path must begin with ./`);
-  } else {
-    try {
-      await access(path.join(root, "public", asset.src.slice(2)));
-    } catch {
-      errors.push(`${asset.id}: nebula artwork does not exist at ${asset.src}`);
-    }
   }
 }
 

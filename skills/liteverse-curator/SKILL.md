@@ -26,6 +26,12 @@ Prepare deterministically, review source-pinned evidence in bounded batches, the
 15. Validate and publish the complete staged revision with `scripts/stage-refresh.mjs --library-items <adoption-library-items.json>`. It materializes the nebula→galaxy→paper routing hierarchy, re-hashes linked PDFs, writes `Graph/staged/<refresh-id>/` and `Graph/pending-update.json`, and never promotes current.
 16. Mark exactly one annotation with `scripts/mark-annotation.mjs --id <id> --revision <n> --refresh-id <id> --derived-file <path>`. Never bulk-mark annotations.
 
+## Tier-0 routing and galaxy digests (0.6+)
+
+- Run `node scripts/liteverse-cli.mjs tier0 build` to refresh the rebuildable Tier-0 cache (verbatim key points, references, in-library citation edges, similarity neighbours, Leiden clusters). Use it to route: citation contexts are the best first evidence locators for a relation, and clusters suggest galaxy membership. It is never evidence and never changes truth.
+- For many papers, digest one galaxy per request: `digest packet --galaxy <id>`, answer only from the packet's quotation IDs, then `digest apply`. Digest relations stay `candidate`; formal relationships still need located evidence from both original papers and `score-connection.mjs`.
+- Explicit citation matches in Tier-0 (`match: "exact"`) may supplement a relation shortlist; `probable` matches must be confirmed against the reference entry first.
+
 ## Maintenance-only localization and relayout
 
 - Use `scripts/prepare-layout-localization.mjs` only when the user explicitly asks to retain the selected taxonomy while translating every graph-visible title, category, paper summary/project role/tag, and relation label, and/or recomputing all existing nebula centers. Supply an exact-ID English translation map, `--confirmed-by-user`, an English confirmation note, and an ISO decision time.

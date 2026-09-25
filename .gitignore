@@ -54,3 +54,5 @@ next-env.d.ts
 *.sqlite-wal
 __pycache__/
 *.py[cod]
+/tools/blender/out/
+/test-results/

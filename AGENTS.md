@@ -54,6 +54,37 @@ materializer. Local preparation, review packets, and candidate scores are never
 scientific evidence and never promote a card, relationship, classification, or
 Usage count.
 
+## Evidence tiers (since 0.6)
+
+Every paper carries exactly one visible tier. Never relabel one tier as another.
+
+- **Tier 0 — Extracted.** `scripts/lib/liteverse-tier0.mjs` (shared by the App
+  and `liteverse tier0 build`) derives the abstract, up to eight verbatim key
+  points with page and character locators, quantities, parsed references,
+  in-library citation edges, similarity neighbours, and Leiden clusters. It is
+  deterministic and rebuildable, and it lives only in `Cache/Tier0/`. A
+  citation edge is a bibliographic fact ("A cites B"), never a scientific
+  relationship. Tier-0 text is routing and reading material, not evidence.
+- **Tier 1 — Reviewed / AI digest.** For AI curation at scale, prefer one
+  galaxy per packet: `liteverse digest packet --galaxy <id>` and
+  `liteverse digest apply --galaxy <id> --packet <p> --digest <d>`. Every digest
+  cell and relation must cite quotation IDs from the packet, and every relation
+  must cite both papers; `apply` rejects anything else and stores the result
+  immutably under `Knowledge/digests/`. Digest relations remain `candidate`.
+  Curator Review Batches that produce `card_draft` papers are also Tier 1.
+- **Tier 2 — Verified.** Only the existing original-page review produces
+  `evidence_verified`. Run it on demand (a paper adopted into a task, a user
+  request, or a relation to be verified), not for every imported paper.
+
+Apple Intelligence summaries (macOS 26, `LiteverseIntelligence` helper) are
+on-device drafts generated from Tier-0 quotations. They are stored in
+`Cache/Intelligence/`, are labelled as drafts, and must never be used as
+evidence, copied into cards or claims, or counted as Usage.
+
+The App's automatic regions for unreviewed papers are a view over Tier-0
+clusters. Choosing an automatic layout in the App changes only that view; a
+formal macro-region decision still follows the partition rules below.
+
 For a queue larger than one or two papers, keep mechanical work out of the
 model context. Build deterministic 3–5-paper Review Batches, reopen only the
 source-pinned original pages selected for scientific review, apply decisions,
@@ -87,8 +118,10 @@ otherwise reusable paper through extra scientific review.
 
 Do not split these responsibilities into per-feature Skills. The CLI is the
 provider-neutral interface; Codex is the first adapter. Liteverse has no
-background daemon, bundled Node/Python runtime, local model, automatic online
-literature search, cloud sync, or shipped stdio MCP adapter.
+background daemon, bundled Node/Python runtime, bundled language model,
+automatic online literature search, cloud sync, or shipped stdio MCP adapter.
+The only local model it may call is the operating system's Apple Intelligence
+model, through the optional helper, for labelled draft summaries.
 
 ## Macro-region decisions
 
