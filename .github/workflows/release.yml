@@ -6,6 +6,12 @@ on:
   push:
     tags:
       - "v*"
+    # Merging a change to this file on main publishes the tag and commit it
+    # names; used when tags cannot be pushed directly.
+    branches:
+      - main
+    paths:
+      - .github/release-request.json
   workflow_dispatch:
     inputs:
       tag:
@@ -19,27 +25,43 @@ permissions:
   contents: write
 
 concurrency:
-  group: release-${{ github.event.inputs.tag || github.ref_name }}
+  group: release-${{ github.event.inputs.tag || github.ref_name || 'request' }}
   cancel-in-progress: false
 
 jobs:
   publish:
     runs-on: macos-26
     timeout-minutes: 60
-    env:
-      RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
-      RELEASE_TARGET: ${{ github.event.inputs.target }}
     steps:
+      - name: Resolve the requested release
+        env:
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+          INPUT_TARGET: ${{ github.event.inputs.target }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            echo "RELEASE_TAG=$GITHUB_REF_NAME" >> "$GITHUB_ENV"
+          elif [[ -n "${INPUT_TAG:-}" ]]; then
+            echo "RELEASE_TAG=$INPUT_TAG" >> "$GITHUB_ENV"
+            echo "RELEASE_TARGET=${INPUT_TARGET:-}" >> "$GITHUB_ENV"
+          else
+            request="$(gh api "repos/$GITHUB_REPOSITORY/contents/.github/release-request.json?ref=$GITHUB_SHA" \
+              -H "Accept: application/vnd.github.raw")"
+            echo "RELEASE_TAG=$(jq -r .tag <<<"$request")" >> "$GITHUB_ENV"
+            echo "RELEASE_TARGET=$(jq -r .target <<<"$request")" >> "$GITHUB_ENV"
+          fi
+
       - name: Check out tagged source
         uses: actions/checkout@v5
         with:
-          ref: ${{ github.event.inputs.target || env.RELEASE_TAG }}
+          ref: ${{ env.RELEASE_TARGET || env.RELEASE_TAG }}
           fetch-depth: 0
           path: source
           persist-credentials: false
 
       - name: Create the release tag locally when publishing a target commit
-        if: ${{ github.event.inputs.target != '' }}
+        if: ${{ env.RELEASE_TARGET != '' }}
         working-directory: source
         run: |
           set -euo pipefail
