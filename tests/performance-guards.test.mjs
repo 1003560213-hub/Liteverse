@@ -5,19 +5,9 @@ import test from "node:test";
 const componentPath = new URL("../app/universe/LiteratureUniverse.tsx", import.meta.url);
 const nativePath = new URL("../macos/LiteverseApp.m", import.meta.url);
 const packageScriptPath = new URL("../scripts/build-macos-app.sh", import.meta.url);
-
-test("catalog persistence cannot feed workspace health back into itself", async () => {
-  const [component, nativeBridge] = await Promise.all([
-    readFile(componentPath, "utf8"),
-    readFile(nativePath, "utf8"),
-  ]);
-
-  assert.match(component, /lastCatalogSyncFingerprintRef/);
-  assert.match(component, /action: "syncCatalog", items: catalogSyncItems/);
-  assert.doesNotMatch(component, /action: "syncCatalog", items: catalogLibraryItems/);
-  assert.match(component, /if \(lastCatalogSyncFingerprintRef\.current === fingerprint\) return/);
-  assert.match(nativeBridge, /if \(\[library isEqualToDictionary:storedLibrary\]\) return/);
-});
+const scenePath = new URL("../app/universe/sky/SkyScene.ts", import.meta.url);
+const shadersPath = new URL("../app/universe/sky/shaders.ts", import.meta.url);
+const stylesPath = new URL("../app/globals.css", import.meta.url);
 
 test("workspace integrity scans are cached and allocation bounded", async () => {
   const nativeBridge = await readFile(nativePath, "utf8");
@@ -32,44 +22,31 @@ test("workspace integrity scans are cached and allocation bounded", async () => 
   assert.match(nativeBridge, /if \(!missingPackagedAsset && !catalogVersionChanged\) return YES/);
 });
 
-test("cinematic renderer has explicit memory and frame budgets", async () => {
-  const [component, packageScript] = await Promise.all([
+test("the 3D renderer draws on demand and scales down on battery and heat", async () => {
+  const [scene, shaders, shell, packageScript] = await Promise.all([
+    readFile(scenePath, "utf8"),
+    readFile(shadersPath, "utf8"),
     readFile(componentPath, "utf8"),
     readFile(packageScriptPath, "utf8"),
   ]);
-
-  assert.match(component, /assignedNebulaAssetIds/);
-  assert.match(component, /if \(!assignedNebulaAssetIds\.has\(asset\.id\)\) continue/);
-  assert.match(component, /Math\.sqrt\(4_500_000 \/ Math\.max\(1, width \* height\)\)/);
-  assert.match(component, /const INTERACTION_FPS = 30/);
-  assert.match(component, /const IDLE_FPS = 12/);
-  assert.match(component, /const BACKGROUND_FPS = 4/);
-  assert.match(component, /const targetFps = windowFocused/);
-  assert.match(component, /activelyMoving[\s\S]*\? reducedMotion[\s\S]*\? IDLE_FPS[\s\S]*: INTERACTION_FPS[\s\S]*: reducedMotion[\s\S]*\? BACKGROUND_FPS[\s\S]*: IDLE_FPS[\s\S]*: BACKGROUND_FPS/);
-  assert.match(component, /if \(document\.hidden\) \{[\s\S]*frame = 0/);
-  assert.match(component, /categoryFilterRef\.current/);
-  assert.match(component, /backdropCanvas\.width = 0/);
-  assert.match(component, /regionNebulaSprites\.clear\(\)/);
-  assert.match(component, /const maximumDimension = 420/);
-  assert.match(component, /for \(const assetId of new Set[\s\S]*await loadGalaxySprite\(assetId\)/);
-  assert.match(component, /liteverse-black-hole-transparent\.png/);
-  assert.match(component, /const ALL_VIEW_AMBIENT_PAPERS_PER_NEBULA = 12/);
-  assert.match(component, /const FOCUSED_AMBIENT_PAPERS_PER_NEBULA = 48/);
-  assert.match(component, /ambientPaperSelections = new Map/);
-  assert.match(
-    component,
-    /const galaxyPositions = new Map\([\s\S]*containPointInNebulaEllipse\(rawPoint, categoryFrame, 0\.58, 0\.34\)/,
-  );
-  assert.match(component, /const source = galaxyPositions\.get\(sourceGalaxy\.id\)!/);
-  assert.match(component, /const target = galaxyPositions\.get\(targetGalaxy\.id\)!/);
-  const ambientStart = component.indexOf("const showAmbientPaperFlashes =");
-  const ambientEnd = component.indexOf("projectedGalaxiesRef.current", ambientStart);
-  assert.ok(ambientStart >= 0 && ambientEnd > ambientStart);
-  const ambientSection = component.slice(ambientStart, ambientEnd);
-  assert.match(ambientSection, /for \(const paperId of ambientPaperIds\)/);
-  assert.doesNotMatch(ambientSection, /for \(const paper of renderUniverse\.papers\)/);
-  assert.match(ambientSection, /containPointInNebulaEllipse/);
-  assert.doesNotMatch(component, /getImageData\(/);
-  assert.match(packageScript, /for GALAXY_ASSET in .*web\/galaxies.*\.png/);
-  assert.match(packageScript, /sips -Z 768 .*liteverse-black-hole-transparent\.png/);
+  // No perpetual animation loop: frames are requested only on change, during
+  // a transition, or by a capped ambient interval.
+  assert.match(scene, /invalidate\(\) \{\s*if \(this\.disposed \|\| this\.frameRequested\) return;/);
+  assert.match(scene, /if \(animating\) this\.invalidate\(\);/);
+  assert.doesNotMatch(scene, /requestAnimationFrame\(this\.frame\);\s*\n\s*this\.renderer\.render/);
+  assert.match(scene, /efficient: \{ pixelRatio: 1, pointsPerPixel2: 0\.5, minPoints: 900, ambientFps: 0 \}/);
+  assert.match(scene, /if \(this\.ambient && fps > 0 && !this\.disposed\)/);
+  // Level of detail: galaxies off screen are skipped and point budgets follow
+  // projected area.
+  assert.match(scene, /renderable\.group\.visible = onScreen;/);
+  assert.match(scene, /pixels \* pixels \* settings\.pointsPerPixel2/);
+  // Surface brightness is conserved across distance and level of detail.
+  assert.match(scene, /cloud\.sizeScale \* Math\.sqrt\(renderable\.maxCount \/ Math\.max\(1, count\)\)/);
+  assert.match(shaders, /coverage = max\(diameter \* diameter, 0\.002\)/);
+  // Power state drives quality and ambient motion.
+  assert.match(shell, /power\.lowPowerMode \|\| power\.onBattery \|\| power\.thermalState === "serious"/);
+  assert.match(shell, /ambientPreference && !constrained && !power\.occluded && documentVisible/);
+  // No stacked blur over the live scene; no PNG sticker artwork is packaged.
+  assert.doesNotMatch(await readFile(stylesPath, "utf8"), /backdrop-filter/);
+  assert.doesNotMatch(packageScript, /galaxies\/\*\.png|nebula-regions/);
 });

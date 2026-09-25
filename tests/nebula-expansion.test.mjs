@@ -13,10 +13,9 @@ import {
 const execFileAsync = promisify(execFile);
 
 test("packages ten unique region nebula assets and permits up to ten regions", async () => {
-  const [universeText, validator, styles, nativeBridge] = await Promise.all([
+  const [universeText, validator, nativeBridge] = await Promise.all([
     readFile(new URL("../data/universe.json", import.meta.url), "utf8"),
     readFile(new URL("../scripts/validate-universe.mjs", import.meta.url), "utf8"),
-    readFile(new URL("../app/globals.css", import.meta.url), "utf8"),
     readFile(new URL("../macos/LiteverseApp.m", import.meta.url), "utf8"),
   ]);
   const universe = JSON.parse(universeText);
@@ -36,15 +35,10 @@ test("packages ten unique region nebula assets and permits up to ten regions", a
       "./nebula-regions/nebula10.png",
     ],
   );
-  await Promise.all(
-    universe.visuals.nebulaAssets.map((asset) =>
-      access(new URL(`../public/${asset.src.slice(2)}`, import.meta.url)),
-    ),
-  );
+  // Since 0.6 region styles are procedural; the catalog keeps stable style
+  // slots and legacy source names, and no artwork file is required.
   assert.match(validator, /macroCategories\.length > 10/);
   assert.match(validator, /1-10/);
-  assert.match(styles, /\.nebula-switcher\s*\{[^}]*overflow-x: auto/s);
-  assert.match(styles, /\.nebula-switcher button\s*\{[^}]*flex: 0 0 auto/s);
   assert.match(nativeBridge, /synchronizePackagedNebulaAssetCatalogIfSafe/);
   assert.match(nativeBridge, /fileExistsAtPath:\[self pendingRefreshURL\]\.path/);
   assert.match(nativeBridge, /\.locks\/stage-refresh\.lock/);

@@ -16,62 +16,56 @@
   <a href="CONTRIBUTING.md">Contribute</a>
 </p>
 
-Liteverse turns a local literature library into an interactive research
-universe. Broad themes become nebulae, focused topics become galaxies, and
-papers become stars. The same evidence-aware library can give an AI assistant
-focused, traceable context without uploading an entire research workspace to a
-cloud service.
+Liteverse turns a folder of PDFs into a connected, readable map of your field.
+It reads every paper on your Mac, pulls out the key sentences with page
+references, links papers that cite each other, and arranges them as a 3D deep
+field: broad themes become galaxy clusters, focused topics become galaxies,
+and papers become stars.
 
-![Liteverse organizing a theoretical-physics literature library](docs/assets/liteverse-universe-demo.jpg)
-
-<p align="center">
-  <sub>
-    A real research library shown as nebulae and linked galaxies. Public
-    downloads start with an empty universe and contain no personal papers or
-    project data.
-  </sub>
-</p>
-
-## Move from themes to evidence
-
-![A Liteverse nebula divided into galaxies around its research-memory black hole](docs/assets/liteverse-galaxy-demo.jpg)
+![Liteverse showing a fictional demonstration library as a deep field of galaxy clusters](docs/assets/liteverse-universe-demo.jpg)
 
 <p align="center">
   <sub>
-    Open a nebula to explore its galaxies, relationship lanes, and central
-    research-memory black hole before opening individual paper stars.
+    A fictional demonstration library. Public downloads start with an empty
+    universe and contain no papers or project data.
   </sub>
 </p>
 
-## One local workspace
+## Read a large library quickly
 
-![Liteverse Settings for literature and research memory](docs/assets/liteverse-settings-demo.jpg)
+![Desk view with keyboard triage of extracted key points](docs/assets/liteverse-desk-demo.jpg)
 
-<p align="center">
-  <sub>
-    Add a PDF, register an arXiv paper, or link an existing local literature
-    folder without copying every source file into Liteverse.
-  </sub>
-</p>
+- **Key points in seconds, without AI.** Each paper gets its abstract, up to
+  eight verbatim key sentences (question, method, result, limitation,
+  assumption), quantities, and a parsed reference list. Every point links to its
+  page, and nothing is paraphrased or invented.
+- **Connections from citations.** Reference lists are matched to the papers you
+  already have, so you see who cites whom, the sentence where it happens, which
+  papers are foundational in your library, and a reading path through each
+  topic.
+- **Automatic organization.** Papers are grouped by shared references and
+  vocabulary into clusters and galaxies before any AI review.
+- **Desk mode for fast reading:** keyboard triage (J/K, Enter, O to open the PDF
+  at the quote), a galaxy brief, and a side-by-side comparison table.
+- **Optional Apple Intelligence summaries** on macOS 26, generated on your Mac
+  from the extracted key points and always labelled as drafts.
+- **Honest evidence tiers:** *Extracted* (local, verbatim), *Reviewed* (AI-curated
+  card drafts), and *Verified* (checked against the original pages). A tier is
+  never silently promoted.
 
-## What Liteverse does
+## A real deep universe, built for laptops
 
-- Organizes a large library as a movable hierarchy of up to ten broad nebulae,
-  focused galaxies, and individual paper stars.
-- Shows scientific relationships as parallel verified or candidate lanes
-  between galaxies, while retaining each paper-level evidence record.
-- Opens paper summaries, evidence, relationships, and personal annotations;
-  project notes live around each nebula's central black hole.
-- Accepts PDFs and arXiv links, links existing local folders without duplicating
-  their PDFs, and can read stored Zotero PDFs through a read-only intake path.
-- Performs hashing, extraction, strict duplicate checks, search indexing, and
-  small review batches locally before scientific interpretation is requested.
-- Searches verified literature and builds focused Context Packs for AI-assisted
-  research, writing, and code tasks.
-- Preserves project goals, decisions, code and experiment metadata, findings,
-  and open questions.
-- Makes frequently used research areas visually brighter without changing
-  scientific evidence or relationship scores.
+![Galaxy cluster with Blender-generated galaxies and the research-notes black hole](docs/assets/liteverse-galaxy-demo.jpg)
+
+- Galaxies are real 3D point clouds generated in Blender from physically
+  motivated models (exponential discs, Sérsic bulges, logarithmic spiral arms,
+  dust lanes, star-forming knots) and drawn with WebGL.
+- Research notes live in the accretion disc of each cluster's central black
+  hole.
+- The universe draws only when something changes. On battery, in Low Power Mode,
+  or when the Mac is hot, it switches to a power-saving quality automatically.
+- Trackpad-native: pinch to zoom, scroll to pan, drag to orbit. Standard Mac
+  menus and shortcuts (⌘K search, ⌘1/⌘2 Sky/Desk, ⌘[ back).
 
 ## Quick start
 
@@ -79,75 +73,68 @@ cloud service.
    [GitHub Releases](https://github.com/1003560213-hub/Liteverse/releases).
 2. Unzip the macOS arm64 archive and move **Liteverse.app** to Applications.
 3. On first launch, Control-click the app and choose **Open**.
-4. Open **Settings → Literature** and add a PDF, an arXiv link, or a local
-   literature folder.
-5. Liteverse prepares the source locally. Ask Codex to review its scientific
-   meaning in a small batch, then choose **Refresh** when the updated universe
-   is ready.
+4. Press **⌘O** to import PDFs, or open **Settings → Library** to add an arXiv
+   link, link a folder, or connect Zotero.
+5. Watch the universe fill in. Use **Desk** (⌘2) to skim, and ask an AI
+   assistant to review one galaxy at a time when you want reviewed cards and
+   verified relationships.
 
-The current preview requires **macOS 13 or later** on an **Apple Silicon Mac**.
-It is ad-hoc signed and has not yet been notarized by Apple.
+Requires **macOS 13 or later** on an **Apple Silicon Mac**. Apple Intelligence
+summaries need macOS 26 with Apple Intelligence turned on. The preview is
+ad-hoc signed and has not been notarized by Apple.
 
-## Use Liteverse with Codex
+## Use Liteverse with an AI assistant
 
-Codex is optional, installed separately, and is never launched automatically.
-Liteverse includes three installable Skills:
+Liteverse includes three installable Skills for Codex and other agents that
+can run the command-line interface:
 
 | Skill | Purpose |
 | --- | --- |
-| `liteverse-curator` | Organizes new papers, knowledge cards, regions, relationships, and annotations. |
+| `liteverse-curator` | Reviews papers by galaxy, builds knowledge cards, regions, relationships, and annotations. |
 | `liteverse-retriever` | Finds and adopts verified literature evidence for a task. |
 | `liteverse-research-memory` | Preserves project decisions, code, experiments, results, and handoffs. |
-
-Install the bundled integration with:
 
 ```bash
 "/Applications/Liteverse.app/Contents/Resources/install-codex-skills.sh"
 ```
 
-Then use natural language in Codex:
+Useful commands:
 
-> Use the Liteverse library to compare these papers and prepare context for this
-> simulation task.
+```bash
+liteverse tier0 build                  # refresh extracted key points and citation links
+liteverse digest packet --galaxy <id>  # one galaxy, ready for AI review
+liteverse context build --project <id> --query "..."
+```
 
-Liteverse performs deterministic preparation itself and gives Codex a focused,
-versioned Context Pack instead of placing an entire library into one prompt.
-AI inferences remain provisional unless they are supported by exact paper
-evidence or reproducible computation records.
+AI output is accepted only when it cites the extracted quotations, and
+relationships stay candidates until they are checked against the original
+pages.
 
 ## Local-first by design
 
-Liteverse stores its mutable workspace under:
-
-```text
-~/Library/Application Support/Liteverse/
-```
-
-The public app starts empty and contains no personal papers, annotations, graph
-data, or research memory. Version 0.5.0 has no account, cloud sync, background
-daemon, bundled language model, or default cloud embedding. Its short-lived
-native Worker handles hashing, explicit arXiv retrieval, PDF extraction,
-deduplication, indexing, and routing-only review packets, then exits. Processing
-an arXiv link may use the network only to retrieve the source explicitly
-requested by the user. Linked folders remain in their original locations and
-must stay available for later evidence reads.
-
-Liteverse can be used as a visual library without AI. Codex remains responsible
-for scientific interpretation, evidence-aware relationships, verified
-classification, and semantic research-memory updates.
+Your workspace lives in `~/Library/Application Support/Liteverse/`. The public
+app starts empty. There is no account, cloud sync, background daemon, or bundled
+language model. Extraction, citation matching, clustering, and search run on
+your Mac. An arXiv link downloads only that paper and its official metadata.
+Apple Intelligence summaries use Apple's on-device model and never leave your
+Mac. Linked folders and Zotero attachments stay where they are.
 
 ## Development
 
-Source builds require macOS 13+, Node.js 24+, and Python 3.12+.
+Source builds require macOS 13+, Node.js 24+, and Python 3.12+. Packaging the
+Apple Intelligence helper requires Xcode 26 (the rest builds with older SDKs).
 
 ```bash
 python3 -m pip install --requirement requirements.txt
 npm ci
-npm run dev
+npm run dev        # browser preview with a fictional demonstration library
+npm test
+npm run desktop:package
 ```
 
-Run `npm test` for the full public-source validation suite. Packaging and
-release requirements are documented in [RELEASING.md](RELEASING.md).
+The galaxy assets are generated with Blender; see
+[tools/blender/README.md](tools/blender/README.md). Release steps are in
+[RELEASING.md](RELEASING.md).
 
 ## Contributing and security
 
@@ -157,5 +144,5 @@ opening a pull request. Report security issues through the private process in
 
 ## License
 
-Liteverse is available under the [MIT License](LICENSE). Artwork attribution and
-licensing details are listed in [ASSET_LICENSES.md](ASSET_LICENSES.md).
+Liteverse is available under the [MIT License](LICENSE). Asset licensing is
+listed in [ASSET_LICENSES.md](ASSET_LICENSES.md).

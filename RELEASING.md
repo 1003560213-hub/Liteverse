@@ -37,8 +37,11 @@ live `~/Library/Application Support/Liteverse/` workspace.
 
 ## Distribution
 
-1. Update the package version, `macos/Info.plist`, release notes, and tag
-   consistently.
+1. Update the package version, `macos/Info.plist`, and
+   `docs/releases/vX.Y.Z.md` consistently, then push the tag `vX.Y.Z`. The
+   `Publish release` workflow builds on a `macos-26` runner (so the Apple
+   Intelligence helper is included), runs the full verification, and publishes
+   a prerelease.
 2. Build from the reviewed tag. The repository's default package is ad-hoc
    signed for local testing only.
 3. Public macOS distribution requires the distributor's Developer ID signing,
@@ -46,5 +49,7 @@ live `~/Library/Application Support/Liteverse/` workspace.
    repository's default build script.
 4. Publish SHA-256 checksums for downloadable artifacts.
 5. Install the artifact on a clean macOS account and verify empty onboarding,
-   PDF/arXiv import, search, backup validation, and App Refresh before announcing
-   the release.
+   PDF/arXiv import, key-point extraction, citation links, ⌘K search, the PDF
+   viewer, Apple Intelligence summaries (macOS 26), power-saving quality on
+   battery, backup validation, and applying a reviewed update before
+   announcing the release.

@@ -1,6 +1,6 @@
 {
   "name": "liteverse",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "A local-first literature universe and research-memory workspace for people and AI assistants.",
   "license": "MIT",
   "keywords": [
@@ -8,18 +8,22 @@
     "research-memory",
     "knowledge-graph",
     "local-first",
-    "codex"
+    "codex",
+    "apple-intelligence",
+    "citation-graph"
   ],
   "private": true,
   "engines": {
     "node": ">=24.0.0"
   },
   "scripts": {
-    "dev": "WRANGLER_LOG_PATH=.wrangler/wrangler.log vinext dev",
-    "build": "npm run typecheck:app && npm run validate:data && WRANGLER_LOG_PATH=.wrangler/wrangler.log vinext build",
+    "dev": "vite --config vite.desktop.config.ts",
+    "build": "npm run typecheck:app && npm run validate:data && npm run desktop:build",
     "desktop:build": "vite build --config vite.desktop.config.ts && node scripts/inline-desktop-assets.mjs",
     "desktop:package": "zsh scripts/build-macos-app.sh",
     "worker:build": "zsh scripts/build-local-worker.sh",
+    "intelligence:build": "zsh scripts/build-intelligence-helper.sh",
+    "assets:universe": "python3 tools/blender/build_universe_assets.py",
     "codex:notes": "node scripts/codex-note-queue.mjs list",
     "codex:workspace": "node scripts/codex-workspace-queue.mjs list",
     "liteverse": "node --no-warnings scripts/liteverse-cli.mjs",
@@ -29,45 +33,31 @@
     "nebula:sync-runtime": "node scripts/sync-runtime-nebula-assets.mjs",
     "sync:private:check": "node scripts/sync-private-shared.mjs --check",
     "sync:private:write": "node scripts/sync-private-shared.mjs --write",
-    "start": "WRANGLER_LOG_PATH=.wrangler/wrangler.log vinext start",
     "test": "npm run build && node --test tests/*.test.mjs",
     "typecheck:app": "tsc -p tsconfig.app.json",
     "validate:data": "node scripts/validate-universe.mjs",
     "verify:public": "node scripts/verify-public-release.mjs",
-    "lint": "eslint . --ignore-pattern .gitnexus --ignore-pattern dist --ignore-pattern .next --ignore-pattern .vinext --ignore-pattern dist-desktop --ignore-pattern Liteverse.app --ignore-pattern release",
-    "db:generate": "drizzle-kit generate"
+    "lint": "eslint ."
   },
   "dependencies": {
-    "drizzle-orm": "0.45.2",
-    "next": "16.2.10",
     "react": "19.2.6",
-    "react-dom": "19.2.6"
+    "react-dom": "19.2.6",
+    "three": "0.186.1"
   },
   "devDependencies": {
-    "@cloudflare/vite-plugin": "1.44.0",
-    "@tailwindcss/postcss": "4.2.1",
+    "@eslint/js": "9.39.4",
     "@types/node": "22.19.19",
     "@types/react": "19.2.14",
     "@types/react-dom": "19.2.3",
+    "@types/three": "0.186.0",
     "@vitejs/plugin-react": "6.0.2",
-    "@vitejs/plugin-rsc": "0.5.26",
-    "drizzle-kit": "0.31.10",
+    "esbuild": "0.28.1",
     "eslint": "9.39.4",
-    "eslint-config-next": "16.2.6",
-    "react-server-dom-webpack": "19.2.6",
-    "tailwindcss": "4.2.1",
+    "eslint-plugin-react-hooks": "7.1.1",
+    "globals": "17.12.0",
     "typescript": "5.9.3",
-    "vinext": "0.0.50",
-    "vite": "8.1.4",
-    "wrangler": "4.110.0"
-  },
-  "overrides": {
-    "@esbuild-kit/core-utils": {
-      "esbuild": "0.28.1"
-    },
-    "next": {
-      "postcss": "8.5.19"
-    }
+    "typescript-eslint": "8.70.1",
+    "vite": "8.1.4"
   },
   "type": "module"
 }

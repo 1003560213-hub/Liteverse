@@ -456,11 +456,9 @@ test("background-aware region placement prefers blank image footprints and reduc
   assert.equal(DEFAULT_BACKGROUND_LAYOUT_PROFILE.sourceHeight, 1086);
   assert.equal(DEFAULT_BACKGROUND_LAYOUT_PROFILE.objectFit, "cover");
   assert.equal(DEFAULT_BACKGROUND_LAYOUT_PROFILE.objectPosition, "center");
-  assert.equal(
-    hash(await readFile(path.join(root, "public", "liteverse-nebula.png"))),
-    DEFAULT_BACKGROUND_LAYOUT_PROFILE.sourceSha256,
-    "the occupancy profile must stay pinned to the packaged default background",
-  );
+  // The 0.5 backdrop image is no longer shipped; the frozen profile keeps
+  // existing seeds producing the same deterministic layouts.
+  assert.match(DEFAULT_BACKGROUND_LAYOUT_PROFILE.sourceSha256, /^[a-f0-9]{64}$/);
 
   const makeLayout = (regionCount) => {
     const categories = Array.from({ length: regionCount }, (_, index) => ({

@@ -17,8 +17,9 @@ const PROFILE_CELLS = Object.freeze([
 ]);
 
 // This is a deterministic, low-resolution visual-occupancy profile of the
-// default 4:3 background after its CSS `cover center` crop at the canonical
-// desktop viewport. Values combine broad perceptual brightness and local
+// 0.5 default 4:3 background after its CSS `cover center` crop at the canonical
+// desktop viewport. The 0.6 renderer no longer draws that image, but the frozen
+// profile is kept so existing seeds keep producing identical layouts. Values combine broad perceptual brightness and local
 // detail. Keeping the profile beside the Curator avoids decoding the PNG while
 // building a graph and makes a given seed produce the same layout everywhere.
 export const DEFAULT_BACKGROUND_LAYOUT_PROFILE = Object.freeze({

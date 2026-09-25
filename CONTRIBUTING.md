@@ -21,10 +21,16 @@ Requirements: macOS 13 or later, Node.js 24 or later, and Python 3.12 or later.
 ```bash
 python3 -m pip install --requirement requirements.txt
 npm install
+npm run dev          # browser preview with a fictional demonstration library
 npm run typecheck:app
 npm run lint
 npm test
 ```
+
+`npm run dev` loads `desktop/dev-bridge.ts`, an in-memory stand-in for the
+native bridge with invented papers. It is excluded from production builds.
+Regenerate the galaxy assets only with `tools/blender/build_universe_assets.py`
+and commit the regenerated manifest together with the files.
 
 The native desktop package is macOS-only:
 

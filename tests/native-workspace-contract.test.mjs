@@ -130,15 +130,12 @@ test("native workspace bridge keeps sources managed and reports honest artifact 
   assert.match(source, /queryContractVersion/);
   assert.match(source, /aliasContractSha256/);
   assert.match(source, /SELECT \(SELECT COUNT\(\*\) FROM papers\), \(SELECT COUNT\(\*\) FROM claims\)/);
-  assert.match(source, /sendLiteratureSearchError/);
   assert.match(source, /DISPATCH_AUTORELEASE_FREQUENCY_WORK_ITEM/);
   assert.doesNotMatch(source, /NSData \*catalogData = \[NSData dataWithContentsOfURL:\[self papersIndexURL\]/);
   assert.match(source, /orderedClaimPaperIDs/);
   assert.match(source, /papersByID\.count < \(NSUInteger\)limit/);
   assert.match(source, /stagedPapers:snapshot\[@"papers"\]/);
   assert.match(source, /updated\[@"displayTitle"\] = paper\[@"title"\]/);
-  assert.match(source, /storedByPaperID/);
-  assert.match(source, /mergedOrganizedItem/);
   assert.doesNotMatch(source, /fileURLWithPath:\[localPath stringByStandardizingPath\]/);
 });
 
@@ -251,29 +248,50 @@ test("region documents use append-only Research Memory with revision-pinned nati
   assert.match(source, /not scientifically verified/);
 });
 
-test("native Context Preview is revision-pinned, cache-only, and never adopts evidence", async () => {
+test("native Tier-0 cache and Apple Intelligence bridge stay rebuildable and non-evidential", async () => {
   const source = await readFile(path.join(root, "macos", "LiteverseApp.m"), "utf8");
-  const method = source.match(/- \(NSDictionary \*\)buildContextPreviewForPayload:[\s\S]+?\n}\n\n- \(NSDictionary \*\)validatedPartitionProposalsAtURL/)?.[0] || "";
+  const saveTier0 = source.match(/- \(void\)saveTier0Payload:[\s\S]+?\n}\n/)?.[0] || "";
+  const loadTier0 = source.match(/- \(void\)loadTier0Payload:[\s\S]+?\n}\n/)?.[0] || "";
+  const digest = source.match(/- \(void\)runIntelligenceDigestPayload:[\s\S]+?\n}\n/)?.[0] || "";
 
-  assert.match(method, /liteverse-context-preview-v1/);
-  assert.match(method, /searchLiteratureAtIndexForQuery:query limit:12/);
-  assert.match(method, /projectDataForID:projectID registry:registry/);
-  assert.match(method, /verificationStatus.*evidence_verified/);
-  assert.match(method, /artifactRevision/);
-  assert.match(method, /artifactSha256/);
-  assert.match(method, /Local FTS5\/BM25 match/);
-  assert.match(method, /Verified relationship-graph expansion/);
-  assert.match(method, /Graph or project memory changed while/);
-  assert.match(method, /@"adopted": @NO/);
-  assert.match(method, /@"usageRecorded": @NO/);
-  assert.match(method, /@"cacheOnly": @YES/);
-  assert.match(method, /Cache\/ContextPreviews/);
-  assert.doesNotMatch(method, /appendJSONObject|appendJSONObjects|usageCountsURL|workspaceInboxURL|currentGraphURL[^\n]+writeJSONObject/);
+  // Tier-0 results live only in Cache/ and are accepted only for the bytes on disk.
+  assert.match(source, /Cache\/Tier0\/app-briefs\.json/);
+  assert.match(saveTier0, /cachedSHA256ForFileAtURL:expected\[identifier\]/);
+  assert.match(saveTier0, /isEqualToString:sha\.lowercaseString/);
+  assert.doesNotMatch(saveTier0, /currentGraphURL[^\n]+writeJSONObject|usageCountsURL|appendJSONObject/);
+  assert.match(loadTier0, /page\.count >= 48 \|\| bytes > 24 \* 1024 \* 1024/);
+  assert.match(loadTier0, /@"remaining"/);
 
-  assert.match(source, /__liteverseReceiveContextPreview/);
-  assert.match(source, /__liteverseReceiveContextPreviewError/);
-  assert.match(source, /action isEqualToString:@"buildContextPreview"/);
-  assert.match(source, /@"contextPreview": contextPreview \?: NSNull\.null/);
+  // The on-device model runs in a separate helper, only on macOS 26+, and its
+  // output is a labelled draft cached outside Knowledge, Graph, and Usage.
+  assert.match(source, /Contents\/MacOS\/LiteverseIntelligence/);
+  assert.match(source, /NSOperatingSystemVersion minimum = \{ 26, 0, 0 \}/);
+  assert.match(source, /Cache\/Intelligence\/digests\.json/);
+  assert.match(digest, /@"kind": @"on_device_draft"/);
+  assert.match(digest, /\[quoteIDs containsObject:quoteID\]/);
+  assert.doesNotMatch(digest, /Knowledge\/|currentGraphURL|usageCountsURL|appendJSONObject/);
+
+  // Removed features stay removed.
+  assert.doesNotMatch(source, /buildContextPreview|saveContextRequest|syncCatalogItems|restoreWorkspace/);
+});
+
+test("native shell provides laptop-aware power state, menus, window memory, and a PDF viewer", async () => {
+  const source = await readFile(path.join(root, "macos", "LiteverseApp.m"), "utf8");
+  assert.match(source, /isLowPowerModeEnabled/);
+  assert.match(source, /NSProcessInfoThermalStateDidChangeNotification/);
+  assert.match(source, /IOPSNotificationCreateRunLoopSource/);
+  assert.match(source, /windowDidChangeOcclusionState:/);
+  assert.match(source, /__liteverseReceivePower/);
+  assert.match(source, /frameAutosaveName = @"LiteverseMainWindow"/);
+  assert.match(source, /NSWindowCollectionBehaviorFullScreenPrimary/);
+  assert.match(source, /@"Import PDFs…" command:@"native\.importPDF" key:@"o"/);
+  assert.match(source, /@"Search Library…" command:@"palette" key:@"k"/);
+  assert.match(source, /@"Back" command:@"go\.back" key:@"\["/);
+  assert.match(source, /__liteverseCommand/);
+  assert.match(source, /PDFView \*view = \[\[PDFView alloc\]/);
+  assert.match(source, /highlightedSelections = @\[ onPage \]/);
+  assert.match(source, /dispatch_semaphore_wait\(slots, DISPATCH_TIME_FOREVER\)/);
+  assert.match(source, /if \(task\.isRunning\) \[task terminate\]/);
 });
 
 test("native backup import is hash checked and cannot overwrite the active workspace", async () => {
@@ -316,6 +334,8 @@ test("native backup validator enforces graph artifact closure and exact Workspac
       "-framework", "Cocoa",
       "-framework", "UniformTypeIdentifiers",
       "-framework", "WebKit",
+      "-framework", "PDFKit",
+      "-framework", "IOKit",
       "-lsqlite3",
       path.join(root, "tests", "native-backup-validator.m"),
       "-o", validator,

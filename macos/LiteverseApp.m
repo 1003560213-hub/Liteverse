@@ -1,5 +1,8 @@
 #import <Cocoa/Cocoa.h>
 #import <CommonCrypto/CommonDigest.h>
+#import <IOKit/ps/IOPSKeys.h>
+#import <IOKit/ps/IOPowerSources.h>
+#import <PDFKit/PDFKit.h>
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 #import <WebKit/WebKit.h>
 #import <errno.h>
@@ -8,9 +11,15 @@
 #import <sqlite3.h>
 #import <unistd.h>
 
-@interface LiteverseAppDelegate : NSObject <NSApplicationDelegate, WKScriptMessageHandler, WKNavigationDelegate> {
+@interface LiteverseAppDelegate : NSObject <NSApplicationDelegate, NSWindowDelegate, WKScriptMessageHandler, WKNavigationDelegate> {
   dispatch_queue_t _persistenceQueue;
   dispatch_queue_t _localPreparationQueue;
+  dispatch_semaphore_t _localPreparationSlots;
+  dispatch_queue_t _tier0Queue;
+  dispatch_queue_t _intelligenceQueue;
+  BOOL _observingPower;
+  CFRunLoopSourceRef _powerSourceRunLoopSource;
+  NSMutableArray<NSWindow *> *_documentWindows;
   dispatch_source_t _pendingRefreshSource;
   dispatch_source_t _workspaceSource;
   NSUInteger _workspaceObservationGeneration;
@@ -27,35 +36,73 @@
 - (NSDictionary *)searchLiteratureAtIndexForQuery:(NSString *)query
                                              limit:(NSInteger)limit
                                              error:(NSError **)error;
+- (void)sendPowerState;
 @end
+
+static void LiteversePowerSourcesChanged(void *context) {
+  LiteverseAppDelegate *delegate = (__bridge LiteverseAppDelegate *)context;
+  [delegate sendPowerState];
+}
 
 @implementation LiteverseAppDelegate
 
+- (NSMenuItem *)menuItemTitled:(NSString *)title
+                        command:(NSString *)command
+                            key:(NSString *)key
+                      modifiers:(NSEventModifierFlags)modifiers {
+  NSMenuItem *item = [[NSMenuItem alloc] initWithTitle:title
+                                                action:@selector(performMenuCommand:)
+                                         keyEquivalent:key ?: @""];
+  item.target = self;
+  item.representedObject = command;
+  item.keyEquivalentModifierMask = modifiers;
+  return item;
+}
+
+- (NSMenu *)addMenuTitled:(NSString *)title toMenu:(NSMenu *)mainMenu {
+  NSMenuItem *holder = [[NSMenuItem alloc] initWithTitle:title action:nil keyEquivalent:@""];
+  NSMenu *menu = [[NSMenu alloc] initWithTitle:title];
+  holder.submenu = menu;
+  [mainMenu addItem:holder];
+  return menu;
+}
+
 - (void)configureApplicationMenus {
   NSMenu *mainMenu = [[NSMenu alloc] initWithTitle:@""];
+  const NSEventModifierFlags command = NSEventModifierFlagCommand;
 
-  NSMenuItem *applicationMenuItem = [[NSMenuItem alloc] initWithTitle:@""
-                                                               action:nil
-                                                        keyEquivalent:@""];
-  [mainMenu addItem:applicationMenuItem];
-  NSMenu *applicationMenu = [[NSMenu alloc] initWithTitle:@"Liteverse"];
+  NSMenu *applicationMenu = [self addMenuTitled:@"Liteverse" toMenu:mainMenu];
   [applicationMenu addItemWithTitle:@"About Liteverse"
                              action:@selector(orderFrontStandardAboutPanel:)
                       keyEquivalent:@""];
   [applicationMenu addItem:NSMenuItem.separatorItem];
-  [applicationMenu addItemWithTitle:@"Quit Liteverse"
-                             action:@selector(terminate:)
-                      keyEquivalent:@"q"];
-  applicationMenuItem.submenu = applicationMenu;
+  [applicationMenu addItem:[self menuItemTitled:@"Settings…" command:@"settings" key:@"," modifiers:command]];
+  [applicationMenu addItem:NSMenuItem.separatorItem];
+  [applicationMenu addItemWithTitle:@"Hide Liteverse" action:@selector(hide:) keyEquivalent:@"h"];
+  NSMenuItem *hideOthers = [applicationMenu addItemWithTitle:@"Hide Others"
+                                                      action:@selector(hideOtherApplications:)
+                                               keyEquivalent:@"h"];
+  hideOthers.keyEquivalentModifierMask = command | NSEventModifierFlagOption;
+  [applicationMenu addItemWithTitle:@"Show All" action:@selector(unhideAllApplications:) keyEquivalent:@""];
+  [applicationMenu addItem:NSMenuItem.separatorItem];
+  [applicationMenu addItemWithTitle:@"Quit Liteverse" action:@selector(terminate:) keyEquivalent:@"q"];
+
+  NSMenu *fileMenu = [self addMenuTitled:@"File" toMenu:mainMenu];
+  [fileMenu addItem:[self menuItemTitled:@"Import PDFs…" command:@"native.importPDF" key:@"o" modifiers:command]];
+  [fileMenu addItem:[self menuItemTitled:@"Link a Literature Folder…" command:@"native.linkFolder" key:@"o"
+                               modifiers:command | NSEventModifierFlagShift]];
+  [fileMenu addItem:[self menuItemTitled:@"Connect Zotero…" command:@"native.connectZotero" key:@"" modifiers:0]];
+  [fileMenu addItem:[self menuItemTitled:@"Add arXiv Paper…" command:@"settings" key:@"" modifiers:0]];
+  [fileMenu addItem:NSMenuItem.separatorItem];
+  [fileMenu addItem:[self menuItemTitled:@"Export Backup…" command:@"native.exportBackup" key:@"" modifiers:0]];
+  [fileMenu addItem:[self menuItemTitled:@"Verify a Backup…" command:@"native.importBackup" key:@"" modifiers:0]];
+  [fileMenu addItem:NSMenuItem.separatorItem];
+  [fileMenu addItemWithTitle:@"Close Window" action:@selector(performClose:) keyEquivalent:@"w"];
 
   // WKWebView forwards these standard editing selectors through the macOS
   // responder chain. Without an Edit menu, keyboard shortcuts such as Cmd+V
   // never reach a focused textarea in this programmatic AppKit shell.
-  NSMenuItem *editMenuItem = [[NSMenuItem alloc] initWithTitle:@""
-                                                        action:nil
-                                                 keyEquivalent:@""];
-  [mainMenu addItem:editMenuItem];
-  NSMenu *editMenu = [[NSMenu alloc] initWithTitle:@"Edit"];
+  NSMenu *editMenu = [self addMenuTitled:@"Edit" toMenu:mainMenu];
   [editMenu addItemWithTitle:@"Undo" action:@selector(undo:) keyEquivalent:@"z"];
   NSMenuItem *redoItem = [editMenu addItemWithTitle:@"Redo"
                                              action:@selector(redo:)
@@ -66,9 +113,58 @@
   [editMenu addItemWithTitle:@"Copy" action:@selector(copy:) keyEquivalent:@"c"];
   [editMenu addItemWithTitle:@"Paste" action:@selector(paste:) keyEquivalent:@"v"];
   [editMenu addItemWithTitle:@"Select All" action:@selector(selectAll:) keyEquivalent:@"a"];
-  editMenuItem.submenu = editMenu;
+  [editMenu addItem:NSMenuItem.separatorItem];
+  [editMenu addItem:[self menuItemTitled:@"Search Library…" command:@"palette" key:@"k" modifiers:command]];
+
+  NSMenu *viewMenu = [self addMenuTitled:@"View" toMenu:mainMenu];
+  [viewMenu addItem:[self menuItemTitled:@"Sky" command:@"mode.sky" key:@"1" modifiers:command]];
+  [viewMenu addItem:[self menuItemTitled:@"Desk" command:@"mode.desk" key:@"2" modifiers:command]];
+  [viewMenu addItem:NSMenuItem.separatorItem];
+  [viewMenu addItem:[self menuItemTitled:@"Toggle Atlas" command:@"toggle.atlas" key:@"s"
+                               modifiers:command | NSEventModifierFlagControl]];
+  [viewMenu addItem:[self menuItemTitled:@"Toggle Inspector" command:@"toggle.inspector" key:@"i"
+                               modifiers:command | NSEventModifierFlagOption]];
+  [viewMenu addItem:NSMenuItem.separatorItem];
+  [viewMenu addItem:[self menuItemTitled:@"Zoom In" command:@"zoom.in" key:@"=" modifiers:command]];
+  [viewMenu addItem:[self menuItemTitled:@"Zoom Out" command:@"zoom.out" key:@"-" modifiers:command]];
+  [viewMenu addItem:[self menuItemTitled:@"Reset Orientation" command:@"zoom.reset" key:@"0" modifiers:command]];
+  [viewMenu addItem:NSMenuItem.separatorItem];
+  NSMenuItem *fullScreen = [viewMenu addItemWithTitle:@"Enter Full Screen"
+                                               action:@selector(toggleFullScreen:)
+                                        keyEquivalent:@"f"];
+  fullScreen.keyEquivalentModifierMask = command | NSEventModifierFlagControl;
+
+  NSMenu *goMenu = [self addMenuTitled:@"Go" toMenu:mainMenu];
+  [goMenu addItem:[self menuItemTitled:@"Back" command:@"go.back" key:@"[" modifiers:command]];
+  [goMenu addItem:[self menuItemTitled:@"Universe" command:@"go.universe" key:@"u"
+                             modifiers:command | NSEventModifierFlagShift]];
+
+  NSMenu *windowMenu = [self addMenuTitled:@"Window" toMenu:mainMenu];
+  [windowMenu addItemWithTitle:@"Minimize" action:@selector(performMiniaturize:) keyEquivalent:@"m"];
+  [windowMenu addItemWithTitle:@"Zoom" action:@selector(performZoom:) keyEquivalent:@""];
+  NSApp.windowsMenu = windowMenu;
 
   NSApp.mainMenu = mainMenu;
+}
+
+- (void)performMenuCommand:(NSMenuItem *)sender {
+  NSString *command = [sender.representedObject isKindOfClass:NSString.class] ? sender.representedObject : nil;
+  if (command.length == 0) return;
+  if ([command isEqualToString:@"native.importPDF"]) [self presentPDFImporter];
+  else if ([command isEqualToString:@"native.linkFolder"]) [self presentLiteratureFolderImporter];
+  else if ([command isEqualToString:@"native.connectZotero"]) [self presentZoteroImporter];
+  else if ([command isEqualToString:@"native.exportBackup"]) [self presentWorkspaceExporterIncludingPDFs:NO];
+  else if ([command isEqualToString:@"native.importBackup"]) [self presentWorkspaceImporter];
+  else [self sendCommandToWeb:command];
+}
+
+- (void)sendCommandToWeb:(NSString *)command {
+  if (!self.webView) return;
+  [self.webView callAsyncJavaScript:@"window.__liteverseCommand && window.__liteverseCommand(command);"
+                          arguments:@{ @"command": command }
+                            inFrame:nil
+                     inContentWorld:WKContentWorld.pageWorld
+                  completionHandler:nil];
 }
 
 - (NSError *)storageError:(NSString *)message code:(NSInteger)code {
@@ -1610,48 +1706,6 @@
   });
 }
 
-- (void)sendLiteratureSearchError:(NSError *)error requestID:(NSString *)requestID {
-  NSDictionary *payload = @{
-    @"requestId": requestID ?: @"",
-    @"message": error.localizedDescription ?: @"The local literature index is unavailable."
-  };
-  dispatch_async(dispatch_get_main_queue(), ^{
-    [self.webView callAsyncJavaScript:
-        @"window.__liteverseReceiveLiteratureSearchError && window.__liteverseReceiveLiteratureSearchError(errorPayload);"
-                              arguments:@{ @"errorPayload": payload }
-                                inFrame:nil
-                         inContentWorld:WKContentWorld.pageWorld
-                      completionHandler:nil];
-  });
-}
-
-- (void)sendContextPreview:(NSDictionary *)preview {
-  if (!preview) return;
-  dispatch_async(dispatch_get_main_queue(), ^{
-    [self.webView callAsyncJavaScript:
-        @"window.__liteverseReceiveContextPreview && window.__liteverseReceiveContextPreview(previewPayload);"
-                              arguments:@{ @"previewPayload": preview }
-                                inFrame:nil
-                         inContentWorld:WKContentWorld.pageWorld
-                      completionHandler:nil];
-  });
-}
-
-- (void)sendContextPreviewError:(NSError *)error requestID:(NSString *)requestID {
-  NSDictionary *payload = @{
-    @"requestId": requestID ?: @"",
-    @"message": error.localizedDescription ?: @"The local Context Preview could not be built."
-  };
-  dispatch_async(dispatch_get_main_queue(), ^{
-    [self.webView callAsyncJavaScript:
-        @"window.__liteverseReceiveContextPreviewError && window.__liteverseReceiveContextPreviewError(errorPayload);"
-                              arguments:@{ @"errorPayload": payload }
-                                inFrame:nil
-                         inContentWorld:WKContentWorld.pageWorld
-                      completionHandler:nil];
-  });
-}
-
 - (void)sendUniverseGraph:(NSDictionary *)graph callback:(NSString *)callback {
   if (!graph || callback.length == 0) return;
   NSDictionary *runtimeGraph = [self graphByInjectingUsageCounts:graph];
@@ -2886,232 +2940,6 @@
   return [text substringToIndex:end];
 }
 
-- (NSDictionary *)latestContextPreviewForProjectID:(NSString *)projectID {
-  if (![self isSafeProjectID:projectID]) return nil;
-  NSURL *previewURL = [[[self applicationSupportURL]
-      URLByAppendingPathComponent:@"Cache/ContextPreviews" isDirectory:YES]
-      URLByAppendingPathComponent:[projectID stringByAppendingPathComponent:@"latest.json"]];
-  if (![NSFileManager.defaultManager fileExistsAtPath:previewURL.path]) return nil;
-  NSDictionary *preview = [self readDictionaryAtURL:previewURL defaultValue:nil error:nil];
-  if (![preview[@"schemaVersion"] isEqualToString:@"liteverse-context-preview-v1"] ||
-      ![preview[@"projectId"] isEqualToString:projectID] ||
-      ![preview[@"cacheOnly"] boolValue] || [preview[@"adopted"] boolValue] ||
-      ![preview[@"selectedClaims"] isKindOfClass:NSArray.class] ||
-      ![preview[@"projectMemory"] isKindOfClass:NSArray.class]) return nil;
-  return preview;
-}
-
-- (NSDictionary *)buildContextPreviewForPayload:(NSDictionary *)payload error:(NSError **)error {
-  NSString *query = [payload[@"query"] isKindOfClass:NSString.class]
-      ? [payload[@"query"] stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet]
-      : @"";
-  NSString *projectID = [payload[@"projectId"] isKindOfClass:NSString.class]
-      ? payload[@"projectId"] : nil;
-  NSString *requestID = [payload[@"requestId"] isKindOfClass:NSString.class]
-      ? payload[@"requestId"] : NSUUID.UUID.UUIDString.lowercaseString;
-  NSInteger budget = [payload[@"budgetChars"] integerValue];
-  if (query.length == 0 || query.length > 20000 || ![self isSafeProjectID:projectID] ||
-      requestID.length == 0 || requestID.length > 160 || budget < 2000 || budget > 200000) {
-    if (error) *error = [self storageError:
-        @"The local Context Preview query, project, request ID, or character budget is invalid." code:606];
-    return nil;
-  }
-  if (![self ensureRuntimeGraphStorage:error]) return nil;
-
-  NSDictionary *registry = [self readDictionaryAtURL:[self projectsRegistryURL]
-                                        defaultValue:nil error:error];
-  NSString *activeProjectID = registry ? [self activeProjectIDFromRegistry:registry] : nil;
-  if (!registry || ![activeProjectID isEqualToString:projectID]) {
-    if (error) *error = [self storageError:
-        @"The active project changed before the local Context Preview was built." code:607];
-    return nil;
-  }
-  NSDictionary *projectData = [self projectDataForID:projectID registry:registry error:error];
-  if (!projectData) return nil;
-  NSDictionary *graph = [self readDictionaryAtURL:[self currentGraphURL]
-                                      defaultValue:nil error:error];
-  if (!graph) return nil;
-  id graphRevision = graph[@"revision"] ?: @0;
-
-  NSURL *memoryURL = [[[self projectDirectoryURLForID:projectID error:error]
-      URLByAppendingPathComponent:@"memory" isDirectory:YES]
-      URLByAppendingPathComponent:@"current.json"];
-  NSDictionary *memoryProjection = [NSFileManager.defaultManager fileExistsAtPath:memoryURL.path]
-      ? [self readDictionaryAtURL:memoryURL defaultValue:nil error:error]
-      : @{ @"schemaVersion": @1, @"projectId": projectID, @"revision": @0,
-           @"ledgerHash": @"", @"items": @[] };
-  if (!memoryProjection) return nil;
-  NSNumber *memoryRevision = [memoryProjection[@"revision"] isKindOfClass:NSNumber.class]
-      ? memoryProjection[@"revision"] : @0;
-  NSString *memoryLedgerHash = [memoryProjection[@"ledgerHash"] isKindOfClass:NSString.class]
-      ? memoryProjection[@"ledgerHash"] : @"";
-
-  NSDictionary *search = [self searchLiteratureAtIndexForQuery:query limit:12 error:error];
-  if (!search) return nil;
-  NSInteger literatureBudget = (NSInteger)floor((double)budget * 0.72);
-  NSInteger literatureUsed = 0;
-  NSMutableArray *selectedClaims = [NSMutableArray array];
-  NSMutableOrderedSet<NSString *> *limitationTexts = [NSMutableOrderedSet orderedSet];
-  for (NSDictionary *paper in [search[@"results"] isKindOfClass:NSArray.class] ? search[@"results"] : @[]) {
-    NSArray *relationExpansion = [paper[@"relationExpansion"] isKindOfClass:NSArray.class]
-        ? paper[@"relationExpansion"] : @[];
-    for (NSDictionary *claim in [paper[@"matchingClaims"] isKindOfClass:NSArray.class]
-        ? paper[@"matchingClaims"] : @[]) {
-      if (![claim[@"verificationStatus"] isEqualToString:@"evidence_verified"] ||
-          [claim[@"type"] isEqualToString:@"project_role"]) continue;
-      NSString *claimText = [claim[@"text"] isKindOfClass:NSString.class] ? claim[@"text"] : @"";
-      NSInteger remaining = literatureBudget - literatureUsed;
-      if (claimText.length == 0 || remaining < 120) break;
-      NSString *bounded = [self contextPreviewText:claimText limitedTo:remaining];
-      NSString *section = [claim[@"section"] isKindOfClass:NSString.class]
-          ? claim[@"section"] : (claim[@"type"] ?: @"claim");
-      NSString *routingReason = relationExpansion.count > 0
-          ? [NSString stringWithFormat:@"Verified relationship-graph expansion via %@",
-              [relationExpansion componentsJoinedByString:@", "]]
-          : [NSString stringWithFormat:@"Local FTS5/BM25 match in %@", section];
-      NSArray *evidence = [claim[@"evidence"] isKindOfClass:NSArray.class] ? claim[@"evidence"] : @[];
-      [selectedClaims addObject:@{
-        @"paperId": paper[@"paperId"] ?: @"",
-        @"paperTitle": paper[@"title"] ?: @"",
-        @"title": paper[@"title"] ?: @"",
-        @"claimId": claim[@"claimId"] ?: @"",
-        @"type": claim[@"type"] ?: @"claim",
-        @"text": bounded,
-        @"verificationStatus": @"evidence_verified",
-        @"artifactRevision": claim[@"artifactRevision"] ?: paper[@"artifactRevision"] ?: @0,
-        @"artifactSha256": claim[@"artifactSha256"] ?: paper[@"artifactSha256"] ?: @"",
-        @"evidenceLocators": evidence,
-        @"whySelected": routingReason,
-        @"reason": routingReason,
-        @"trust": @"verified_original_source"
-      }];
-      literatureUsed += bounded.length;
-      if ([claim[@"type"] isEqualToString:@"limitation"]) {
-        [limitationTexts addObject:[NSString stringWithFormat:@"%@: %@", paper[@"paperId"] ?: @"paper", bounded]];
-      }
-    }
-    if (literatureUsed >= literatureBudget - 120) break;
-  }
-
-  NSMutableOrderedSet<NSString *> *queryTokens = [NSMutableOrderedSet orderedSet];
-  for (NSString *token in [[self normalizedSearchText:query] componentsSeparatedByString:@" "]) {
-    if (token.length > 1) [queryTokens addObject:token];
-  }
-  NSMutableArray *rankedMemory = [NSMutableArray array];
-  NSMutableArray *conflicts = [NSMutableArray array];
-  NSSet *alwaysRelevantTypes = [NSSet setWithArray:@[@"goal", @"convention", @"decision", @"assumption"]];
-  NSArray *memoryItems = [projectData[@"projectMemory"][@"items"] isKindOfClass:NSArray.class]
-      ? projectData[@"projectMemory"][@"items"] : @[];
-  for (NSDictionary *item in memoryItems) {
-    if (![item[@"state"] isEqualToString:@"active"]) continue;
-    NSString *content = [item[@"content"] isKindOfClass:NSString.class]
-        ? item[@"content"] : ([item[@"statement"] isKindOfClass:NSString.class] ? item[@"statement"] : @"");
-    NSString *title = [item[@"title"] isKindOfClass:NSString.class] ? item[@"title"] : @"";
-    NSString *searchable = [self normalizedSearchText:
-        [NSString stringWithFormat:@"%@ %@", title, content]];
-    NSInteger score = [alwaysRelevantTypes containsObject:item[@"type"]] ? 1 : 0;
-    for (NSString *token in queryTokens) {
-      if ([searchable containsString:token]) score += 2;
-    }
-    if (score > 0 && content.length > 0) {
-      [rankedMemory addObject:@{ @"item": item, @"score": @(score) }];
-    }
-    NSArray *contradicts = [item[@"contradicts"] isKindOfClass:NSArray.class] ? item[@"contradicts"] : @[];
-    NSArray *contradictedBy = [item[@"contradictedBy"] isKindOfClass:NSArray.class] ? item[@"contradictedBy"] : @[];
-    if (contradicts.count > 0 || contradictedBy.count > 0 ||
-        [item[@"evidenceState"] isEqualToString:@"contradicted"]) {
-      [conflicts addObject:@{
-        @"memoryId": item[@"memoryId"] ?: item[@"id"] ?: @"memory",
-        @"title": title,
-        @"evidenceState": item[@"evidenceState"] ?: @"unknown",
-        @"contradicts": contradicts,
-        @"contradictedBy": contradictedBy
-      }];
-    }
-  }
-  [rankedMemory sortUsingComparator:^NSComparisonResult(NSDictionary *left, NSDictionary *right) {
-    NSInteger leftScore = [left[@"score"] integerValue];
-    NSInteger rightScore = [right[@"score"] integerValue];
-    if (leftScore != rightScore) return leftScore > rightScore ? NSOrderedAscending : NSOrderedDescending;
-    NSString *leftID = left[@"item"][@"memoryId"] ?: left[@"item"][@"id"] ?: @"";
-    NSString *rightID = right[@"item"][@"memoryId"] ?: right[@"item"][@"id"] ?: @"";
-    return [leftID compare:rightID];
-  }];
-  NSInteger memoryBudget = budget - literatureUsed;
-  NSInteger memoryUsed = 0;
-  NSMutableArray *selectedMemory = [NSMutableArray array];
-  for (NSDictionary *candidate in rankedMemory) {
-    if (memoryBudget - memoryUsed < 100) break;
-    NSDictionary *item = candidate[@"item"];
-    NSString *content = [item[@"content"] isKindOfClass:NSString.class]
-        ? item[@"content"] : item[@"statement"];
-    NSString *bounded = [self contextPreviewText:content limitedTo:memoryBudget - memoryUsed];
-    NSMutableDictionary *selected = [item mutableCopy];
-    selected[@"content"] = bounded;
-    selected[@"selectionReason"] = [candidate[@"score"] integerValue] > 1
-        ? @"Task-query term overlap" : @"Active project goal or convention";
-    [selectedMemory addObject:selected];
-    memoryUsed += bounded.length;
-  }
-  if (selectedClaims.count == 0) {
-    [limitationTexts addObject:@"No evidence-verified claim matched this query in the current local index."];
-  }
-  [limitationTexts addObject:
-      @"This local preview has not been adopted by an AI task and does not affect literature heat or usage history."];
-
-  // Pin the preview only if both mutable projections remained unchanged while
-  // search and budget selection were running.
-  NSDictionary *finalGraph = [self readDictionaryAtURL:[self currentGraphURL]
-                                           defaultValue:nil error:error];
-  NSDictionary *finalRegistry = [self readDictionaryAtURL:[self projectsRegistryURL]
-                                              defaultValue:nil error:error];
-  NSDictionary *finalMemory = [NSFileManager.defaultManager fileExistsAtPath:memoryURL.path]
-      ? [self readDictionaryAtURL:memoryURL defaultValue:nil error:error] : memoryProjection;
-  if (!finalGraph || !finalRegistry || !finalMemory) return nil;
-  if (![self revision:finalGraph[@"revision"] matches:graphRevision] ||
-      ![[self activeProjectIDFromRegistry:finalRegistry] isEqualToString:projectID] ||
-      ![finalMemory[@"revision"] isEqual:memoryRevision] ||
-      ![(finalMemory[@"ledgerHash"] ?: @"") isEqualToString:memoryLedgerHash]) {
-    if (error) *error = [self storageError:
-        @"Graph or project memory changed while the local Context Preview was being built. Retry to pin the new revisions."
-                                    code:608];
-    return nil;
-  }
-
-  NSString *contextID = [NSString stringWithFormat:@"preview-%@", NSUUID.UUID.UUIDString.lowercaseString];
-  NSString *createdAt = [self isoTimestamp];
-  NSString *cachePath = [[@"Cache/ContextPreviews" stringByAppendingPathComponent:projectID]
-      stringByAppendingPathComponent:@"latest.json"];
-  NSMutableDictionary *preview = [@{
-    @"schemaVersion": @"liteverse-context-preview-v1",
-    @"requestId": requestID,
-    @"contextId": contextID,
-    @"contextKind": @"local_preview",
-    @"adopted": @NO,
-    @"usageRecorded": @NO,
-    @"cacheOnly": @YES,
-    @"createdAt": createdAt,
-    @"projectId": projectID,
-    @"query": query,
-    @"budgetChars": @(budget),
-    @"usedChars": @(literatureUsed + memoryUsed),
-    @"graphRevision": graphRevision,
-    @"memoryRevision": memoryRevision,
-    @"memoryLedgerHash": memoryLedgerHash,
-    @"indexFingerprint": search[@"indexFingerprint"] ?: @"",
-    @"selectedClaims": selectedClaims,
-    @"projectMemory": selectedMemory,
-    @"conflicts": conflicts,
-    @"limitations": limitationTexts.array,
-    @"cachePath": cachePath
-  } mutableCopy];
-  NSURL *cacheURL = [self URLForWorkspaceRelativePath:cachePath error:error];
-  if (!cacheURL || ![NSFileManager.defaultManager createDirectoryAtURL:cacheURL.URLByDeletingLastPathComponent
-                                      withIntermediateDirectories:YES attributes:nil error:error] ||
-      ![self writeJSONObject:preview toURL:cacheURL error:error]) return nil;
-  return preview;
-}
-
 - (NSDictionary *)validatedPartitionProposalsAtURL:(NSURL *)url error:(NSError **)error {
   NSDictionary *proposal = [self readDictionaryAtURL:url defaultValue:nil error:error];
   if (!proposal) return nil;
@@ -3476,7 +3304,6 @@
     [self sendWorkspaceErrorForAction:@"loadWorkspaceHealth" error:error];
     return;
   }
-  NSDictionary *contextPreview = [self latestContextPreviewForProjectID:activeProjectID];
   NSMutableDictionary *payload = [@{
     @"library": library,
     @"researchInformation": research,
@@ -3484,11 +3311,7 @@
     @"projectMemory": projectData[@"projectMemory"],
     @"tasks": projectData[@"tasks"],
     @"contextPacks": projectData[@"contextPacks"],
-    @"contextPreview": contextPreview ?: NSNull.null,
     @"artifacts": projectData[@"artifacts"],
-    // Search is demand-driven through the shared SQLite FTS5 index. Do not
-    // deserialize thousands of claims into every workspace payload.
-    @"searchProjection": @[],
     @"projectUseCounts": projectData[@"projectUseCounts"],
     @"partitionProposals": partitionProposals,
     @"workspace": workspace,
@@ -4551,6 +4374,11 @@
         [NSString stringWithFormat:@"Could not send the local preparation request: %@", exception.reason ?: @"unknown error"]
                             code:627];
   }
+  // A malformed PDF must not hold a preparation slot forever.
+  dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(300 * NSEC_PER_SEC)),
+                 dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+    if (task.isRunning) [task terminate];
+  });
   NSData *stdoutData = [stdoutPipe.fileHandleForReading readDataToEndOfFile];
   NSData *stderrData = [stderrPipe.fileHandleForReading readDataToEndOfFile];
   [task waitUntilExit];
@@ -4590,8 +4418,11 @@
 
 - (void)scheduleLocalPreparationForItem:(NSDictionary *)item {
   NSDictionary *immutableItem = [item copy];
+  dispatch_semaphore_t slots = _localPreparationSlots;
   dispatch_async(_localPreparationQueue, ^{
+    dispatch_semaphore_wait(slots, DISPATCH_TIME_FOREVER);
     @autoreleasepool { [self runLocalPreparationForItem:immutableItem]; }
+    dispatch_semaphore_signal(slots);
   });
 }
 
@@ -5646,148 +5477,6 @@
     NSURL *selectionURL = panel.URL;
     dispatch_async(self->_persistenceQueue, ^{ [self linkZoteroSelectionURL:selectionURL]; });
   }];
-}
-
-- (void)syncCatalogItems:(NSArray *)rawItems {
-  dispatch_async(_persistenceQueue, ^{
-    NSError *error = nil;
-    NSDictionary *storedLibrary = [self readDictionaryAtURL:[self libraryURL]
-                                                defaultValue:[self defaultLibrary]
-                                                       error:&error];
-    if (!storedLibrary) {
-      [self sendWorkspaceErrorForAction:@"syncCatalog" error:error];
-      return;
-    }
-
-    NSArray *storedItems = [storedLibrary[@"items"] isKindOfClass:NSArray.class] ? storedLibrary[@"items"] : @[];
-    NSMutableDictionary<NSString *, NSDictionary *> *storedByPaperID = [NSMutableDictionary dictionary];
-    for (NSDictionary *storedItem in storedItems) {
-      NSString *paperID = [storedItem[@"graphPaperId"] isKindOfClass:NSString.class]
-          ? storedItem[@"graphPaperId"] : nil;
-      BOOL eligible = [storedItem[@"catalogSource"] isEqualToString:@"universe"] ||
-          [storedItem[@"status"] isEqualToString:@"organized"];
-      if (paperID.length == 0 || !eligible) continue;
-      NSDictionary *previous = storedByPaperID[paperID];
-      BOOL storedIsUpload = ![storedItem[@"catalogSource"] isEqualToString:@"universe"];
-      BOOL previousIsCatalog = [previous[@"catalogSource"] isEqualToString:@"universe"];
-      if (!previous || (storedIsUpload && previousIsCatalog)) storedByPaperID[paperID] = storedItem;
-    }
-    NSMutableSet<NSString *> *consumedStoredIDs = [NSMutableSet set];
-    NSMutableSet<NSString *> *catalogPaperIDs = [NSMutableSet set];
-    NSMutableArray *catalogItems = [NSMutableArray array];
-    for (id rawItem in rawItems) {
-      if (![rawItem isKindOfClass:NSDictionary.class]) continue;
-      NSDictionary *item = (NSDictionary *)rawItem;
-      NSString *itemID = item[@"id"];
-      NSString *title = item[@"displayTitle"];
-      NSString *paperID = item[@"graphPaperId"];
-      NSString *localPath = item[@"localPath"];
-      if (itemID.length == 0 || title.length == 0 || paperID.length == 0) continue;
-      [catalogPaperIDs addObject:paperID];
-      NSDictionary *rawSource = [item[@"source"] isKindOfClass:NSDictionary.class] ? item[@"source"] : @{};
-      NSString *sourcePDFPath = [rawSource[@"pdfPath"] isKindOfClass:NSString.class]
-          ? rawSource[@"pdfPath"] : localPath;
-      NSString *managedPath = nil;
-      NSString *catalogPDFPath = nil;
-      NSString *pdfHash = [rawSource[@"sha256"] isKindOfClass:NSString.class] ? rawSource[@"sha256"] : nil;
-      BOOL linkedSource = [self isLinkedPDFSource:rawSource];
-      BOOL linkedAvailable = NO;
-      BOOL linkedHashMatches = NO;
-      if (linkedSource) {
-        NSURL *structuralURL = [self linkedPDFURLForSource:rawSource requireExisting:NO verifyHash:NO error:nil];
-        if (structuralURL) {
-          catalogPDFPath = structuralURL.path;
-          NSURL *existingURL = [self linkedPDFURLForSource:rawSource requireExisting:YES verifyHash:NO error:nil];
-          linkedAvailable = existingURL != nil;
-          if (linkedAvailable && pdfHash.length == 64) {
-            linkedHashMatches = [[[self cachedSHA256ForFileAtURL:existingURL error:nil] lowercaseString]
-                isEqualToString:[pdfHash lowercaseString]];
-          }
-        }
-      } else if (sourcePDFPath.length > 0 && !sourcePDFPath.isAbsolutePath &&
-          [self isSafeWorkspaceRelativePath:sourcePDFPath] &&
-          [sourcePDFPath.stringByStandardizingPath hasPrefix:@"Library/PDFs/"]) {
-        managedPath = sourcePDFPath.stringByStandardizingPath;
-        catalogPDFPath = managedPath;
-      }
-      NSDictionary *rawArtifacts = [item[@"artifacts"] isKindOfClass:NSDictionary.class] ? item[@"artifacts"] : @{};
-      NSString *verificationStatus = [item[@"verificationStatus"] isKindOfClass:NSString.class]
-          ? item[@"verificationStatus"] : (catalogPDFPath ? @"card_draft" : @"source_missing");
-      if (linkedSource && !linkedAvailable) verificationStatus = @"source_missing";
-      else if (linkedSource && !linkedHashMatches) verificationStatus = @"needs_attention";
-      NSMutableDictionary *catalogSource = [rawSource mutableCopy];
-      catalogSource[@"kind"] = [rawSource[@"kind"] isKindOfClass:NSString.class] ? rawSource[@"kind"] : @"pdf";
-      if (linkedSource) {
-        catalogSource[@"storageMode"] = @"linked";
-        if (catalogPDFPath) catalogSource[@"pdfPath"] = catalogPDFPath;
-      } else {
-        catalogSource[@"storageMode"] = @"managed";
-        catalogSource[@"pdfPath"] = managedPath ?: @"";
-      }
-      catalogSource[@"sha256"] = pdfHash ?: @"";
-      NSMutableDictionary *catalogItem = [@{
-        @"id": itemID,
-        @"number": [item[@"number"] isKindOfClass:NSNumber.class] ? item[@"number"] : @([catalogItems count] + 1),
-        @"sourceType": [rawSource[@"kind"] isKindOfClass:NSString.class] ? rawSource[@"kind"] : @"pdf",
-        @"displayTitle": title,
-        @"titleStatus": [item[@"titleStatus"] isKindOfClass:NSString.class] ? item[@"titleStatus"] : @"catalog",
-        @"status": @"organized",
-        @"revision": [item[@"revision"] isKindOfClass:NSNumber.class] ? item[@"revision"] : @1,
-        @"createdAt": [item[@"createdAt"] isKindOfClass:NSString.class] ? item[@"createdAt"] : @"",
-        @"updatedAt": [item[@"updatedAt"] isKindOfClass:NSString.class] ? item[@"updatedAt"] : @"",
-        @"organizedAt": [item[@"organizedAt"] isKindOfClass:NSString.class] ? item[@"organizedAt"] : @"",
-        @"graphPaperId": paperID,
-        @"catalogSource": @"universe",
-        @"localPath": catalogPDFPath ?: @"",
-        @"verificationStatus": verificationStatus,
-        @"source": catalogSource,
-        @"artifacts": rawArtifacts,
-        @"citekey": [item[@"citekey"] isKindOfClass:NSString.class] ? item[@"citekey"] : paperID
-      } mutableCopy];
-      NSDictionary *storedMatch = storedByPaperID[paperID];
-      if (storedMatch) {
-        // Preserve the stable Library identity/number of an uploaded item while
-        // taking title, source, artifact and verification truth from the graph.
-        for (NSString *key in @[@"id", @"number", @"revision", @"createdAt", @"organizedAt", @"originalFilename"]) {
-          if (storedMatch[key]) catalogItem[key] = storedMatch[key];
-        }
-        NSString *storedID = [storedMatch[@"id"] isKindOfClass:NSString.class] ? storedMatch[@"id"] : nil;
-        if (storedID.length > 0) [consumedStoredIDs addObject:storedID];
-      }
-      if (managedPath.length > 0) catalogItem[@"storedFilename"] = managedPath.lastPathComponent;
-      else [catalogItem removeObjectForKey:@"storedFilename"];
-      NSString *arxivID = [item[@"arxivId"] isKindOfClass:NSString.class]
-          ? item[@"arxivId"] : ([storedMatch[@"arxivId"] isKindOfClass:NSString.class] ? storedMatch[@"arxivId"] : nil);
-      NSString *arxivURL = [item[@"arxivUrl"] isKindOfClass:NSString.class]
-          ? item[@"arxivUrl"] : ([storedMatch[@"arxivUrl"] isKindOfClass:NSString.class] ? storedMatch[@"arxivUrl"] : nil);
-      if (arxivID.length > 0) catalogItem[@"arxivId"] = arxivID;
-      if (arxivURL.length > 0) catalogItem[@"arxivUrl"] = arxivURL;
-      [catalogItems addObject:catalogItem];
-    }
-
-    NSMutableArray *userItems = [NSMutableArray array];
-    for (NSDictionary *item in storedItems) {
-      NSString *itemID = [item[@"id"] isKindOfClass:NSString.class] ? item[@"id"] : @"";
-      NSString *paperID = [item[@"graphPaperId"] isKindOfClass:NSString.class] ? item[@"graphPaperId"] : @"";
-      BOOL mergedOrganizedItem = [item[@"status"] isEqualToString:@"organized"] && [catalogPaperIDs containsObject:paperID];
-      if (![item[@"catalogSource"] isEqualToString:@"universe"] &&
-          ![consumedStoredIDs containsObject:itemID] && !mergedOrganizedItem) {
-        [userItems addObject:item];
-      }
-    }
-
-    NSMutableDictionary *library = [storedLibrary mutableCopy];
-    library[@"schemaVersion"] = @1;
-    library[@"items"] = [catalogItems arrayByAddingObjectsFromArray:userItems];
-    // A native catalog sync is idempotent. Rewriting identical data would wake
-    // the workspace watcher, which in turn asks the frontend to sync again.
-    if ([library isEqualToDictionary:storedLibrary]) return;
-    if (![self writeJSONObject:library toURL:[self libraryURL] error:&error]) {
-      [self sendWorkspaceErrorForAction:@"syncCatalog" error:error];
-      return;
-    }
-    [self sendWorkspaceWithNotice:nil];
-  });
 }
 
 - (BOOL)isLowercaseSHA256:(NSString *)value {
@@ -6993,40 +6682,6 @@
   });
 }
 
-- (void)saveContextRequest:(NSDictionary *)payload {
-  NSString *projectID = payload[@"projectId"];
-  NSString *query = [payload[@"query"] isKindOfClass:NSString.class]
-      ? [payload[@"query"] stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet] : @"";
-  NSInteger budget = [payload[@"budgetChars"] integerValue];
-  if (![self isSafeProjectID:projectID] || query.length == 0 || query.length > 20000 || budget < 2000 || budget > 200000) {
-    [self sendWorkspaceErrorForAction:@"saveContextRequest" error:[self storageError:@"The Context request or budget is invalid." code:544]];
-    return;
-  }
-  dispatch_async(_persistenceQueue, ^{
-    NSError *error = nil;
-    NSDictionary *registry = [self readDictionaryAtURL:[self projectsRegistryURL] defaultValue:nil error:&error];
-    if (!registry || ![[self activeProjectIDFromRegistry:registry] isEqualToString:projectID]) {
-      [self sendWorkspaceErrorForAction:@"saveContextRequest" error:error ?: [self storageError:@"The active project changed." code:545]];
-      return;
-    }
-    NSURL *tasksDirectory = [[self projectDirectoryURLForID:projectID error:&error]
-        URLByAppendingPathComponent:@"Tasks" isDirectory:YES];
-    if (![NSFileManager.defaultManager createDirectoryAtURL:tasksDirectory withIntermediateDirectories:YES attributes:nil error:&error]) {
-      [self sendWorkspaceErrorForAction:@"saveContextRequest" error:error]; return;
-    }
-    NSString *requestID = [NSString stringWithFormat:@"request-%@", NSUUID.UUID.UUIDString.lowercaseString];
-    if (![self appendJSONObject:@{
-      @"schemaVersion": @1, @"requestId": requestID, @"projectId": projectID,
-      @"query": query, @"budgetChars": @(budget), @"createdAt": [self isoTimestamp],
-      @"status": @"pending_cli", @"modelInvocation": @NO
-    } toURL:[tasksDirectory URLByAppendingPathComponent:@"context-requests.jsonl"] error:&error]) {
-      [self sendWorkspaceErrorForAction:@"saveContextRequest" error:error];
-      return;
-    }
-    [self sendWorkspaceWithNotice:@"The Context request was saved. The app did not call a model; run liteverse context build to generate the evidence pack."];
-  });
-}
-
 - (void)loadKnowledgeCardForPaperID:(NSString *)paperID
                                path:(NSString *)path
                      expectedSHA256:(NSString *)expectedSHA256 {
@@ -7850,12 +7505,545 @@
   }];
 }
 
+#pragma mark - Power, thermal, and occlusion state
+
+- (NSDictionary *)currentPowerState {
+  NSProcessInfo *info = NSProcessInfo.processInfo;
+  BOOL lowPowerMode = NO;
+  if (@available(macOS 12.0, *)) lowPowerMode = info.isLowPowerModeEnabled;
+  NSString *thermal = @"nominal";
+  switch (info.thermalState) {
+    case NSProcessInfoThermalStateFair: thermal = @"fair"; break;
+    case NSProcessInfoThermalStateSerious: thermal = @"serious"; break;
+    case NSProcessInfoThermalStateCritical: thermal = @"critical"; break;
+    default: break;
+  }
+  BOOL onBattery = NO;
+  CFTypeRef powerInfo = IOPSCopyPowerSourcesInfo();
+  if (powerInfo) {
+    CFStringRef providing = IOPSGetProvidingPowerSourceType(powerInfo);
+    onBattery = providing && CFStringCompare(providing, CFSTR(kIOPMBatteryPowerKey), 0) == kCFCompareEqualTo;
+    CFRelease(powerInfo);
+  }
+  __block BOOL occluded = NO;
+  void (^readOcclusion)(void) = ^{
+    occluded = self.window && !(self.window.occlusionState & NSWindowOcclusionStateVisible);
+  };
+  if (NSThread.isMainThread) readOcclusion();
+  else dispatch_sync(dispatch_get_main_queue(), readOcclusion);
+  return @{
+    @"lowPowerMode": @(lowPowerMode),
+    @"onBattery": @(onBattery),
+    @"thermalState": thermal,
+    @"occluded": @(occluded)
+  };
+}
+
+- (void)sendPowerState {
+  dispatch_async(dispatch_get_main_queue(), ^{
+    NSDictionary *state = [self currentPowerState];
+    [self.webView callAsyncJavaScript:@"window.__liteverseReceivePower && window.__liteverseReceivePower(powerPayload);"
+                            arguments:@{ @"powerPayload": state }
+                              inFrame:nil
+                       inContentWorld:WKContentWorld.pageWorld
+                    completionHandler:nil];
+  });
+}
+
+- (void)startPowerObservation {
+  if (!_observingPower) {
+    _observingPower = YES;
+    NSNotificationCenter *center = NSNotificationCenter.defaultCenter;
+    if (@available(macOS 12.0, *)) {
+      [center addObserver:self selector:@selector(powerStateChanged:)
+                     name:NSProcessInfoPowerStateDidChangeNotification object:nil];
+    }
+    [center addObserver:self selector:@selector(powerStateChanged:)
+                   name:NSProcessInfoThermalStateDidChangeNotification object:nil];
+    _powerSourceRunLoopSource = IOPSNotificationCreateRunLoopSource(LiteversePowerSourcesChanged,
+                                                                    (__bridge void *)self);
+    if (_powerSourceRunLoopSource) {
+      CFRunLoopAddSource(CFRunLoopGetMain(), _powerSourceRunLoopSource, kCFRunLoopDefaultMode);
+    }
+  }
+  [self sendPowerState];
+}
+
+- (void)powerStateChanged:(NSNotification *)notification {
+  [self sendPowerState];
+}
+
+- (void)windowDidChangeOcclusionState:(NSNotification *)notification {
+  if (notification.object == self.window) [self sendPowerState];
+}
+
+#pragma mark - Tier-0 key-point cache
+
+// Tier-0 analysis (verbatim key points, references, citation links) is
+// computed by the shared JavaScript module in the web layer. The native side
+// only supplies page-marked full text for sources whose bytes changed and
+// persists the rebuildable results under Cache/Tier0. Nothing here is
+// scientific truth: the cache can be deleted at any time.
+
+- (NSURL *)tier0CacheURL {
+  return [[self applicationSupportURL] URLByAppendingPathComponent:@"Cache/Tier0/app-briefs.json"];
+}
+
+- (NSDictionary *)tier0CacheEntries {
+  NSDictionary *cache = [self readDictionaryAtURL:[self tier0CacheURL] defaultValue:@{} error:nil];
+  if (![cache[@"schemaVersion"] isEqual:@"liteverse-tier0-app-cache-v1"]) return @{};
+  return [cache[@"entries"] isKindOfClass:NSDictionary.class] ? cache[@"entries"] : @{};
+}
+
+- (BOOL)writeTier0CacheEntries:(NSDictionary *)entries error:(NSError **)error {
+  NSURL *url = [self tier0CacheURL];
+  [NSFileManager.defaultManager createDirectoryAtURL:url.URLByDeletingLastPathComponent
+                         withIntermediateDirectories:YES attributes:nil error:nil];
+  return [self writeJSONObject:@{ @"schemaVersion": @"liteverse-tier0-app-cache-v1", @"entries": entries }
+                         toURL:url error:error];
+}
+
+- (NSArray<NSDictionary *> *)tier0SourceDescriptors {
+  NSMutableArray *sources = [NSMutableArray array];
+  NSDictionary *graph = [self readDictionaryAtURL:[self currentGraphURL] defaultValue:@{} error:nil];
+  NSArray *papers = [graph[@"papers"] isKindOfClass:NSArray.class] ? graph[@"papers"] : @[];
+  NSMutableSet *graphIDs = [NSMutableSet set];
+  for (NSDictionary *paper in papers) {
+    if (![paper isKindOfClass:NSDictionary.class] || ![paper[@"id"] isKindOfClass:NSString.class]) continue;
+    [graphIDs addObject:paper[@"id"]];
+    NSDictionary *artifacts = [paper[@"artifacts"] isKindOfClass:NSDictionary.class] ? paper[@"artifacts"] : @{};
+    NSDictionary *integrity = [artifacts[@"integrity"] isKindOfClass:NSDictionary.class] ? artifacts[@"integrity"] : @{};
+    NSString *relative = [integrity[@"immutableFulltextPath"] isKindOfClass:NSString.class] ? integrity[@"immutableFulltextPath"]
+        : [artifacts[@"fulltextPath"] isKindOfClass:NSString.class] ? artifacts[@"fulltextPath"]
+        : [paper[@"fulltextPath"] isKindOfClass:NSString.class] ? paper[@"fulltextPath"] : nil;
+    if (relative.length == 0 || ![self isSafeWorkspaceRelativePath:relative] ||
+        ![relative.stringByStandardizingPath hasPrefix:@"Knowledge/"]) continue;
+    NSURL *url = [self URLForWorkspaceRelativePath:relative.stringByStandardizingPath error:nil];
+    if (!url) continue;
+    NSDictionary *source = [paper[@"source"] isKindOfClass:NSDictionary.class] ? paper[@"source"] : @{};
+    NSString *authors = [paper[@"authors"] isKindOfClass:NSString.class] ? paper[@"authors"] : @"";
+    [sources addObject:@{
+      @"id": paper[@"id"],
+      @"kind": @"paper",
+      @"url": url,
+      @"title": [paper[@"title"] isKindOfClass:NSString.class] ? paper[@"title"] : paper[@"id"],
+      @"authors": authors.length ? [authors componentsSeparatedByString:@", "] : @[],
+      @"year": [paper[@"year"] isKindOfClass:NSNumber.class] ? paper[@"year"] : NSNull.null,
+      @"arxivId": [source[@"arxivId"] isKindOfClass:NSString.class] ? source[@"arxivId"] : NSNull.null,
+      @"doi": [source[@"doi"] isKindOfClass:NSString.class] ? source[@"doi"] : NSNull.null
+    }];
+  }
+
+  NSDictionary *library = [self readDictionaryAtURL:[self libraryURL] defaultValue:[self defaultLibrary] error:nil];
+  NSArray *items = [library[@"items"] isKindOfClass:NSArray.class] ? library[@"items"] : @[];
+  NSURL *pipeline = [self localPreparationPipelineURL];
+  for (NSDictionary *item in items) {
+    if (![item isKindOfClass:NSDictionary.class] || ![item[@"id"] isKindOfClass:NSString.class]) continue;
+    if ([item[@"status"] isEqual:@"organized"] || [item[@"catalogSource"] isEqual:@"universe"]) continue;
+    if ([item[@"graphPaperId"] isKindOfClass:NSString.class] && [graphIDs containsObject:item[@"graphPaperId"]]) continue;
+    NSDictionary *preparation = [item[@"preparation"] isKindOfClass:NSDictionary.class] ? item[@"preparation"] : nil;
+    NSString *jobID = [preparation[@"jobId"] isKindOfClass:NSString.class] ? preparation[@"jobId"] : nil;
+    if (![preparation[@"state"] isEqual:@"ready"] || ![self isSafeLocalPreparationJobID:jobID]) continue;
+    NSURL *jobURL = [pipeline URLByAppendingPathComponent:jobID isDirectory:YES];
+    NSDictionary *manifest = [self readDictionaryAtURL:[jobURL URLByAppendingPathComponent:@"manifest.json"]
+                                          defaultValue:nil error:nil];
+    NSArray *outputs = [manifest[@"outputs"] isKindOfClass:NSArray.class] ? manifest[@"outputs"] : @[];
+    NSString *fulltextPath = nil;
+    for (NSDictionary *output in outputs) {
+      if ([output isKindOfClass:NSDictionary.class] && [output[@"role"] isEqual:@"fulltext"] &&
+          [output[@"path"] isKindOfClass:NSString.class]) fulltextPath = output[@"path"];
+    }
+    if (fulltextPath.length == 0 || [fulltextPath containsString:@".."] || fulltextPath.isAbsolutePath) continue;
+    NSDictionary *metadata = [manifest[@"canonicalMetadata"] isKindOfClass:NSDictionary.class] ? manifest[@"canonicalMetadata"] : @{};
+    NSString *published = [metadata[@"published"] isKindOfClass:NSString.class] ? metadata[@"published"] : @"";
+    id year = published.length >= 4 ? @([[published substringToIndex:4] integerValue]) : NSNull.null;
+    NSString *title = [metadata[@"title"] isKindOfClass:NSString.class] && [metadata[@"title"] length] > 0
+        ? metadata[@"title"] : ([item[@"displayTitle"] isKindOfClass:NSString.class] ? item[@"displayTitle"] : item[@"id"]);
+    [sources addObject:@{
+      @"id": item[@"id"],
+      @"kind": @"item",
+      @"url": [jobURL URLByAppendingPathComponent:fulltextPath],
+      @"title": title,
+      @"authors": [metadata[@"authors"] isKindOfClass:NSArray.class] ? metadata[@"authors"] : @[],
+      @"year": year,
+      @"arxivId": [metadata[@"arxivId"] isKindOfClass:NSString.class] ? metadata[@"arxivId"] : NSNull.null,
+      @"doi": [metadata[@"doi"] isKindOfClass:NSString.class] ? metadata[@"doi"] : NSNull.null
+    }];
+  }
+  return sources;
+}
+
+- (void)loadTier0Payload:(NSDictionary *)payload {
+  BOOL rebuild = [payload[@"rebuild"] boolValue];
+  BOOL continuation = [payload[@"continuation"] boolValue];
+  NSMutableDictionary *entries = rebuild ? [NSMutableDictionary dictionary] : [[self tier0CacheEntries] mutableCopy];
+  NSArray<NSDictionary *> *descriptors = [self tier0SourceDescriptors];
+  NSMutableSet *liveIDs = [NSMutableSet set];
+  NSMutableDictionary *cachedBriefs = [NSMutableDictionary dictionary];
+  NSMutableArray *stale = [NSMutableArray array];
+  for (NSDictionary *descriptor in descriptors) {
+    NSString *identifier = descriptor[@"id"];
+    [liveIDs addObject:identifier];
+    NSString *sha = [self cachedSHA256ForFileAtURL:descriptor[@"url"] error:nil];
+    if (sha.length != 64) continue;
+    NSDictionary *entry = [entries[identifier] isKindOfClass:NSDictionary.class] ? entries[identifier] : nil;
+    if (entry && [entry[@"fulltextSha256"] isEqual:sha] && [entry[@"brief"] isKindOfClass:NSDictionary.class]) {
+      cachedBriefs[identifier] = entry[@"brief"];
+    } else {
+      NSMutableDictionary *pendingDescriptor = [descriptor mutableCopy];
+      pendingDescriptor[@"fulltextSha256"] = sha;
+      [stale addObject:pendingDescriptor];
+    }
+  }
+  NSMutableArray *removed = [NSMutableArray array];
+  for (NSString *identifier in entries.allKeys) {
+    if (![liveIDs containsObject:identifier]) {
+      [removed addObject:identifier];
+      [entries removeObjectForKey:identifier];
+    }
+  }
+  if (removed.count > 0 || rebuild) [self writeTier0CacheEntries:entries error:nil];
+
+  // Send full text in bounded pages so a large library never produces one
+  // enormous JavaScript payload.
+  NSMutableArray *page = [NSMutableArray array];
+  NSUInteger bytes = 0;
+  for (NSDictionary *descriptor in stale) {
+    if (page.count >= 48 || bytes > 24 * 1024 * 1024) break;
+    NSString *text = [NSString stringWithContentsOfURL:descriptor[@"url"] encoding:NSUTF8StringEncoding error:nil];
+    if (!text) continue;
+    bytes += text.length;
+    NSMutableDictionary *source = [descriptor mutableCopy];
+    [source removeObjectForKey:@"url"];
+    source[@"fulltext"] = text;
+    [page addObject:source];
+  }
+  NSDictionary *response = @{
+    @"briefs": continuation ? @{} : cachedBriefs,
+    @"sources": page,
+    @"remaining": @(stale.count > page.count ? stale.count - page.count : 0),
+    @"removedIds": removed
+  };
+  dispatch_async(dispatch_get_main_queue(), ^{
+    [self.webView callAsyncJavaScript:@"window.__liteverseReceiveTier0 && window.__liteverseReceiveTier0(tier0Payload);"
+                            arguments:@{ @"tier0Payload": response }
+                              inFrame:nil
+                       inContentWorld:WKContentWorld.pageWorld
+                    completionHandler:nil];
+  });
+}
+
+- (void)saveTier0Payload:(NSDictionary *)payload {
+  NSDictionary *briefs = [payload[@"briefs"] isKindOfClass:NSDictionary.class] ? payload[@"briefs"] : @{};
+  if (briefs.count == 0) return;
+  NSMutableDictionary *entries = [[self tier0CacheEntries] mutableCopy];
+  NSMutableDictionary *expected = [NSMutableDictionary dictionary];
+  for (NSDictionary *descriptor in [self tier0SourceDescriptors]) expected[descriptor[@"id"]] = descriptor[@"url"];
+  for (NSString *identifier in briefs) {
+    NSDictionary *brief = [briefs[identifier] isKindOfClass:NSDictionary.class] ? briefs[identifier] : nil;
+    NSString *sha = [brief[@"fulltextSha256"] isKindOfClass:NSString.class] ? brief[@"fulltextSha256"] : nil;
+    if (!brief || ![brief[@"paperId"] isEqual:identifier] || !expected[identifier] || sha.length != 64) continue;
+    // Accept only briefs computed from the bytes currently on disk.
+    NSString *current = [self cachedSHA256ForFileAtURL:expected[identifier] error:nil];
+    if (![current isEqualToString:sha.lowercaseString]) continue;
+    entries[identifier] = @{ @"fulltextSha256": current, @"brief": brief };
+  }
+  NSError *error = nil;
+  if (![self writeTier0CacheEntries:entries error:&error]) {
+    [self sendWorkspaceErrorForAction:@"saveTier0" error:error];
+  }
+}
+
+#pragma mark - Apple Intelligence (on-device Foundation Models)
+
+// Summaries come from the separate LiteverseIntelligence helper, which links
+// Apple's FoundationModels framework and runs only on macOS 26 or later with
+// Apple Intelligence enabled. The helper receives verbatim key points only,
+// never files, and its output is stored as a rebuildable, clearly labelled
+// draft under Cache/Intelligence. It never changes cards, claims, or Usage.
+
+- (NSURL *)intelligenceHelperURL {
+  return [NSBundle.mainBundle.bundleURL URLByAppendingPathComponent:@"Contents/MacOS/LiteverseIntelligence"];
+}
+
+- (NSURL *)intelligenceDigestsURL {
+  return [[self applicationSupportURL] URLByAppendingPathComponent:@"Cache/Intelligence/digests.json"];
+}
+
+- (NSDictionary *)runIntelligenceHelperWithRequest:(NSDictionary *)request
+                                           timeout:(NSTimeInterval)timeout
+                                             error:(NSError **)error {
+  NSURL *helper = [self intelligenceHelperURL];
+  if (![NSFileManager.defaultManager isExecutableFileAtPath:helper.path]) {
+    if (error) *error = [self storageError:@"This build of Liteverse does not include Apple Intelligence support." code:910];
+    return nil;
+  }
+  NSData *input = [NSJSONSerialization dataWithJSONObject:request options:0 error:error];
+  if (!input) return nil;
+  NSTask *task = [[NSTask alloc] init];
+  NSPipe *stdinPipe = [NSPipe pipe];
+  NSPipe *stdoutPipe = [NSPipe pipe];
+  task.executableURL = helper;
+  task.arguments = @[];
+  task.standardInput = stdinPipe;
+  task.standardOutput = stdoutPipe;
+  task.standardError = [NSPipe pipe];
+  if (![task launchAndReturnError:error]) return nil;
+  dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(timeout * NSEC_PER_SEC)),
+                 dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+    if (task.isRunning) [task terminate];
+  });
+  @try {
+    [stdinPipe.fileHandleForWriting writeData:input];
+    [stdinPipe.fileHandleForWriting closeFile];
+  } @catch (NSException *exception) {
+    [task terminate];
+  }
+  NSData *output = [stdoutPipe.fileHandleForReading readDataToEndOfFile];
+  [task waitUntilExit];
+  id result = output.length ? [NSJSONSerialization JSONObjectWithData:output options:0 error:nil] : nil;
+  if (![result isKindOfClass:NSDictionary.class]) {
+    if (error) *error = [self storageError:task.terminationReason == NSTaskTerminationReasonUncaughtSignal
+        ? @"Apple Intelligence took too long and was stopped."
+        : @"Apple Intelligence returned no usable result." code:911];
+    return nil;
+  }
+  if ([result[@"error"] isKindOfClass:NSString.class]) {
+    if (error) *error = [self storageError:result[@"error"] code:912];
+    return nil;
+  }
+  return result;
+}
+
+- (void)sendIntelligenceStatus {
+  dispatch_async(_intelligenceQueue, ^{
+    NSDictionary *status;
+    NSOperatingSystemVersion minimum = { 26, 0, 0 };
+    if (![NSProcessInfo.processInfo isOperatingSystemAtLeastVersion:minimum]) {
+      status = @{ @"available": @NO, @"reason": @"Apple Intelligence summaries need macOS 26 or later." };
+    } else {
+      NSError *error = nil;
+      NSDictionary *result = [self runIntelligenceHelperWithRequest:@{ @"task": @"status" } timeout:20 error:&error];
+      status = result ?: @{ @"available": @NO, @"reason": error.localizedDescription ?: @"Apple Intelligence is unavailable." };
+    }
+    dispatch_async(dispatch_get_main_queue(), ^{
+      [self.webView callAsyncJavaScript:@"window.__liteverseReceiveIntelligenceStatus && window.__liteverseReceiveIntelligenceStatus(statusPayload);"
+                              arguments:@{ @"statusPayload": status }
+                                inFrame:nil
+                         inContentWorld:WKContentWorld.pageWorld
+                      completionHandler:nil];
+    });
+  });
+}
+
+- (void)sendIntelligenceDigests {
+  dispatch_async(_intelligenceQueue, ^{
+    NSDictionary *stored = [self readDictionaryAtURL:[self intelligenceDigestsURL] defaultValue:@{} error:nil];
+    NSDictionary *digests = [stored[@"digests"] isKindOfClass:NSDictionary.class] ? stored[@"digests"] : @{};
+    NSArray *items = digests.allValues;
+    dispatch_async(dispatch_get_main_queue(), ^{
+      [self.webView callAsyncJavaScript:@"window.__liteverseReceiveIntelligenceDigests && window.__liteverseReceiveIntelligenceDigests(digestItems);"
+                              arguments:@{ @"digestItems": items }
+                                inFrame:nil
+                         inContentWorld:WKContentWorld.pageWorld
+                      completionHandler:nil];
+    });
+  });
+}
+
+- (void)runIntelligenceDigestPayload:(NSDictionary *)payload {
+  NSString *requestID = [payload[@"requestId"] isKindOfClass:NSString.class] ? payload[@"requestId"] : @"";
+  NSString *paperID = [payload[@"paperId"] isKindOfClass:NSString.class] ? payload[@"paperId"] : nil;
+  NSArray *rawQuotes = [payload[@"quotes"] isKindOfClass:NSArray.class] ? payload[@"quotes"] : @[];
+  NSMutableArray *quotes = [NSMutableArray array];
+  NSMutableSet *quoteIDs = [NSMutableSet set];
+  for (NSDictionary *quote in rawQuotes) {
+    if (![quote isKindOfClass:NSDictionary.class] || ![quote[@"id"] isKindOfClass:NSString.class] ||
+        ![quote[@"text"] isKindOfClass:NSString.class]) continue;
+    NSString *text = quote[@"text"];
+    if (text.length > 1400) text = [text substringToIndex:1400];
+    [quotes addObject:@{ @"id": quote[@"id"], @"kind": [quote[@"kind"] isKindOfClass:NSString.class] ? quote[@"kind"] : @"point", @"text": text }];
+    [quoteIDs addObject:quote[@"id"]];
+    if (quotes.count >= 9) break;
+  }
+  dispatch_async(_intelligenceQueue, ^{
+    NSMutableDictionary *response = [@{ @"requestId": requestID } mutableCopy];
+    if (!paperID || quotes.count == 0) {
+      response[@"error"] = @"This paper has no extracted key points to summarize.";
+    } else {
+      NSDictionary *request = @{
+        @"task": @"digest",
+        @"title": [payload[@"title"] isKindOfClass:NSString.class] ? payload[@"title"] : @"",
+        @"quotes": quotes
+      };
+      NSData *canonical = [NSJSONSerialization dataWithJSONObject:request options:NSJSONWritingSortedKeys error:nil];
+      NSError *error = nil;
+      NSDictionary *result = [self runIntelligenceHelperWithRequest:request timeout:120 error:&error];
+      NSString *gist = [result[@"gist"] isKindOfClass:NSString.class] ? result[@"gist"] : nil;
+      if (!result || gist.length == 0) {
+        response[@"error"] = error.localizedDescription ?: @"Apple Intelligence returned an empty summary.";
+      } else {
+        if (gist.length > 800) gist = [gist substringToIndex:800];
+        NSMutableArray *points = [NSMutableArray array];
+        for (NSDictionary *point in ([result[@"keyPoints"] isKindOfClass:NSArray.class] ? result[@"keyPoints"] : @[])) {
+          if (![point isKindOfClass:NSDictionary.class] || ![point[@"text"] isKindOfClass:NSString.class]) continue;
+          NSMutableArray *ids = [NSMutableArray array];
+          for (id quoteID in ([point[@"quoteIds"] isKindOfClass:NSArray.class] ? point[@"quoteIds"] : @[])) {
+            // Keep only citations to quotes that were actually provided.
+            if ([quoteID isKindOfClass:NSString.class] && [quoteIDs containsObject:quoteID]) [ids addObject:quoteID];
+          }
+          [points addObject:@{ @"text": point[@"text"], @"quoteIds": ids }];
+          if (points.count >= 4) break;
+        }
+        NSDictionary *digest = @{
+          @"paperId": paperID,
+          @"gist": gist,
+          @"keyPoints": points,
+          @"inputSha256": [self sha256ForData:canonical] ?: @"",
+          @"model": [result[@"model"] isKindOfClass:NSString.class] ? result[@"model"] : @"Apple on-device model",
+          @"createdAt": [self isoTimestamp],
+          @"kind": @"on_device_draft"
+        };
+        NSMutableDictionary *stored = [[self readDictionaryAtURL:[self intelligenceDigestsURL] defaultValue:@{} error:nil] mutableCopy];
+        NSMutableDictionary *digests = [([stored[@"digests"] isKindOfClass:NSDictionary.class] ? stored[@"digests"] : @{}) mutableCopy];
+        digests[paperID] = digest;
+        [NSFileManager.defaultManager createDirectoryAtURL:[self intelligenceDigestsURL].URLByDeletingLastPathComponent
+                               withIntermediateDirectories:YES attributes:nil error:nil];
+        [self writeJSONObject:@{ @"schemaVersion": @"liteverse-intelligence-digests-v1", @"digests": digests }
+                        toURL:[self intelligenceDigestsURL] error:nil];
+        response[@"digest"] = digest;
+      }
+    }
+    dispatch_async(dispatch_get_main_queue(), ^{
+      [self.webView callAsyncJavaScript:@"window.__liteverseReceiveIntelligenceDigest && window.__liteverseReceiveIntelligenceDigest(digestPayload);"
+                              arguments:@{ @"digestPayload": response }
+                                inFrame:nil
+                         inContentWorld:WKContentWorld.pageWorld
+                      completionHandler:nil];
+    });
+  });
+}
+
+#pragma mark - In-app PDF viewer
+
+- (NSURL *)pdfURLForOpenPayload:(NSDictionary *)payload title:(NSString **)title error:(NSError **)error {
+  NSString *paperID = [payload[@"paperId"] isKindOfClass:NSString.class] ? payload[@"paperId"] : nil;
+  NSString *itemID = [payload[@"itemId"] isKindOfClass:NSString.class] ? payload[@"itemId"] : nil;
+  if (paperID) {
+    NSDictionary *graph = [self readDictionaryAtURL:[self currentGraphURL] defaultValue:@{} error:error];
+    for (NSDictionary *paper in ([graph[@"papers"] isKindOfClass:NSArray.class] ? graph[@"papers"] : @[])) {
+      if (![paper isKindOfClass:NSDictionary.class] || ![paper[@"id"] isEqual:paperID]) continue;
+      if (title) *title = [paper[@"title"] isKindOfClass:NSString.class] ? paper[@"title"] : paperID;
+      NSDictionary *source = [paper[@"source"] isKindOfClass:NSDictionary.class] ? paper[@"source"] : @{};
+      return [self registeredPDFURLForSource:source requireExisting:YES verifyHash:NO error:error];
+    }
+  }
+  if (itemID) {
+    NSDictionary *item = [self libraryItemWithID:itemID error:error];
+    if (!item) return nil;
+    if (title) *title = [item[@"displayTitle"] isKindOfClass:NSString.class] ? item[@"displayTitle"] : itemID;
+    NSDictionary *source = [item[@"source"] isKindOfClass:NSDictionary.class] ? item[@"source"] : nil;
+    if ([source[@"pdfPath"] isKindOfClass:NSString.class]) {
+      return [self registeredPDFURLForSource:source requireExisting:YES verifyHash:NO error:error];
+    }
+    // arXiv items keep their downloaded PDF inside the preparation job.
+    NSDictionary *preparation = [item[@"preparation"] isKindOfClass:NSDictionary.class] ? item[@"preparation"] : nil;
+    NSString *jobID = [preparation[@"jobId"] isKindOfClass:NSString.class] ? preparation[@"jobId"] : nil;
+    if ([self isSafeLocalPreparationJobID:jobID]) {
+      NSURL *candidate = [[[self localPreparationPipelineURL] URLByAppendingPathComponent:jobID isDirectory:YES]
+          URLByAppendingPathComponent:@"source.pdf"];
+      if ([NSFileManager.defaultManager fileExistsAtPath:candidate.path]) return candidate;
+    }
+  }
+  if (error && !*error) *error = [self storageError:@"The PDF for this paper is not available." code:930];
+  return nil;
+}
+
+- (void)openPDFAtPagePayload:(NSDictionary *)payload {
+  NSError *error = nil;
+  NSString *title = nil;
+  NSURL *url = [self pdfURLForOpenPayload:payload title:&title error:&error];
+  if (!url) {
+    [self sendWorkspaceErrorForAction:@"openPDFAtPage" error:error];
+    return;
+  }
+  PDFDocument *document = [[PDFDocument alloc] initWithURL:url];
+  if (!document) {
+    [self sendWorkspaceErrorForAction:@"openPDFAtPage" error:[self storageError:@"The PDF could not be opened." code:931]];
+    return;
+  }
+  NSInteger pageIndex = MAX(0, MIN((NSInteger)document.pageCount - 1, [payload[@"page"] integerValue] - 1));
+  PDFPage *page = [document pageAtIndex:pageIndex];
+
+  NSRect frame = NSMakeRect(0, 0, 760, 900);
+  NSWindow *window = [[NSWindow alloc] initWithContentRect:frame
+                                                 styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable |
+                                                           NSWindowStyleMaskMiniaturizable | NSWindowStyleMaskResizable
+                                                   backing:NSBackingStoreBuffered
+                                                     defer:NO];
+  window.title = title ?: url.lastPathComponent;
+  window.releasedWhenClosed = NO;
+  PDFView *view = [[PDFView alloc] initWithFrame:frame];
+  view.autoScales = YES;
+  view.displayMode = kPDFDisplaySinglePageContinuous;
+  view.document = document;
+  window.contentView = view;
+  if (page) [view goToPage:page];
+
+  // Highlight the quoted sentence on its page. PDF text may break lines or
+  // hyphenate differently from the extracted text, so search progressively
+  // shorter prefixes of the normalized quote.
+  NSString *quote = [payload[@"quote"] isKindOfClass:NSString.class] ? payload[@"quote"] : @"";
+  NSArray *words = [[quote stringByReplacingOccurrencesOfString:@"\n" withString:@" "]
+      componentsSeparatedByCharactersInSet:NSCharacterSet.whitespaceCharacterSet];
+  words = [words filteredArrayUsingPredicate:[NSPredicate predicateWithFormat:@"length > 0"]];
+  for (NSUInteger count = MIN((NSUInteger)10, words.count); count >= 3 && page; count -= 3) {
+    NSString *needle = [[words subarrayWithRange:NSMakeRange(0, count)] componentsJoinedByString:@" "];
+    NSArray<PDFSelection *> *matches = [document findString:needle withOptions:NSCaseInsensitiveSearch];
+    PDFSelection *onPage = nil;
+    for (PDFSelection *match in matches) {
+      if ([match.pages containsObject:page]) { onPage = match; break; }
+    }
+    if (onPage) {
+      [onPage extendSelectionAtEnd:(NSInteger)MAX(0, (NSInteger)quote.length - (NSInteger)needle.length)];
+      onPage.color = [NSColor colorWithCalibratedRed:1.0 green:0.84 blue:0.4 alpha:0.55];
+      view.highlightedSelections = @[ onPage ];
+      [view goToSelection:onPage];
+      break;
+    }
+    if (count < 6) break;
+  }
+
+  if (!_documentWindows) _documentWindows = [NSMutableArray array];
+  [_documentWindows addObject:window];
+  __weak NSWindow *weakWindow = window;
+  __block id observer = [NSNotificationCenter.defaultCenter addObserverForName:NSWindowWillCloseNotification
+                                                                        object:window
+                                                                         queue:NSOperationQueue.mainQueue
+                                                                    usingBlock:^(NSNotification *note) {
+    if (weakWindow) [self->_documentWindows removeObject:weakWindow];
+    [NSNotificationCenter.defaultCenter removeObserver:observer];
+  }];
+  [window cascadeTopLeftFromPoint:NSMakePoint(NSMinX(self.window.frame) + 40, NSMaxY(self.window.frame) - 40)];
+  [window makeKeyAndOrderFront:nil];
+}
+
 - (void)applicationDidFinishLaunching:(NSNotification *)notification {
   [self configureApplicationMenus];
   dispatch_queue_attr_t persistenceAttributes = dispatch_queue_attr_make_with_autorelease_frequency(
       DISPATCH_QUEUE_SERIAL, DISPATCH_AUTORELEASE_FREQUENCY_WORK_ITEM);
   _persistenceQueue = dispatch_queue_create("com.liteverse.persistence", persistenceAttributes);
-  _localPreparationQueue = dispatch_queue_create("com.liteverse.local-preparation", persistenceAttributes);
+  // Preparation jobs are independent (one job directory each), so several
+  // PDFs are read in parallel. The slot count stays modest to keep a laptop
+  // responsive; results are still committed one at a time on the persistence
+  // queue.
+  dispatch_queue_attr_t concurrentAttributes = dispatch_queue_attr_make_with_autorelease_frequency(
+      DISPATCH_QUEUE_CONCURRENT, DISPATCH_AUTORELEASE_FREQUENCY_WORK_ITEM);
+  _localPreparationQueue = dispatch_queue_create("com.liteverse.local-preparation", concurrentAttributes);
+  NSUInteger cores = NSProcessInfo.processInfo.activeProcessorCount;
+  _localPreparationSlots = dispatch_semaphore_create((long)MAX((NSUInteger)1, MIN((NSUInteger)4, cores / 3)));
+  _tier0Queue = dispatch_queue_create("com.liteverse.tier0", persistenceAttributes);
+  _intelligenceQueue = dispatch_queue_create("com.liteverse.intelligence", persistenceAttributes);
   _sourceHashCache = [NSMutableDictionary dictionary];
   WKWebViewConfiguration *configuration = [[WKWebViewConfiguration alloc] init];
   [configuration.userContentController addScriptMessageHandler:self name:@"liteverse"];
@@ -7877,9 +8065,11 @@
   self.webView.wantsLayer = YES;
   self.webView.layer.backgroundColor = NSColor.blackColor.CGColor;
 
-  NSRect visibleFrame = NSScreen.mainScreen ? NSScreen.mainScreen.visibleFrame : NSMakeRect(0, 0, 1320, 820);
-  CGFloat initialWidth = MIN(1320, MAX(900, visibleFrame.size.width - 48));
-  CGFloat initialHeight = MIN(820, MAX(620, visibleFrame.size.height - 48));
+  // Laptop-first window: fill most of a 13-inch display (1470x956 points by
+  // default on current MacBook Air models) and remember the user's frame.
+  NSRect visibleFrame = NSScreen.mainScreen ? NSScreen.mainScreen.visibleFrame : NSMakeRect(0, 0, 1440, 900);
+  CGFloat initialWidth = MIN(1600, MAX(960, visibleFrame.size.width - 32));
+  CGFloat initialHeight = MIN(1000, MAX(640, visibleFrame.size.height - 32));
   NSRect frame = NSMakeRect(0, 0, initialWidth, initialHeight);
   NSWindowStyleMask style =
       NSWindowStyleMaskTitled |
@@ -7891,13 +8081,19 @@
                                               backing:NSBackingStoreBuffered
                                                 defer:NO];
   self.window.title = @"Liteverse";
-  self.window.minSize = NSMakeSize(900, 620);
-  self.window.backgroundColor = NSColor.blackColor;
+  self.window.titleVisibility = NSWindowTitleHidden;
+  self.window.titlebarAppearsTransparent = YES;
+  self.window.minSize = NSMakeSize(960, 640);
+  self.window.backgroundColor = [NSColor colorWithCalibratedRed:0.027 green:0.035 blue:0.055 alpha:1];
+  self.window.collectionBehavior |= NSWindowCollectionBehaviorFullScreenPrimary;
+  self.window.delegate = self;
   self.window.contentView = self.webView;
   NSRect outerFrame = self.window.frame;
   outerFrame.origin.x = NSMidX(visibleFrame) - outerFrame.size.width * 0.5;
   outerFrame.origin.y = NSMidY(visibleFrame) - outerFrame.size.height * 0.5;
   [self.window setFrameOrigin:outerFrame.origin];
+  [self.window setFrameUsingName:@"LiteverseMainWindow"];
+  self.window.frameAutosaveName = @"LiteverseMainWindow";
   [self.window makeKeyAndOrderFront:nil];
 
   NSURL *resourceURL = NSBundle.mainBundle.resourceURL;
@@ -7952,19 +8148,16 @@
   decisionHandler(WKNavigationActionPolicyAllow);
 }
 
-- (void)webView:(WKWebView *)webView didFinishNavigation:(WKNavigation *)navigation {
-  [webView evaluateJavaScript:
-      @"JSON.stringify({ready:document.readyState,root:document.getElementById('root')?.innerHTML.length||0,scripts:document.scripts.length,scriptBytes:document.scripts[0]?.textContent.length||0,boot:window.__liteverseBoot||null,body:document.body.innerText.slice(0,120)})"
-         completionHandler:^(id result, NSError *error) {
-    NSLog(@"Liteverse document state: %@ error=%@", result, error);
-  }];
-}
-
 - (BOOL)applicationShouldTerminateAfterLastWindowClosed:(NSApplication *)sender {
   return YES;
 }
 
 - (void)applicationWillTerminate:(NSNotification *)notification {
+  if (_powerSourceRunLoopSource) {
+    CFRunLoopRemoveSource(CFRunLoopGetMain(), _powerSourceRunLoopSource, kCFRunLoopDefaultMode);
+    CFRelease(_powerSourceRunLoopSource);
+    _powerSourceRunLoopSource = NULL;
+  }
   if (_pendingRefreshSource) {
     dispatch_source_cancel(_pendingRefreshSource);
     _pendingRefreshSource = nil;
@@ -7986,6 +8179,40 @@
   NSString *action = payload[@"action"];
   if ([action isEqualToString:@"runtimeError"]) {
     NSLog(@"Liteverse runtime error: %@ (%@:%@)", payload[@"message"], payload[@"source"], payload[@"line"]);
+    return;
+  }
+  if ([action isEqualToString:@"observePower"]) {
+    [self startPowerObservation];
+    return;
+  }
+  if ([action isEqualToString:@"loadTier0"]) {
+    NSDictionary *request = [payload copy];
+    dispatch_async(_tier0Queue, ^{
+      @autoreleasepool { [self loadTier0Payload:request]; }
+    });
+    return;
+  }
+  if ([action isEqualToString:@"saveTier0"]) {
+    NSDictionary *request = [payload copy];
+    dispatch_async(_tier0Queue, ^{
+      @autoreleasepool { [self saveTier0Payload:request]; }
+    });
+    return;
+  }
+  if ([action isEqualToString:@"intelligenceStatus"]) {
+    [self sendIntelligenceStatus];
+    return;
+  }
+  if ([action isEqualToString:@"loadIntelligenceDigests"]) {
+    [self sendIntelligenceDigests];
+    return;
+  }
+  if ([action isEqualToString:@"intelligenceDigest"]) {
+    [self runIntelligenceDigestPayload:[payload copy]];
+    return;
+  }
+  if ([action isEqualToString:@"openPDFAtPage"]) {
+    [self openPDFAtPagePayload:[payload copy]];
     return;
   }
   if ([action isEqualToString:@"loadUniverse"]) {
@@ -8025,13 +8252,8 @@
     [self presentWorkspaceExporterIncludingPDFs:[payload[@"includePDFs"] boolValue]];
     return;
   }
-  if ([action isEqualToString:@"importWorkspace"] || [action isEqualToString:@"restoreWorkspace"]) {
+  if ([action isEqualToString:@"importWorkspace"]) {
     [self presentWorkspaceImporter];
-    return;
-  }
-  if ([action isEqualToString:@"syncCatalog"] &&
-      [payload[@"items"] isKindOfClass:NSArray.class]) {
-    [self syncCatalogItems:payload[@"items"]];
     return;
   }
   if ([action isEqualToString:@"pickLiteraturePDF"]) {
@@ -8093,51 +8315,6 @@
   }
   if ([action isEqualToString:@"createProject"] && [payload[@"name"] isKindOfClass:NSString.class]) {
     [self createProjectNamed:payload[@"name"]];
-    return;
-  }
-  if ([action isEqualToString:@"buildContextPreview"]) {
-    NSDictionary *request = [payload copy];
-    NSString *requestID = [request[@"requestId"] isKindOfClass:NSString.class]
-        ? request[@"requestId"] : @"";
-    dispatch_async(_persistenceQueue, ^{
-      @autoreleasepool {
-        NSError *previewError = nil;
-        NSDictionary *preview = [self buildContextPreviewForPayload:request error:&previewError];
-        if (preview) [self sendContextPreview:preview];
-        else [self sendContextPreviewError:previewError requestID:requestID];
-      }
-    });
-    return;
-  }
-  if ([action isEqualToString:@"saveContextRequest"]) {
-    [self saveContextRequest:payload];
-    return;
-  }
-  if ([action isEqualToString:@"searchLiterature"] && [payload[@"query"] isKindOfClass:NSString.class]) {
-    NSString *query = [payload[@"query"] copy];
-    NSString *requestID = [payload[@"requestId"] isKindOfClass:NSString.class]
-        ? [payload[@"requestId"] copy] : NSUUID.UUID.UUIDString.lowercaseString;
-    NSInteger limit = [payload[@"limit"] isKindOfClass:NSNumber.class] ? [payload[@"limit"] integerValue] : 10;
-    dispatch_async(_persistenceQueue, ^{
-      @autoreleasepool {
-        NSError *searchError = nil;
-        NSDictionary *result = [self searchLiteratureAtIndexForQuery:query limit:limit error:&searchError];
-        if (!result) {
-          [self sendLiteratureSearchError:searchError requestID:requestID];
-          return;
-        }
-        NSMutableDictionary *response = [result mutableCopy];
-        response[@"requestId"] = requestID;
-        dispatch_async(dispatch_get_main_queue(), ^{
-          [self.webView callAsyncJavaScript:
-              @"window.__liteverseReceiveLiteratureSearch && window.__liteverseReceiveLiteratureSearch(searchPayload);"
-                                    arguments:@{ @"searchPayload": response }
-                                      inFrame:nil
-                               inContentWorld:WKContentWorld.pageWorld
-                            completionHandler:nil];
-        });
-      }
-    });
     return;
   }
   if ([action isEqualToString:@"loadKnowledgeCard"] &&

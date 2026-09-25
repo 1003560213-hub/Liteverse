@@ -46,17 +46,18 @@ test("the explicit installer is scoped to the three Liteverse Skills and local C
 });
 
 test("backup and workspace-health native actions are wired into the settings UI", async () => {
-  const [universeSource, settingsSource, nativeSource] = await Promise.all([
-    readFile(new URL("../app/universe/LiteratureUniverse.tsx", import.meta.url), "utf8"),
-    readFile(new URL("../app/universe/SettingsDrawer.tsx", import.meta.url), "utf8"),
+  const [stateSource, settingsSource, nativeSource] = await Promise.all([
+    readFile(new URL("../app/universe/useLiteverse.ts", import.meta.url), "utf8"),
+    readFile(new URL("../app/universe/SettingsSheet.tsx", import.meta.url), "utf8"),
     readFile(new URL("../macos/LiteverseApp.m", import.meta.url), "utf8"),
   ]);
 
-  assert.match(universeSource, /action: "loadWorkspaceHealth"/);
-  assert.match(universeSource, /action: "exportWorkspace", includePDFs/);
-  assert.match(universeSource, /action: "importWorkspace"/);
-  assert.match(settingsSource, /BACKUP &amp; RECOVERY/);
-  assert.match(settingsSource, /Include source PDFs/);
+  assert.match(stateSource, /__liteverseReceiveWorkspaceHealth/);
+  assert.match(stateSource, /post\("exportWorkspace", \{ includePDFs \}\)/);
+  assert.match(stateSource, /post\("importWorkspace"\)/);
+  assert.match(settingsSource, /Include managed PDFs/);
+  assert.match(settingsSource, /Export backup…/);
   assert.match(nativeSource, /__liteverseWorkspaceExported/);
   assert.match(nativeSource, /__liteverseWorkspaceImported/);
 });
+

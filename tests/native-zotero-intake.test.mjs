@@ -100,16 +100,18 @@ test("Review Packet v2 drives a capped routing-only BM25 screen", async () => {
 });
 
 test("Library UI exposes Zotero without changing the linked-source trust model", async () => {
-  const [drawer, types, finalizer] = await Promise.all([
-    readFile(path.join(root, "app", "universe", "SettingsDrawer.tsx"), "utf8"),
+  const [settings, workspace, state, types, finalizer] = await Promise.all([
+    readFile(path.join(root, "app", "universe", "SettingsSheet.tsx"), "utf8"),
+    readFile(path.join(root, "app", "universe", "workspace.ts"), "utf8"),
+    readFile(path.join(root, "app", "universe", "useLiteverse.ts"), "utf8"),
     readFile(path.join(root, "app", "universe", "types.ts"), "utf8"),
     readFile(path.join(root, "skills", "liteverse-curator", "scripts", "finalize-curated-snapshot.py"), "utf8"),
   ]);
 
-  assert.match(drawer, /onPickZoteroLibrary: \(\) => void/);
-  assert.match(drawer, /Connect Zotero/);
-  assert.match(drawer, /onClick=\{onPickZoteroLibrary\}/);
-  assert.match(drawer, /catalog: "zotero"/);
+  assert.match(settings, /Connect Zotero…/);
+  assert.match(settings, /onClick=\{actions\.connectZotero\}/);
+  assert.match(state, /post\("pickZoteroLibrary"\)/);
+  assert.match(workspace, /catalog: "zotero"/);
   assert.match(types, /catalog: "zotero"/);
   assert.match(types, /attachmentKey: string/);
   assert.match(finalizer, /paper\["source"\] = \{\s*\*\*source,/);

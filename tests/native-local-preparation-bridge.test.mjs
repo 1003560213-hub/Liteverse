@@ -61,7 +61,6 @@ test("native bridge links local literature folders without duplicating source PD
   const source = await readFile(path.join(root, "macos", "LiteverseApp.m"), "utf8");
   const scanner = source.match(/- \(NSArray<NSDictionary \*> \*\)linkedPDFDescriptorsUnderRootURL:[\s\S]+?\n}\n\n- \(void\)linkLiteratureFolderURL:/)?.[0] || "";
   const linker = source.match(/- \(void\)linkLiteratureFolderURL:[\s\S]+?\n}\n\n- \(void\)presentLiteratureFolderImporter/)?.[0] || "";
-  const syncCatalog = source.match(/- \(void\)syncCatalogItems:[\s\S]+?\n}\n\n- \(BOOL\)isLowercaseSHA256/)?.[0] || "";
 
   assert.match(source, /action isEqualToString:@"pickLiteratureFolder"/);
   assert.match(source, /presentLiteratureFolderImporter/);
@@ -85,10 +84,6 @@ test("native bridge links local literature folders without duplicating source PD
   assert.match(linker, /@"disposition", @"duplicateOfPaperId", @"autoResolution", @"organizedAt"/);
   assert.doesNotMatch(linker, /source\[@"sha256"\] = sourceHash/);
   assert.doesNotMatch(linker, /managedPDFRelativePathForSourceURL|copyItemAtURL/);
-  assert.match(syncCatalog, /BOOL linkedSource = \[self isLinkedPDFSource:rawSource\]/);
-  assert.match(syncCatalog, /cachedSHA256ForFileAtURL:existingURL/);
-  assert.doesNotMatch(syncCatalog, /sha256ForFileAtURL:existingURL/);
-  assert.doesNotMatch(syncCatalog, /managedPDFRelativePathForSourceURL/);
 });
 
 test("linked-source native contracts fail closed across preparation, open, refresh, and backup", async () => {
@@ -138,19 +133,18 @@ test("native bridge validates the immutable result before adopting one item revi
 });
 
 test("Library UI exposes preparation state and revision-pinned retry in English", async () => {
-  const [drawer, universe, styles] = await Promise.all([
-    readFile(path.join(root, "app", "universe", "SettingsDrawer.tsx"), "utf8"),
-    readFile(path.join(root, "app", "universe", "LiteratureUniverse.tsx"), "utf8"),
-    readFile(path.join(root, "app", "globals.css"), "utf8"),
+  const [settings, state, workspace] = await Promise.all([
+    readFile(path.join(root, "app", "universe", "SettingsSheet.tsx"), "utf8"),
+    readFile(path.join(root, "app", "universe", "useLiteverse.ts"), "utf8"),
+    readFile(path.join(root, "app", "universe", "workspace.ts"), "utf8"),
   ]);
 
-  assert.match(drawer, /state: "queued" \| "ready" \| "needs_attention"/);
-  assert.match(drawer, /Preparing locally/);
-  assert.match(drawer, /Locally prepared/);
-  assert.match(drawer, /Preparation needs attention/);
-  assert.match(drawer, /Retry local preparation/);
-  assert.match(universe, /action: "retryLocalPreparation"/);
-  assert.match(universe, /expectedRevision: item\.revision/);
-  assert.match(styles, /\.library-preparation-retry/);
-  assert.match(styles, /min-height: 36px/);
+  assert.match(workspace, /state: "queued" \| "ready" \| "needs_attention"/);
+  assert.match(settings, /Reading PDF/);
+  assert.match(settings, /Extracted · unreviewed/);
+  assert.match(settings, /Preparation needs attention/);
+  assert.match(settings, /actions\.retryPreparation\(item\.id, item\.revision\)/);
+  assert.match(settings, /Retry all/);
+  assert.match(state, /post\("retryLocalPreparation", \{ itemId, expectedRevision \}\)/);
 });
+
