@@ -14,8 +14,9 @@ export const GALAXY_VERTEX = /* glsl */ `
   uniform float uTime;
   uniform float uSpin;
   uniform float uRotation;
-  uniform float uPointPixels;
-  uniform float uAlphaScale;
+  uniform float uSpriteScale;
+  uniform float uFocalPixels;
+  uniform float uGain;
   uniform float uBrightness;
   uniform float uDustPass;
 
@@ -39,20 +40,22 @@ export const GALAXY_VERTEX = /* glsl */ `
     float s = sin(angle);
     p.xz = mat2(c, -s, s, c) * p.xz;
 
-    gl_Position = projectionMatrix * modelViewMatrix * vec4(p, 1.0);
-    // Stars are unresolved: a fixed small screen footprint. Surface
-    // brightness is conserved by uAlphaScale (computed on the CPU from the
-    // galaxy's projected area and the number of points drawn), so a galaxy
-    // keeps the same surface brightness at any distance or level of detail.
-    float relative = 0.55 + size * 1.1;
-    if (population > 4.5) relative *= 1.6;
-    float pixels = uPointPixels * relative;
-    gl_PointSize = clamp(pixels, 1.0, 9.0);
-    float footprint = max(1.0, gl_PointSize * gl_PointSize * 0.45);
-    float intensity = population > 4.5 ? 1.6 : population > 2.5 ? 1.25 : population > 1.5 ? 1.05 : population > 0.5 ? 0.8 : 0.9;
-    vColor = color;
-    float alpha = uAlphaScale * relative * relative / footprint;
-    vAlpha = isDust ? min(0.8, alpha * 1.6) : min(1.0, alpha * intensity * uBrightness);
+    vec4 mv = modelViewMatrix * vec4(p, 1.0);
+    gl_Position = projectionMatrix * mv;
+    // Soft sprites sized by each point's smoothing length (Blender export:
+    // radius = size * sizeScale in galaxy units). uSpriteScale also grows the
+    // sprites when fewer points are drawn, so surface brightness is conserved
+    // at every level of detail. Sub-pixel sprites keep a one-pixel footprint
+    // and dim by the lost area, conserving flux at a distance.
+    float diameter = 2.0 * size * uSpriteScale * uFocalPixels / max(0.001, -mv.z);
+    float coverage = 1.0;
+    if (diameter < 1.0) {
+      coverage = max(diameter * diameter, 0.002);
+      diameter = 1.0;
+    }
+    gl_PointSize = min(diameter, 48.0);
+    vColor = isDust ? vec3(1.0) - color : color;
+    vAlpha = isDust ? 0.45 * coverage : coverage * uGain * uBrightness;
   }
 `;
 
@@ -65,12 +68,9 @@ export const GALAXY_FRAGMENT = /* glsl */ `
     vec2 q = gl_PointCoord * 2.0 - 1.0;
     float r2 = dot(q, q);
     if (r2 > 1.0) discard;
-    float profile = exp(-r2 * 4.0);
-    if (uDustPass > 0.5) {
-      gl_FragColor = vec4(vec3(vAlpha * profile), 1.0);
-    } else {
-      gl_FragColor = vec4(vColor * vAlpha * profile, 1.0);
-    }
+    float profile = exp(-r2 * 3.0) - 0.0498;
+    // Emitters add light; dust multiplies the frame by its transmission.
+    gl_FragColor = vec4(vColor * vAlpha * profile, 1.0);
   }
 `;
 
@@ -80,9 +80,8 @@ export const DEEP_FIELD_VERTEX = /* glsl */ `
   attribute float population;
   attribute float extra;
 
-  uniform float uPixelRatio;
-  uniform float uViewportHeight;
-  uniform float uFovScale;
+  uniform float uSpriteScale;
+  uniform float uFocalPixels;
 
   varying vec3 vColor;
   varying float vKind;
@@ -94,21 +93,29 @@ export const DEEP_FIELD_VERTEX = /* glsl */ `
     vec3 direction = normalize(position);
     vec4 mv = modelViewMatrix * vec4(direction * 900.0, 1.0);
     gl_Position = projectionMatrix * mv;
-    // Angular sizes are fixed on the sky and scale with the field of view.
-    float pixels = (0.8 + size * 7.0) * uPixelRatio * uFovScale;
-    float kind = population;
-    vKind = kind;
-    // Foreground stars flagged for diffraction spikes get a larger sprite.
-    if (kind > 0.5 && kind < 1.5) pixels *= 4.0;
-    float coverage = 1.0;
-    if (pixels < 1.0) {
-      coverage = max(pixels * pixels, 0.05);
-      pixels = 1.0;
+    // Angular sizes are fixed on the sky: radius (radians) = size * sizeScale.
+    float diameter = 2.0 * size * uSpriteScale * uFocalPixels;
+    float kind = 0.0;
+    if (population > 6.5) {
+      bool spikes = mod(extra, 2.0) > 0.5;
+      kind = spikes ? 1.0 : 0.0;
+      diameter = max(diameter, 1.5) * (spikes ? 9.0 : 2.2);
+    } else {
+      float subtype = mod(extra, 4.0);
+      float axisClass = mod(floor(extra / 4.0), 4.0);
+      kind = subtype > 0.5 && subtype < 2.5 ? 3.0 : 2.0;
+      vAxis = 0.3 + 0.2 * axisClass;
+      vAngle = floor(extra / 16.0) * 3.14159265 / 16.0;
+      diameter *= 2.4;
     }
-    gl_PointSize = min(pixels, 64.0);
+    float coverage = 1.0;
+    if (diameter < 1.0) {
+      coverage = max(diameter * diameter, 0.05);
+      diameter = 1.0;
+    }
+    gl_PointSize = min(diameter, 72.0);
+    vKind = kind;
     vColor = color;
-    vAxis = 0.25 + 0.75 * fract(extra / 16.0);
-    vAngle = floor(extra / 16.0) / 16.0 * 3.14159265;
     vAlpha = coverage;
   }
 `;
@@ -126,33 +133,32 @@ export const DEEP_FIELD_FRAGMENT = /* glsl */ `
     float light = 0.0;
     if (vKind < 0.5) {
       // Faint field star: unresolved point-spread function.
-      light = exp(-dot(q, q) * 6.0);
+      light = exp(-dot(q, q) * 7.0);
     } else if (vKind < 1.5) {
-      // Bright foreground star with six-fold diffraction spikes, as produced
-      // by a segmented hexagonal primary mirror, plus a faint horizontal
-      // spike from the secondary support.
+      // Bright foreground star with six diffraction spikes (segmented
+      // hexagonal primary) and a faint horizontal spike (secondary support).
       float r = length(q);
-      float core = exp(-r * r * 90.0) + 0.25 * exp(-r * r * 16.0);
+      float core = exp(-r * r * 160.0) + 0.2 * exp(-r * r * 30.0);
       float spikes = 0.0;
       for (int k = 0; k < 3; k++) {
         float a = float(k) * 1.0471976 + 1.5707963;
         vec2 d = vec2(cos(a), sin(a));
         float along = abs(dot(q, d));
         float across = abs(dot(q, vec2(-d.y, d.x)));
-        spikes += exp(-across * 70.0) * (1.0 - smoothstep(0.0, 1.0, along));
+        spikes += exp(-across * 90.0) * pow(1.0 - min(1.0, along), 3.0);
       }
-      float horizontal = exp(-abs(q.y) * 90.0) * (1.0 - smoothstep(0.0, 0.7, abs(q.x))) * 0.45;
-      light = core + 0.55 * spikes + horizontal;
+      float horizontal = exp(-abs(q.y) * 120.0) * pow(1.0 - min(1.0, abs(q.x) * 1.4), 3.0) * 0.4;
+      light = core + 0.6 * spikes + horizontal;
     } else {
-      // Distant galaxy: inclined exponential/Sersic-like disc.
+      // Distant galaxy: inclined disc (exponential) or spheroid (Sersic-like).
       float c = cos(vAngle);
       float s = sin(vAngle);
       vec2 p = vec2(c * q.x - s * q.y, s * q.x + c * q.y);
       p.y /= vAxis;
       float r = length(p);
-      light = vKind > 2.5 ? exp(-pow(r * 3.2, 0.5) * 3.0) * 1.4 : exp(-r * 4.0);
+      light = vKind > 2.5 ? exp(-pow(r * 3.0, 0.5) * 3.2) * 1.5 : exp(-r * 4.5);
     }
-    if (light < 0.004) discard;
+    if (light < 0.003) discard;
     gl_FragColor = vec4(vColor * light * vAlpha * uExposure, 1.0);
   }
 `;
@@ -174,7 +180,7 @@ export const PAPER_STAR_VERTEX = /* glsl */ `
     }
     vec4 mv = modelViewMatrix * vec4(position, 1.0);
     gl_Position = projectionMatrix * mv;
-    float pixels = (11.0 + size * 12.0 + highlight * 12.0) * uPixelRatio;
+    float pixels = (20.0 + size * 14.0 + highlight * 14.0) * uPixelRatio;
     gl_PointSize = pixels;
     vColor = color;
     vHighlight = highlight;
@@ -191,9 +197,11 @@ export const PAPER_STAR_FRAGMENT = /* glsl */ `
     float core = exp(-r * r * 26.0);
     float halo = exp(-r * r * 5.0) * 0.35;
     float cross = (exp(-abs(q.x) * 40.0) + exp(-abs(q.y) * 40.0)) * (1.0 - smoothstep(0.0, 1.0, r)) * 0.4;
-    float ring = vHighlight > 0.0 ? smoothstep(0.08, 0.0, abs(r - 0.78)) * 0.85 * vHighlight : 0.0;
+    // A thin marker ring keeps every paper identifiable against bright
+    // galaxy light; it brightens when hovered or selected.
+    float ring = smoothstep(0.07, 0.0, abs(r - 0.78)) * (0.3 + 0.7 * vHighlight);
     float light = core + halo + cross;
-    vec3 rgb = vColor * light + vec3(0.62, 0.8, 1.0) * ring;
+    vec3 rgb = vColor * light + mix(vColor, vec3(0.62, 0.8, 1.0), vHighlight) * ring;
     if (light + ring < 0.01) discard;
     gl_FragColor = vec4(rgb, 1.0);
   }

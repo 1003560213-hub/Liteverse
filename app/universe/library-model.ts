@@ -1,7 +1,7 @@
 import type { Brief as Tier0Brief, LibraryAnalysis as Tier0Library } from "../../scripts/lib/liteverse-tier0.mjs";
 import type { GalaxyHierarchy } from "./hierarchy";
 import type { EvidenceTier, ProvisionalLayout, SkyPaperMeta } from "./sky/model";
-import type { Paper, UniverseGraph } from "./types";
+import { paperVerificationState, type Paper, type UniverseGraph } from "./types";
 import type { LibraryItem, WorkspaceState } from "./workspace";
 
 /**
@@ -37,8 +37,9 @@ export const TIER_DETAILS: Record<EvidenceTier, string> = {
   2: "Evidence verified against original PDF pages.",
 };
 
+/** Verified only with the full evidence closure (source hash, card, full text, evidence). */
 export function tierForPaper(paper: Paper): EvidenceTier {
-  return paper.verificationStatus === "evidence_verified" ? 2 : 1;
+  return paperVerificationState(paper).tone === "verified" ? 2 : 1;
 }
 
 export function heatFor(count: number) {

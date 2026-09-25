@@ -187,7 +187,12 @@ test("reading paths put cited papers before the papers that cite them, even with
 });
 
 test("evidence tiers never promote a reviewed card to verified", () => {
-  assert.equal(models.tierForPaper({ verificationStatus: "evidence_verified" }), 2);
+  const closure = {
+    source: { sha256: "a".repeat(64) },
+    artifacts: { evidenceCount: 2, cardPath: "Knowledge/cards/p.md", fulltextPath: "Knowledge/fulltext/p.md" },
+  };
+  assert.equal(models.tierForPaper({ verificationStatus: "evidence_verified", ...closure }), 2);
+  assert.equal(models.tierForPaper({ verificationStatus: "evidence_verified" }), 1, "status alone is not enough");
   assert.equal(models.tierForPaper({ verificationStatus: "card_draft" }), 1);
   assert.equal(models.tierForPaper({ verificationStatus: "needs_attention" }), 1);
   assert.equal(models.heatFor(0), 0);

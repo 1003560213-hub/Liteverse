@@ -144,11 +144,12 @@ export function SkyView(props: SkyViewProps) {
       const element = elements[index] as HTMLElement | undefined;
       if (!element) continue;
       const projected = scene.project(label.position, label.radius);
-      const offset = label.kind === "paper" ? 12 : Math.min(160, projected.pixelRadius * 0.9 + 10);
-      const x = projected.x;
-      const y = projected.y + (label.kind === "region" ? -offset : offset);
       const width = element.offsetWidth || 120;
       const height = element.offsetHeight || 18;
+      // Labels sit clear of their object: below stars and galaxies, above regions.
+      const offset = (label.kind === "paper" ? 12 : Math.min(160, projected.pixelRadius * 0.9 + 10)) + height / 2;
+      const x = projected.x;
+      const y = projected.y + (label.kind === "region" ? -offset : offset);
       const box = { x0: x - width / 2 - 4, y0: y - height / 2 - 2, x1: x + width / 2 + 4, y1: y + height / 2 + 2 };
       const collides = occupied.some((other) =>
         box.x0 < other.x1 && box.x1 > other.x0 && box.y0 < other.y1 && box.y1 > other.y0);

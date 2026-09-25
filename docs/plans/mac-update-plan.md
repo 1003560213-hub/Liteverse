@@ -1,6 +1,9 @@
 # Liteverse macOS update plan (post-0.5.0)
 
-Status: proposal for review. Nothing in this document is implemented yet.
+Status: decisions D1–D9 approved (D6 approved for Apple Intelligence draft
+summaries). Implemented in 0.6.0 except where noted in `docs/releases/v0.6.0.md`
+under "Known limitations" (OCR, native incremental FTS, shared hash cache,
+per-paper catalog pins, and in-app backup activation remain open).
 Baseline: `main` at v0.5.0 (commit `b654c06`). File and line references point to
 that commit.
 

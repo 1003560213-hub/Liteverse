@@ -41,8 +41,8 @@ test("the 3D renderer draws on demand and scales down on battery and heat", asyn
   assert.match(scene, /renderable\.group\.visible = onScreen;/);
   assert.match(scene, /pixels \* pixels \* settings\.pointsPerPixel2/);
   // Surface brightness is conserved across distance and level of detail.
-  assert.match(scene, /SURFACE_BRIGHTNESS \* area\) \/ Math\.max\(1, count\)/);
-  assert.match(shaders, /uAlphaScale \* relative \* relative \/ footprint/);
+  assert.match(scene, /cloud\.sizeScale \* Math\.sqrt\(renderable\.maxCount \/ Math\.max\(1, count\)\)/);
+  assert.match(shaders, /coverage = max\(diameter \* diameter, 0\.002\)/);
   // Power state drives quality and ambient motion.
   assert.match(shell, /power\.lowPowerMode \|\| power\.onBattery \|\| power\.thermalState === "serious"/);
   assert.match(shell, /ambientPreference && !constrained && !power\.occluded && documentVisible/);

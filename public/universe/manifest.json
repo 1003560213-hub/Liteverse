@@ -2,7 +2,7 @@
   "schemaVersion": "liteverse-universe-assets-v1",
   "generator": {
     "tool": "tools/blender/build_universe_assets.py",
-    "scriptSha256": "5fb66edf286bb94465493d734bab635a21bb45fcaf574d7fb3473edbe1707a48",
+    "scriptSha256": "b3db62feb460ad8907162973fe46b55918c2f63cd6f137e69cbe103e9e1e9e5a",
     "blenderVersion": "4.5.0",
     "seed": 1729,
     "points": 40000
@@ -12,8 +12,26 @@
     "version": 1,
     "headerBytes": 32,
     "recordBytes": 12,
-    "color": "sRGB-encoded u8",
-    "axes": "disk in x-z plane, +y up; rotation positive about +y makes arms trail"
+    "endianness": "little",
+    "position": "i16 x3, value = q / 32767 * radius",
+    "color": "u8 x3 sRGB-encoded; emitters: additive colour, dust: transmission (1 = clear)",
+    "size": "u8, sprite radius = size / 255 * sizeScale * radius",
+    "axes": "galaxies: disk in x-z plane, +y up; positive rotation about +y makes arms trail",
+    "populations": {
+      "0": "old",
+      "1": "disk",
+      "2": "young",
+      "3": "hii",
+      "4": "dust",
+      "5": "nucleus",
+      "6": "distantGalaxy",
+      "7": "foregroundStar"
+    },
+    "extra": {
+      "galaxy": "component: 0 disk, 1 bulge/nucleus, 2 bar, 3 arm, 4 ring, 5 tidal/outflow, 6 companion, 7 halo",
+      "distantGalaxy": "bits0-1 subtype (0 spiral, 1 elliptical, 2 lenticular, 3 irregular), bits2-3 axis-ratio class (q = 0.3/0.5/0.7/0.9), bits4-7 position angle (k * 180/16 deg)",
+      "foregroundStar": "bit0 diffraction spikes"
+    }
   },
   "galaxies": [
     {
@@ -21,19 +39,20 @@
       "name": "Grand-design spiral",
       "morphology": "SA(s)c grand-design spiral",
       "pointCount": 40000,
-      "radius": 15.004138946533203,
+      "radius": 15.238704681396484,
+      "sizeScale": 0.108725,
       "byteLength": 480032,
-      "sha256": "4b309ca028c70063fd83e76951400d67e7218f9e73eeecd7512468597dda6ef0",
+      "sha256": "f4ea2e8980e4caf7a0dd436eace0f0e6fe1e917c635caecaf0b5688c728c67ef",
       "file": "galaxies/g01-grand-design-spiral.lvpc",
       "dominantColor": [
-        0.979,
-        0.9421,
-        1.0
+        1.0,
+        0.9081,
+        0.9283
       ],
       "populations": {
         "old": 6000,
-        "disk": 13200,
-        "young": 8000,
+        "disk": 14400,
+        "young": 6800,
         "hii": 2400,
         "dust": 10000,
         "nucleus": 400
@@ -44,14 +63,15 @@
       "name": "Barred spiral",
       "morphology": "SB(s)bc barred spiral",
       "pointCount": 40000,
-      "radius": 14.994817733764648,
+      "radius": 15.00167465209961,
+      "sizeScale": 0.10925,
       "byteLength": 480032,
-      "sha256": "814774c6e737f5f5f4ada9eed09bd5cfa3ea87522c3f0fb8bbcf5810aa3acf97",
+      "sha256": "6fc67f3cdc45540cdae4fa95b6f45bbcafd5d11bd8e9281d36e69076b486de28",
       "file": "galaxies/g02-barred-spiral.lvpc",
       "dominantColor": [
-        0.9917,
-        0.9513,
-        1.0
+        1.0,
+        0.912,
+        0.9377
       ],
       "populations": {
         "old": 8000,
@@ -67,14 +87,15 @@
       "name": "Flocculent spiral",
       "morphology": "SA(rs)c flocculent spiral",
       "pointCount": 40000,
-      "radius": 13.496824264526367,
+      "radius": 13.50137710571289,
+      "sizeScale": 0.107995,
       "byteLength": 480032,
-      "sha256": "3184ed8e630a7419d641f54f449935a12a3a8df250626d9a30cc5aa48743b17f",
+      "sha256": "555791d4732ade469ae4bc0bf002f681ecde603abe2ece39e075ca3614ffe85e",
       "file": "galaxies/g03-flocculent-spiral.lvpc",
       "dominantColor": [
-        0.9815,
-        0.9455,
-        1.0
+        1.0,
+        0.9217,
+        0.9569
       ],
       "populations": {
         "old": 5200,
@@ -91,13 +112,14 @@
       "morphology": "E3 triaxial elliptical",
       "pointCount": 40000,
       "radius": 29.052305221557617,
+      "sizeScale": 0.149871,
       "byteLength": 480032,
-      "sha256": "53193bfb468f56d42952ec3b17d3ff5da19cbdd3d1a57a72335acac6ecb25ab8",
+      "sha256": "277f04bf4a51d2837ddebaaf2b00e0808dca0aca846eaf7b99eb2729a882a41a",
       "file": "galaxies/g04-elliptical.lvpc",
       "dominantColor": [
         1.0,
-        0.8664,
-        0.7282
+        0.8678,
+        0.7254
       ],
       "populations": {
         "old": 39800,
@@ -110,13 +132,14 @@
       "morphology": "S0 lenticular",
       "pointCount": 40000,
       "radius": 13.00042724609375,
+      "sizeScale": 0.132168,
       "byteLength": 480032,
-      "sha256": "79c2ec77858383b3b4100c85668bb940c71e653d95c0bd6a536ce9ad0a1b6c80",
+      "sha256": "7ab3562d3f7a71409d987e217d71bb6ffd0bcb5fe5d0c32b273d3f98c46e5c74",
       "file": "galaxies/g05-lenticular.lvpc",
       "dominantColor": [
         1.0,
-        0.8923,
-        0.7906
+        0.8931,
+        0.7923
       ],
       "populations": {
         "old": 14400,
@@ -130,22 +153,23 @@
       "name": "Ring galaxy",
       "morphology": "collisional ring galaxy",
       "pointCount": 40000,
-      "radius": 14.56936264038086,
+      "radius": 14.558125495910645,
+      "sizeScale": 0.085957,
       "byteLength": 480032,
-      "sha256": "0c235f8033c99deebb40c041836fb1931edc1e5f3b80e1237aad6c24692fbb6d",
+      "sha256": "b3e50e302fc90ad4f776b8bf2d95d78569a739ef6af608d20a9faddfe9a28cf0",
       "file": "galaxies/g06-ring.lvpc",
       "dominantColor": [
-        0.9071,
-        0.8986,
-        1.0
+        1.0,
+        0.8593,
+        0.9166
       ],
       "populations": {
-        "old": 5600,
-        "disk": 14000,
-        "young": 9600,
-        "hii": 3600,
-        "dust": 6800,
-        "nucleus": 400
+        "old": 6060,
+        "disk": 12928,
+        "young": 9700,
+        "hii": 4040,
+        "dust": 6868,
+        "nucleus": 404
       }
     },
     {
@@ -153,21 +177,22 @@
       "name": "Irregular dwarf",
       "morphology": "dIrr / Magellanic irregular",
       "pointCount": 40000,
-      "radius": 6.002354621887207,
+      "radius": 6.009007930755615,
+      "sizeScale": 0.109733,
       "byteLength": 480032,
-      "sha256": "08f527d955c3d553db0757f2c033f646a18747400a9be12518dd13b4d1d876b4",
+      "sha256": "44e11c6e8e98692eb772ad7390288e4062d3ab1ad00eff9ad5b0427f89284d33",
       "file": "galaxies/g07-irregular-dwarf.lvpc",
       "dominantColor": [
-        0.8774,
-        0.8781,
+        0.9474,
+        0.8569,
         1.0
       ],
       "populations": {
-        "old": 10800,
+        "old": 8800,
         "disk": 4000,
-        "young": 12000,
-        "hii": 5200,
-        "dust": 7600,
+        "young": 13200,
+        "hii": 5600,
+        "dust": 8000,
         "nucleus": 400
       }
     },
@@ -176,20 +201,21 @@
       "name": "Interacting pair",
       "morphology": "interacting spiral pair with tidal tail and bridge",
       "pointCount": 40000,
-      "radius": 30.185640335083008,
+      "radius": 29.792505264282227,
+      "sizeScale": 0.054288,
       "byteLength": 480032,
-      "sha256": "6358a9cb84452b4c86ac8a104d72794a07ec9043955f0cd03355a32542c335e3",
+      "sha256": "9eb8a5468b74b9799ca3209e3e622415eb2d71a72c9accbaad9419f14f1bd502",
       "file": "galaxies/g08-interacting-pair.lvpc",
       "dominantColor": [
-        0.9859,
-        0.9478,
-        1.0
+        1.0,
+        0.9214,
+        0.9504
       ],
       "populations": {
         "old": 6160,
-        "disk": 15656,
-        "young": 7984,
-        "hii": 2024,
+        "disk": 16384,
+        "young": 7312,
+        "hii": 1968,
         "dust": 7800,
         "nucleus": 376
       }
@@ -199,21 +225,22 @@
       "name": "Starburst",
       "morphology": "nuclear starburst with bipolar superwind",
       "pointCount": 40000,
-      "radius": 8.828285217285156,
+      "radius": 8.605311393737793,
+      "sizeScale": 0.158801,
       "byteLength": 480032,
-      "sha256": "4932509407002b6b350f2d4aa214cb9b3982c8e7a2cac1b7fe15b0dcdaaf15be",
+      "sha256": "b6590faf606d3e345c09acf72940e833982c85d40512600af3e4a36598e48731",
       "file": "galaxies/g09-starburst.lvpc",
       "dominantColor": [
-        0.8549,
-        0.8507,
-        1.0
+        1.0,
+        0.8284,
+        0.9378
       ],
       "populations": {
-        "old": 2800,
-        "disk": 10000,
-        "young": 6800,
-        "hii": 11600,
-        "dust": 8400,
+        "old": 3200,
+        "disk": 11200,
+        "young": 7200,
+        "hii": 13200,
+        "dust": 4800,
         "nucleus": 400
       }
     },
@@ -222,14 +249,15 @@
       "name": "Seyfert spiral",
       "morphology": "Seyfert 2 spiral with ionisation cone",
       "pointCount": 40000,
-      "radius": 13.989542007446289,
+      "radius": 13.993160247802734,
+      "sizeScale": 0.113831,
       "byteLength": 480032,
-      "sha256": "e5ea03b5ffdc37e571ad26d6f1562ad471c6e7771ddf6a559683855b261a7410",
+      "sha256": "9415a0cde8c9a2c7c2ee937487c0cd5d5d367276cc5fff71751d4fa04870e76f",
       "file": "galaxies/g10-seyfert-spiral.lvpc",
       "dominantColor": [
-        0.9417,
-        0.9298,
-        1.0
+        1.0,
+        0.9247,
+        0.9734
       ],
       "populations": {
         "old": 5984,
@@ -247,13 +275,14 @@
     "morphology": "distant galaxies + foreground stars",
     "pointCount": 8500,
     "radius": 0.9841556549072266,
+    "sizeScale": 0.006097,
     "byteLength": 102032,
     "sha256": "7961c2e34977d15c25d5a2d50a8ce5b859fa0e4846a56220028c71653cdd123f",
     "file": "deep-field.lvpc",
     "dominantColor": [
       1.0,
-      0.8504,
-      0.7438
+      0.8652,
+      0.7732
     ],
     "populations": {
       "distantGalaxy": 6000,

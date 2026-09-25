@@ -182,7 +182,7 @@ function graph() {
       categoryIds: [categories[paper.theme].id],
       position: [0, 0, 0],
       verificationStatus: index % 3 === 0 ? "evidence_verified" : "card_draft",
-      artifacts: { evidenceCount: index % 3 === 0 ? 4 : 0 },
+      artifacts: { evidenceCount: index % 3 === 0 ? 4 : 0, cardPath: `Knowledge/cards/${paper.id}.md`, fulltextPath: `Knowledge/fulltext/${paper.id}.md` },
       source: { kind: "arxiv", arxivId: paper.arxivId, sha256: sha(paper.id) },
       summary: `A fictional demonstration summary of "${paper.title}".`,
       projectRole: "",

@@ -23,8 +23,6 @@ import argparse
 import hashlib
 import json
 import math
-import os
-import shutil
 import struct
 import sys
 import tempfile
@@ -680,8 +678,8 @@ def g05_lenticular(rng, N):
 def g06_ring(rng, N):
     """Cartwheel-like collisional ring: expanding density wave, offset nucleus."""
     c = Cloud()
-    n = alloc(N, dict(ring_young=0.22, ring_hii=0.08, ring_disk=0.18, inner=0.12, spokes=0.06,
-                      disk=0.14, dust=0.17, nucleus=0.01, nucl_bulge=0.02))
+    n = alloc(N, dict(ring_young=0.24, ring_hii=0.1, ring_disk=0.12, inner=0.13, spokes=0.07,
+                      disk=0.13, dust=0.17, nucleus=0.01, nucl_bulge=0.02))
     Rring, qx, qz = 10.0, 1.0, 0.86
     nuc = np.array([-3.0, 0.0, -1.2])
 
@@ -698,16 +696,19 @@ def g06_ring(rng, N):
     ccent, _ = ring_pts(70, 1.0, 0.1)
     idx = rng.integers(0, 60, kc)
     pc = ccent[idx] + rng.normal(size=(kc, 3)) * np.array([0.55, 0.15, 0.55])
-    pd, _ = ring_pts(k - kc, 1.4, 0.2)
+    pd, thd = ring_pts(k - kc, 1.0, 0.2)
+    # azimuthal brightness asymmetry (the Cartwheel's ring is brighter on the
+    # side where the intruder passed closest)
+    asym = np.concatenate([0.55 + 0.45 * np.cos(np.arctan2(pc[:, 2], pc[:, 0]) - 2.2), 0.55 + 0.45 * np.cos(thd - 2.2)])
     c.add(np.concatenate([pc, pd]), POP_YOUNG, blackbody_chroma(temps_young(rng, k, 10000.0, 30000.0)),
-          lum_powerlaw(rng, k, 0.35, 0.8), rng.uniform(0.15, 0.45, k) + 0.25 * rng.random(k) ** 6, C_RING)
+          lum_powerlaw(rng, k, 0.3, 0.75) * asym, rng.uniform(0.15, 0.45, k) + 0.25 * rng.random(k) ** 6, C_RING)
     k = n["ring_hii"]
     idx = rng.integers(0, 45, k)
     p = ccent[idx] * 1.02 + rng.normal(size=(k, 3)) * np.array([0.14, 0.06, 0.14])
     c.add(p, POP_HII, hii_colors(rng, k), rng.uniform(0.6, 1.0, k), rng.uniform(0.35, 0.8, k), C_RING)
     k = n["ring_disk"]
-    p, _ = ring_pts(k, 1.6, 0.3)
-    c.add(p, POP_DISK, blackbody_chroma(rng.normal(6500.0, 700.0, k)), rng.uniform(0.3, 0.55, k),
+    p, thr = ring_pts(k, 1.3, 0.3)
+    c.add(p, POP_DISK, blackbody_chroma(rng.normal(7500.0, 900.0, k)), rng.uniform(0.15, 0.3, k) * (0.6 + 0.4 * np.cos(thr - 2.2)),
           rng.uniform(0.12, 0.3, k), C_RING)
     # inner ring around the offset nucleus (old/yellow)
     k = n["inner"]
@@ -725,14 +726,14 @@ def g06_ring(rng, N):
     a0 = nuc[None, :] + polar(np.full(k, 2.8), ang[s], np.zeros(k))
     a1 = polar(np.full(k, Rring * 0.9), ang[s] + 0.15, np.zeros(k)) * np.array([qx, 1, qz])
     p = a0 + (a1 - a0) * t[:, None] + rng.normal(size=(k, 3)) * np.array([0.7, 0.15, 0.7])
-    c.add(p, POP_DISK, blackbody_chroma(rng.normal(5600.0, 600.0, k)), rng.uniform(0.25, 0.5, k),
+    c.add(p, POP_DISK, blackbody_chroma(rng.normal(5600.0, 600.0, k)), rng.uniform(0.12, 0.3, k),
           rng.uniform(0.12, 0.28, k), C_DISK)
     # faint underlying disk
     k = n["disk"]
     R = exp_disk_R(rng, k, 4.0, 13.0)
     th = rng.uniform(-np.pi, np.pi, k)
     c.add(polar(R, th, sech2(rng, k, 0.3)) + nuc * 0.5, POP_DISK, blackbody_chroma(temps_disk(rng, k, R, 13.0)),
-          rng.uniform(0.2, 0.45, k), rng.uniform(0.12, 0.28, k), C_DISK)
+          rng.uniform(0.08, 0.2, k), rng.uniform(0.12, 0.28, k), C_DISK)
     # dust on the inner side of the ring and along spokes
     k = n["dust"]
     kr = int(k * 0.88)
@@ -847,7 +848,6 @@ def g08_interacting(rng, N):
     c.add(p, POP_YOUNG, blackbody_chroma(temps_young(rng, ky)), lum_powerlaw(rng, ky, 0.5, 1.0),
           rng.uniform(0.15, 0.45, ky), C_TIDAL)
     p, t = curve_cloud(kdu, P0, P1, C, 0.25, 0.4, 0.0)
-    p = p + (np.array([0.0, 0.0, 0.0]))
     c.add(p, POP_DUST, DUST_RGB * rng.uniform(0.85, 1.15, (kdu, 1)), 1.0, rng.uniform(0.45, 0.9, kdu), C_TIDAL)
 
     # long tidal tail from arm 1, winding outward and warping out of the plane
@@ -962,16 +962,13 @@ def g10_seyfert(rng, N):
     c.add(p, POP_NUCLEUS, blackbody_chroma(rng.uniform(15000.0, 35000.0, k)), 1.0,
           np.clip(0.95 - r / 0.6 * 0.5, 0.4, 1.0) * rng.uniform(0.7, 1.0, k), C_BULGE)
     k = n["cone"]
-    axis = rot_x(np.array([[0.0, 1.0, 0.0]]), math.radians(35.0))[0]
     side = np.where(rng.random(k) < 0.5, -1.0, 1.0)
     h = 0.1 + 2.2 * rng.random(k) ** 1.5
     open_ = np.radians(rng.uniform(0.0, 22.0, k))
     phi = rng.uniform(-np.pi, np.pi, k)
     local = np.stack([h * np.tan(open_) * np.cos(phi), h, h * np.tan(open_) * np.sin(phi)], axis=1)
-    # rotate local y to axis
-    ang = math.acos(axis[1])
+    # cone axis tilted 35° from the disk normal (+y)
     p = rot_x(local, math.radians(35.0)) * side[:, None]
-    del ang
     lum = np.clip(np.exp(-h / 1.5), 0.15, 1.0) * rng.uniform(0.5, 0.9, k)
     c.add(p + rng.normal(size=(k, 3)) * 0.05, POP_NUCLEUS, 0.5 * NLR_RGB + 0.5, lum * 0.6, rng.uniform(0.25, 0.55, k), C_TIDAL)
     return c
@@ -1001,6 +998,11 @@ def angular_diameter_distance(z, om=0.3):
     Ez = np.sqrt(om * (1 + zz) ** 3 + (1 - om))
     dc = np.concatenate([[0.0], np.cumsum(0.5 * (1 / Ez[1:] + 1 / Ez[:-1]) * np.diff(zz))])
     return np.interp(z, zz, dc) / (1 + z)
+
+
+# Sprite radius of a size=1 deep-field object, in units of the shell radius
+# (≈ angular radius in radians at r = 1).
+DEEP_FIELD_SIZE_SCALE = 0.006
 
 
 def deep_field(rng, n_gal=6000, n_star=2500):
@@ -1155,11 +1157,13 @@ def encode_lvpc(d):
 
 
 def summarize(rec):
+    # flux-weighted mean colour of the emitting points (sprite flux ∝ colour ×
+    # size²), normalised to max channel 1, reported sRGB-encoded in [0, 1]
     rgb = rec["rgb"].astype(np.float64) / 255.0
     lin = np.where(rgb <= 0.04045, rgb / 12.92, ((rgb + 0.055) / 1.055) ** 2.4)
     emit = rec["pop"] != POP_DUST
-    w = lin[emit].sum(axis=1, keepdims=True)
-    mean = (lin[emit] * 1.0).sum(axis=0) / max(1.0, float(w.sum()))
+    area = (rec["size"][emit].astype(np.float64) / 255.0) ** 2
+    mean = (lin[emit] * area[:, None]).sum(axis=0)
     mean = mean / mean.max() if mean.max() > 0 else mean
     dom = [round(float(v), 4) for v in linear_to_srgb(mean)]
     pops = {}
@@ -1378,16 +1382,21 @@ def render_previews(scene, objects, preview_dir, samples, res, tmp, gain):
     for gid, obj in objects:
         d = read_mesh_object(obj)
         R = np.linalg.norm(d["pos"][:, [0, 2]], axis=1)
-        R_view = float(np.percentile(R, FRAMING.get(gid, 99.3))) * 1.08
+        R_view = float(np.percentile(R, FRAMING.get(gid, 99.3))) * 1.15
         px = 2 * R_view / res  # world units per pixel
         S = d["size_scale"]
         add_points_modifier(obj, mat, star_scale=S * STAR_K, dust_scale=S * DUST_K)
-        # Normalise emission by total emitting cross-section so previews of
-        # different archetypes share a comparable exposure.
+        # Auto-exposure: estimate the face-on surface-brightness map from the
+        # points themselves (flux = colour × sprite area) and put its 99th
+        # percentile at a fixed level, so every archetype is exposed alike.
         emit = d["pop"] != POP_DUST
         r_px = (d["size"][emit] + 0.02) * S * STAR_K / px
-        flux = float((np.pi * r_px ** 2 * d["rgb"][emit].mean(axis=1)).sum())
-        emission.default_value = gain * res * res / max(flux, 1e-6) * 0.06 * 4.0
+        w = d["rgb"][emit].mean(axis=1) * np.pi * r_px ** 2
+        xy = d["pos"][emit][:, [0, 2]]
+        fmap, _, _ = np.histogram2d(xy[:, 0], xy[:, 1], bins=res // 4, range=[[-R_view, R_view]] * 2, weights=w)
+        fmap = fmap / 16.0  # per pixel
+        q = float(np.quantile(fmap[fmap > 0], 0.99))
+        emission.default_value = gain * 0.25 / max(q, 1e-9)
         for o in scene.objects:
             if o.type == "MESH":
                 o.hide_render = o is not obj
@@ -1420,8 +1429,8 @@ def render_deep_field_preview(scene, obj, mat, preview_dir, tmp):
     for o in scene.objects:
         if o.type == "MESH":
             o.hide_render = o is not obj
-    add_points_modifier(obj, mat, star_scale=0.0011, dust_scale=0.001)
-    mat.node_tree.nodes["Emission"].inputs[1].default_value = 8.0
+    add_points_modifier(obj, mat, star_scale=DEEP_FIELD_SIZE_SCALE, dust_scale=DEEP_FIELD_SIZE_SCALE)
+    mat.node_tree.nodes["Emission"].inputs[1].default_value = 12.0
     cam = scene.camera
     cam.data.type = "PERSP"
     cam.data.lens = 24
@@ -1475,10 +1484,11 @@ def build(args, out_dir, export=True):
         objects.append((gid, obj))
         print(f"[build] {gid}: {args.points} pts ({time.time() - t0:.1f}s)", flush=True)
     df_obj = None
-    if not only:
+    if not only or "deep-field" in only:
         rng = np.random.default_rng(np.random.SeedSequence([args.seed, 1000]))
         cloud, n = deep_field(rng)
         data = cloud.finish(rng, n, adaptive=False)
+        data["size_scale"] = DEEP_FIELD_SIZE_SCALE
         coll = bpy.data.collections.new("deep-field")
         scene.collection.children.link(coll)
         df_obj = make_mesh_object("deep-field", data, coll)
@@ -1488,16 +1498,18 @@ def build(args, out_dir, export=True):
         (out_dir / "galaxies").mkdir(parents=True, exist_ok=True)
         galaxies = []
         for (gid, obj), (_, name, morph) in zip(objects, ARCHETYPES):
-            blob, radius, rec = encode_lvpc(read_mesh_object(obj))
+            d = read_mesh_object(obj)
+            blob, radius, rec = encode_lvpc(d)
             rel = f"galaxies/{gid}.lvpc"
             (out_dir / rel).write_bytes(blob)
             dom, pops = summarize(rec)
             galaxies.append({
                 "id": gid, "name": name, "morphology": morph, "pointCount": int(rec.shape[0]),
-                "radius": radius, "byteLength": len(blob), "sha256": hashlib.sha256(blob).hexdigest(),
-                "file": rel, "dominantColor": dom, "populations": pops,
+                "radius": radius, "sizeScale": round(d["size_scale"] / radius, 6),
+                "byteLength": len(blob), "sha256": hashlib.sha256(blob).hexdigest(), "file": rel, "dominantColor": dom, "populations": pops,
             })
-        blob, radius, rec = encode_lvpc(read_mesh_object(df_obj))
+        d = read_mesh_object(df_obj)
+        blob, radius, rec = encode_lvpc(d)
         (out_dir / "deep-field.lvpc").write_bytes(blob)
         dom, pops = summarize(rec)
         manifest = {
@@ -1509,13 +1521,23 @@ def build(args, out_dir, export=True):
                 "seed": args.seed,
                 "points": args.points,
             },
-            "format": {"magic": "LVPC", "version": FORMAT_VERSION, "headerBytes": HEADER_BYTES,
-                       "recordBytes": RECORD_DTYPE.itemsize, "color": "sRGB-encoded u8",
-                       "axes": "disk in x-z plane, +y up; rotation positive about +y makes arms trail"},
+            "format": {
+                "magic": "LVPC", "version": FORMAT_VERSION, "headerBytes": HEADER_BYTES,
+                "recordBytes": RECORD_DTYPE.itemsize, "endianness": "little",
+                "position": "i16 x3, value = q / 32767 * radius",
+                "color": "u8 x3 sRGB-encoded; emitters: additive colour, dust: transmission (1 = clear)",
+                "size": "u8, sprite radius = size / 255 * sizeScale * radius",
+                "axes": "galaxies: disk in x-z plane, +y up; positive rotation about +y makes arms trail",
+                "populations": {str(k): v for k, v in POP_NAMES.items()},
+                "extra": {"galaxy": "component: 0 disk, 1 bulge/nucleus, 2 bar, 3 arm, 4 ring, 5 tidal/outflow, 6 companion, 7 halo",
+                          "distantGalaxy": "bits0-1 subtype (0 spiral, 1 elliptical, 2 lenticular, 3 irregular), bits2-3 axis-ratio class (q = 0.3/0.5/0.7/0.9), bits4-7 position angle (k * 180/16 deg)",
+                          "foregroundStar": "bit0 diffraction spikes"},
+            },
             "galaxies": galaxies,
             "deepField": {
                 "id": "deep-field", "name": "Deep field", "morphology": "distant galaxies + foreground stars",
-                "pointCount": int(rec.shape[0]), "radius": radius, "byteLength": len(blob),
+                "pointCount": int(rec.shape[0]), "radius": radius,
+                "sizeScale": round(d["size_scale"] / radius, 6), "byteLength": len(blob),
                 "sha256": hashlib.sha256(blob).hexdigest(), "file": "deep-field.lvpc",
                 "dominantColor": dom, "populations": pops,
             },

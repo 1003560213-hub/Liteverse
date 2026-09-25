@@ -24,6 +24,8 @@ export type PointCloud = {
   id: string;
   count: number;
   radius: number;
+  /** Sprite radius in normalized units = size/255 * sizeScale. */
+  sizeScale: number;
   /** Interleaved 12-byte records starting at LVPC_HEADER_BYTES. */
   buffer: ArrayBuffer;
 };
@@ -36,6 +38,7 @@ export type UniverseAssetManifest = {
     morphology: string;
     pointCount: number;
     radius: number;
+    sizeScale?: number;
     byteLength: number;
     sha256: string;
     file: string;
@@ -45,6 +48,7 @@ export type UniverseAssetManifest = {
     id?: string;
     pointCount: number;
     radius: number;
+    sizeScale?: number;
     byteLength: number;
     sha256: string;
     file: string;
@@ -62,7 +66,7 @@ declare global {
   }
 }
 
-export function parsePointCloud(id: string, buffer: ArrayBuffer): PointCloud {
+export function parsePointCloud(id: string, buffer: ArrayBuffer, sizeScale = 0.1): PointCloud {
   if (buffer.byteLength < LVPC_HEADER_BYTES) throw new Error(`${id}: point cloud is truncated`);
   const view = new DataView(buffer);
   const magic = String.fromCharCode(
@@ -77,7 +81,7 @@ export function parsePointCloud(id: string, buffer: ArrayBuffer): PointCloud {
     throw new Error(`${id}: point cloud length does not match its header`);
   }
   if (!(radius > 0)) throw new Error(`${id}: point cloud radius is invalid`);
-  return { id, count, radius, buffer };
+  return { id, count, radius, sizeScale, buffer };
 }
 
 function base64ToArrayBuffer(value: string) {
@@ -126,9 +130,9 @@ export function loadUniverseAssets(): Promise<UniverseAssets> {
         return response.arrayBuffer();
       };
       const galaxies = await Promise.all(
-        manifest.galaxies.map(async (entry) => parsePointCloud(entry.id, await read(entry.file))),
+        manifest.galaxies.map(async (entry) => parsePointCloud(entry.id, await read(entry.file), entry.sizeScale)),
       );
-      const deepField = parsePointCloud("deep-field", await read(manifest.deepField.file));
+      const deepField = parsePointCloud("deep-field", await read(manifest.deepField.file), manifest.deepField.sizeScale);
       return { manifest, galaxies, deepField };
     })();
     pending.catch(() => { pending = null; });

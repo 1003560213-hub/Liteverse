@@ -185,9 +185,8 @@ export class SkyScene {
       vertexShader: DEEP_FIELD_VERTEX,
       fragmentShader: DEEP_FIELD_FRAGMENT,
       uniforms: {
-        uPixelRatio: { value: 1 },
-        uViewportHeight: { value: 800 },
-        uFovScale: { value: 1 },
+        uSpriteScale: { value: assets.deepField.sizeScale },
+        uFocalPixels: { value: 1000 },
         uExposure: { value: 1 },
       },
       transparent: true,
@@ -291,8 +290,9 @@ export class SkyScene {
       uTime: { value: 0 },
       uSpin: { value: galaxy.spin },
       uRotation: { value: /elliptical|lenticular/.test(cloud.id) ? 0.01 : 0.05 },
-      uPointPixels: { value: 1.5 },
-      uAlphaScale: { value: 0.05 },
+      uSpriteScale: { value: cloud.sizeScale },
+      uFocalPixels: { value: 1000 },
+      uGain: { value: 0.32 },
       uBrightness: { value: 1 },
       uDustPass: { value: 0 },
     });
@@ -397,8 +397,9 @@ export class SkyScene {
           uTime: { value: 0 },
           uSpin: { value: 1 },
           uRotation: { value: 0.004 },
-          uPointPixels: { value: 1.5 },
-          uAlphaScale: { value: 0.05 },
+          uSpriteScale: { value: this.assets.galaxies[ellipticalIndex].sizeScale },
+          uFocalPixels: { value: 1000 },
+          uGain: { value: 0.32 },
           uBrightness: { value: 0.7 },
           uDustPass: { value: 0 },
         },
@@ -856,9 +857,7 @@ export class SkyScene {
     this.updateLevelOfDetail();
     if (this.deepField && this.deepFieldMaterial) {
       this.deepField.position.copy(this.camera.position);
-      this.deepFieldMaterial.uniforms.uPixelRatio.value = this.renderer.getPixelRatio();
-      this.deepFieldMaterial.uniforms.uViewportHeight.value = this.height;
-      this.deepFieldMaterial.uniforms.uFovScale.value = 42 / this.camera.fov;
+      this.deepFieldMaterial.uniforms.uFocalPixels.value = this.focalPixels();
     }
     for (const renderable of this.regions.values()) {
       if (renderable.diskMaterial) renderable.diskMaterial.uniforms.uTime.value = this.sceneTime;
@@ -868,19 +867,14 @@ export class SkyScene {
     if (animating) this.invalidate();
   };
 
-  /** Mean surface brightness of a galaxy disc in display units (0..1). */
-  private static readonly SURFACE_BRIGHTNESS = 0.22;
-
-  private surfaceUniforms(pixelRadius: number, count: number) {
-    const ratio = this.renderer.getPixelRatio();
-    const pointPixels = 1.35 * ratio;
-    const area = Math.PI * Math.max(1, pixelRadius * ratio) ** 2;
-    const alphaScale = (SkyScene.SURFACE_BRIGHTNESS * area) / Math.max(1, count);
-    return { pointPixels, alphaScale };
+  /** Focal length in device pixels, for converting world sizes to sprite sizes. */
+  private focalPixels() {
+    return (this.height * this.renderer.getPixelRatio()) / (2 * Math.tan(THREE.MathUtils.degToRad(this.camera.fov) / 2));
   }
 
   private updateLevelOfDetail() {
     const settings = QUALITY[this.quality];
+    const focal = this.focalPixels();
     for (const renderable of this.galaxies.values()) {
       const { galaxy } = renderable;
       const projected = this.project(galaxy.position, galaxy.radius);
@@ -895,20 +889,23 @@ export class SkyScene {
         Math.max(settings.minPoints, pixels * pixels * settings.pointsPerPixel2),
       ));
       renderable.stars.geometry.setDrawRange(0, count);
-      const { pointPixels, alphaScale } = this.surfaceUniforms(pixels, count);
+      // Fewer points drawn: each sprite covers proportionally more area, so
+      // the integrated surface brightness stays the same.
+      const cloud = this.assets!.galaxies[galaxy.archetype % this.assets!.galaxies.length];
+      const spriteScale = cloud.sizeScale * Math.sqrt(renderable.maxCount / Math.max(1, count));
       for (const material of [renderable.material, renderable.dustMaterial]) {
         material.uniforms.uTime.value = this.sceneTime;
-        material.uniforms.uPointPixels.value = pointPixels;
-        material.uniforms.uAlphaScale.value = alphaScale;
+        material.uniforms.uSpriteScale.value = spriteScale;
+        material.uniforms.uFocalPixels.value = focal;
       }
     }
     for (const renderable of this.regions.values()) {
       if (!renderable.core || !renderable.coreMaterial) continue;
-      const projected = this.project(renderable.region.center, 0.55);
       const count = renderable.core.geometry.drawRange.count;
-      const { pointPixels, alphaScale } = this.surfaceUniforms(Math.max(0, projected.pixelRadius), Number.isFinite(count) ? count : 6000);
-      renderable.coreMaterial.uniforms.uPointPixels.value = pointPixels;
-      renderable.coreMaterial.uniforms.uAlphaScale.value = alphaScale;
+      const ellipticalIndex = Math.max(0, this.assets!.galaxies.findIndex((cloud) => /elliptical/.test(cloud.id)));
+      const cloud = this.assets!.galaxies[ellipticalIndex];
+      renderable.coreMaterial.uniforms.uSpriteScale.value = cloud.sizeScale * Math.sqrt(cloud.count / Math.max(1, Number.isFinite(count) ? count : cloud.count));
+      renderable.coreMaterial.uniforms.uFocalPixels.value = focal;
       renderable.coreMaterial.uniforms.uTime.value = this.sceneTime;
     }
   }
