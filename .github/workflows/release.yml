@@ -11,6 +11,9 @@ on:
       tag:
         description: Release tag to build and publish (for example v0.6.0)
         required: true
+      target:
+        description: Commit to tag when the tag does not exist yet (full SHA on main)
+        required: false
 
 permissions:
   contents: write
@@ -25,14 +28,29 @@ jobs:
     timeout-minutes: 60
     env:
       RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+      RELEASE_TARGET: ${{ github.event.inputs.target }}
     steps:
       - name: Check out tagged source
         uses: actions/checkout@v5
         with:
-          ref: ${{ env.RELEASE_TAG }}
+          ref: ${{ github.event.inputs.target || env.RELEASE_TAG }}
           fetch-depth: 0
           path: source
           persist-credentials: false
+
+      - name: Create the release tag locally when publishing a target commit
+        if: ${{ github.event.inputs.target != '' }}
+        working-directory: source
+        run: |
+          set -euo pipefail
+          [[ "$RELEASE_TARGET" =~ ^[0-9a-f]{40}$ ]] || { echo "target must be a full commit SHA" >&2; exit 1; }
+          git merge-base --is-ancestor "$RELEASE_TARGET" origin/main || { echo "target is not on main" >&2; exit 1; }
+          if git rev-parse -q --verify "refs/tags/$RELEASE_TAG" >/dev/null; then
+            test "$(git rev-parse "$RELEASE_TAG^{commit}")" = "$RELEASE_TARGET"
+          else
+            git -c user.name=github-actions -c user.email=github-actions@users.noreply.github.com \
+              tag -a "$RELEASE_TAG" "$RELEASE_TARGET" -m "Liteverse ${RELEASE_TAG#v}"
+          fi
 
       - name: Resolve version
         run: |
@@ -145,6 +163,12 @@ jobs:
             gh release upload "$RELEASE_TAG" "${assets[@]}" --clobber --repo "$GITHUB_REPOSITORY"
             gh release edit "$RELEASE_TAG" --title "$title" --notes-file "$notes" --prerelease --repo "$GITHUB_REPOSITORY"
           else
-            gh release create "$RELEASE_TAG" "${assets[@]}" --verify-tag --title "$title" \
-              --notes-file "$notes" --prerelease --repo "$GITHUB_REPOSITORY"
+            if [[ -n "${RELEASE_TARGET:-}" ]]; then
+              # The tag is created on GitHub at the verified target commit.
+              gh release create "$RELEASE_TAG" "${assets[@]}" --target "$RELEASE_TARGET" --title "$title" \
+                --notes-file "$notes" --prerelease --repo "$GITHUB_REPOSITORY"
+            else
+              gh release create "$RELEASE_TAG" "${assets[@]}" --verify-tag --title "$title" \
+                --notes-file "$notes" --prerelease --repo "$GITHUB_REPOSITORY"
+            fi
           fi
